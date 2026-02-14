@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+import json
+import os
+from datetime import datetime
+import tomllib
+
+from pydantic import BaseModel, Field, validator
+
+
+TIMEFRAME = Literal["1h", "1d"]
+
+
+class CoinbaseConfig(BaseModel):
+    api_key: Optional[str] = Field(default=None, alias="COINBASE_API_KEY")
+    api_secret: Optional[str] = Field(default=None, alias="COINBASE_API_SECRET")
+    api_passphrase: Optional[str] = Field(default=None, alias="COINBASE_API_PASSPHRASE")
+    use_sandbox: bool = Field(default=False, alias="COINBASE_USE_SANDBOX")
+    request_timeout_s: float = 15.0
+    request_burst: int = 5
+    requests_per_minute: int = 120
+    sandbox_error_variant: Optional[str] = Field(default=None, alias="COINBASE_SANDBOX_ERROR_VARIANT")
+
+    @validator("api_key", "api_secret", always=True)
+    def _trim_str(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
+class DataConfig(BaseModel):
+    product: str = "BTC-USD"
+    cache_dir: Path = Field(default=Path(".trading_bot_cache"))
+    use_parquet_cache: bool = False
+    stale_after_minutes: int = 15
+    cache_ttl_hours: int = 6
+    hourly_limit: int = 350
+    daily_limit: int = 350
+    force_refresh: bool = False
+
+    @validator("cache_dir", pre=True)
+    def _cache_dir(cls, value: Any) -> Path:
+        if isinstance(value, Path):
+            return value
+        return Path(value)
+
+
+class PublicSourcesConfig(BaseModel):
+    enabled: bool = False
+    fear_greed_enabled: bool = False
+    blockchain_enabled: bool = False
+    cache_ttl_minutes: int = 60
+
+
+class RegimeConfig(BaseModel):
+    # Macro
+    daily_trend_window: int = 50
+    daily_momentum_window: int = 28
+    daily_momentum_quantile: float = 0.66
+
+    # Micro
+    adx_window: int = 14
+    chop_window: int = 14
+    realized_vol_window: int = 168
+    vol_lookback_days: int = 365
+    vol_high_threshold_quantile: float = 0.90
+    adx_trend_threshold: float = 25.0
+    adx_range_threshold: float = 20.0
+    chop_trend_threshold: float = 38.2
+    chop_range_threshold: float = 61.8
+    regime_confirmation_bars: int = 3
+    min_regime_duration_hours: int = 6
+
+    # Range
+    bb_window: int = 20
+    bb_stdev: float = 2.0
+    range_tranche_size: float = 0.25
+    range_max_exposure: float = 0.75
+    range_min_time_between_trades_hours: float = 2.0
+    range_max_trades_per_day: int = 4
+
+    # Trend
+    trend_mode: Literal["donchian", "ema_cross"] = "donchian"
+    donchian_window: int = 55
+    ema_fast: int = 20
+    ema_slow: int = 50
+    trend_exposure_cap: float = 1.0
+    vol_target_multiplier: float = 1.0
+    atr_window: int = 14
+    atr_mult: float = 3.0
+
+    # High vol
+    high_vol_cap: float = 0.2
+
+    # Vol targeting
+    target_ann_vol: float = 0.25
+    realized_vol_window_hours: int = 168
+    max_position_fraction: float = 1.0
+
+    # HMM
+    hmm_regime_enabled: bool = False
+    hmm_window_hours: int = 1000
+    hmm_n_states: int = 3
+
+
+class RiskConfig(BaseModel):
+    max_drawdown_cut_pct: float = 0.25
+    max_exposure: float = 1.0
+    max_additional_exposure_on_drawdown: float = 0.5
+    stale_bar_max_multiplier: int = 2
+    cutoff_no_new_entries: bool = True
+
+
+class ExecutionConfig(BaseModel):
+    limit_price_offset_bps: float = 3.0
+    order_timeout_s: int = 60
+    fallback_to_market: bool = True
+    post_only: bool = True
+    max_slippage_bps: float = 35.0
+    spread_bps: float = 15.0
+    maker_bps: float = 10.0
+    taker_bps: float = 25.0
+    paper_fill_delay_s: float = 0.5
+
+
+class FeesConfig(BaseModel):
+    maker_bps: float = 10.0
+    taker_bps: float = 25.0
+
+
+class LoggingConfig(BaseModel):
+    json_logs: bool = True
+    console_level: str = "INFO"
+    file_path: Optional[str] = "logs/trading_bot.log"
+
+
+class BacktestConfig(BaseModel):
+    start: Optional[str] = None
+    end: Optional[str] = None
+    strategy: str = "regime_switching"
+    initial_equity: float = 10000.0
+    output_dir: str = "reports"
+    maker_bps: float = 10.0
+    taker_bps: float = 25.0
+    slippage_bps: float = 5.0
+    use_spread_slippage: bool = True
+    max_trades_per_year: Optional[int] = None
+
+
+class RuntimeConfig(BaseModel):
+    mode: Literal["paper", "live", "backtest"] = "backtest"
+    cycles: Optional[int] = None
+    tick_seconds: int = 60
+
+
+class BotConfig(BaseModel):
+    coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
+    data: DataConfig = Field(default_factory=DataConfig)
+    public_sources: PublicSourcesConfig = Field(default_factory=PublicSourcesConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    fees: FeesConfig = Field(default_factory=FeesConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+
+    @validator("coinbase", "data", "public_sources", "regime", "risk", "execution", "fees", "backtest", "logging", "runtime", pre=True)
+    def _convert_nested(cls, value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        return value
+
+    @classmethod
+    def load(cls, path: Optional[str] = None) -> "BotConfig":
+        # merge config file (json/toml/yaml-like plain key=val) with env vars
+        raw: Dict[str, Any] = {}
+        if path:
+            file_path = Path(path)
+            if not file_path.exists():
+                raise FileNotFoundError(f"Config file not found: {path}")
+            text = file_path.read_text(encoding="utf-8")
+            if file_path.suffix.lower() in {".yml", ".yaml"}:
+                try:
+                    import yaml  # type: ignore
+                except Exception as err:
+                    raise RuntimeError("PyYAML required for YAML config files") from err
+                raw = yaml.safe_load(text) or {}
+            elif file_path.suffix.lower() == ".toml":
+                raw = tomllib.loads(text)
+            else:
+                raw = json.loads(text)
+
+        def env(name: str, current: Any, cast=str):
+            env_name = f"TRADING_BOT_{name}"
+            if env_name not in os.environ:
+                return current
+            raw_value = os.environ[env_name]
+            if cast in {int, float, bool}:
+                if cast is bool:
+                    return str(raw_value).lower() in {"1", "true", "yes", "on"}
+                return cast(raw_value)
+            return cast(raw_value)
+
+        env_overrides = {
+            "coinbase.api_key": env("COINBASE_API_KEY", raw.get("coinbase", {}).get("api_key") if isinstance(raw.get("coinbase", {}), dict) else None),
+            "coinbase.api_secret": env("COINBASE_API_SECRET", raw.get("coinbase", {}).get("api_secret") if isinstance(raw.get("coinbase", {}), dict) else None),
+            "coinbase.use_sandbox": env("COINBASE_USE_SANDBOX", raw.get("coinbase", {}).get("use_sandbox") if isinstance(raw.get("coinbase", {}), dict) else False, bool),
+        }
+
+        def _set_path(d: dict[str, Any], dotted: str, value: Any) -> None:
+            if value is None:
+                return
+            parts = dotted.split(".")
+            cur = d
+            for p in parts[:-1]:
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+            cur[parts[-1]] = value
+
+        merged = dict(raw)
+        for k, v in env_overrides.items():
+            _set_path(merged, k, v)
+
+        # Also expose direct env vars for convenience
+        merged.setdefault("coinbase", {}).setdefault("api_key", os.getenv("COINBASE_API_KEY", merged.get("coinbase", {}).get("api_key")))
+        merged.setdefault("coinbase", {}).setdefault("api_secret", os.getenv("COINBASE_API_SECRET", merged.get("coinbase", {}).get("api_secret")))
+        merged.setdefault("coinbase", {}).setdefault("api_passphrase", os.getenv("COINBASE_API_PASSPHRASE", merged.get("coinbase", {}).get("api_passphrase")))
+
+        if hasattr(cls, "model_validate"):
+            cfg = cls.model_validate(merged)
+        else:
+            cfg = cls.parse_obj(merged)
+        return cfg
+
+
+@dataclass(frozen=True)
+class IntervalSpec:
+    timeframe: TIMEFRAME
+    seconds: int
+
+
+def timeframe_to_seconds(tf: TIMEFRAME) -> int:
+    if tf == "1h":
+        return 60 * 60
+    if tf == "1d":
+        return 24 * 60 * 60
+    raise ValueError(f"Unsupported timeframe: {tf}")
+
+
+def now_utc() -> datetime:
+    return datetime.utcnow().replace(tzinfo=None)

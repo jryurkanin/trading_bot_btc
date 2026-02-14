@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv-test/
+venv/
+
+# Local data/artifacts
+.trading_bot_cache/
+reports/
+logs/
+*.sqlite
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+pandas
+numpy
+pydantic
+httpx
+tenacity
+pytest
+rich
+hmmlearn
+pyyaml
+# optional: official SDK
+coinbase-advanced-py
