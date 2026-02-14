@@ -22,13 +22,19 @@ Production-oriented Bitcoin strategy codebase for Coinbase Advanced Trade with:
   - RANGE mean-reversion (Bollinger)
   - TREND breakout (Donchian / EMA cross)
 - **Risk engine**:
-  - drawdown breaker
-  - stale data breaker
+  - drawdown breaker + stale data breaker
+  - daily loss / consecutive-loss kill switches
+  - manual kill switch + safe-mode flatten
   - vol-target sizing and caps
 - **Execution**:
+  - exchange constraint enforcement (min size/notional + increment rounding)
   - limit-first placement + fallback-to-market
-  - idempotent client_order_id
-  - paper mode simulator
+  - order lifecycle persistence (partial fill states)
+  - deterministic cancel/replace on timeout
+  - idempotent client_order_id + paper mode simulator
+- **Operational hardening**:
+  - health status file + alert log output
+  - cycle failure / order failure threshold alerts
 - **Backtesting**:
   - fee-aware + slippage
   - equity curve, trade log, metrics

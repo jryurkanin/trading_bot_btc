@@ -109,16 +109,22 @@ class BacktestEngine:
                 continue
             hourly_ctx = hourly.iloc[: i + 1]
 
-            bundle: RegimeDecisionBundle = orchestrator.compute_target_position(ts, hourly_ctx.reset_index(), daily_ctx.reset_index(), current_exposure=btc * row["close"] / max(equity, 1e-9) if equity > 0 else 0.0)
+            current_exposure = max(0.0, min(1.0, btc * row["close"] / equity if equity > 0 else 0.0))
+            bundle: RegimeDecisionBundle = orchestrator.compute_target_position(ts, hourly_ctx.reset_index(), daily_ctx.reset_index(), current_exposure=current_exposure)
             target = bundle.final_target
 
-            # apply stale data and drawdown breakers
-            # In backtests, use simulated time (ts) for stale-data checks.
-            target = risk_mgr.apply_caps(target, risk_state, ts.to_pydatetime(), ts.to_pydatetime(), timeframe_minutes=60)
+            risk_mgr.update_runtime_state(risk_state, equity, ts)
+            # apply stale data, kill-switch, and drawdown breakers
+            target = risk_mgr.apply_caps(
+                target,
+                risk_state,
+                ts.to_pydatetime(),
+                ts.to_pydatetime(),
+                timeframe_minutes=60,
+                current_fraction=current_exposure,
+            )
             if target != bundle.final_target:
                 bundle.final_target = target
-
-            current_exposure = max(0.0, min(1.0, btc * row["close"] / equity if equity > 0 else 0.0))
 
             if target > current_exposure:
                 side = "BUY"

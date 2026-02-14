@@ -10,6 +10,9 @@ import json
 import hmac
 import hashlib
 import base64
+from email.utils import parsedate_to_datetime
+import math
+
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
@@ -27,6 +30,14 @@ class RateLimitError(CoinbaseError):
 
 
 class TransientError(CoinbaseError):
+    pass
+
+
+class AuthError(CoinbaseError):
+    pass
+
+
+class ClockSkewError(TransientError):
     pass
 
 
@@ -51,6 +62,16 @@ class Account:
     available_balance: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class ProductConstraints:
+    product_id: str
+    base_increment: float
+    quote_increment: float
+    base_min_size: float
+    base_max_size: Optional[float]
+    min_notional: float
+
+
 class RESTClientWrapper:
     """Coinbase brokerage REST wrapper.
 
@@ -66,6 +87,7 @@ class RESTClientWrapper:
         self.data_cfg = data_cfg or DataConfig()
         self.base_url = self.SANDBOX_URL if config.use_sandbox else self.BASE_URL
         self._request_times: deque[float] = deque(maxlen=max(config.requests_per_minute, 1) * 2)
+        self._clock_skew_seconds: float = 0.0
         self._sdk_client = self._init_sdk_client()
         self.http = httpx.AsyncClient if False else None
         self.sync_http = httpx.Client(
@@ -107,7 +129,7 @@ class RESTClientWrapper:
             return headers
         if not self.config.api_key or not self.config.api_secret:
             return headers
-        ts = str(int(time.time()))
+        ts = str(int(time.time() + self._clock_skew_seconds))
         signature = self._sign_message(ts, method, path, body, self.config.api_secret)
         headers.update(
             {
@@ -136,7 +158,37 @@ class RESTClientWrapper:
         self._request_times.append(time.monotonic())
 
     def _is_retryable_status(self, status: int) -> bool:
-        return status == 429 or 500 <= status < 600
+        return status in {408, 409, 425, 429} or 500 <= status < 600
+
+    def _update_clock_skew_from_headers(self, headers: Dict[str, Any]) -> None:
+        date_value = headers.get("Date") if isinstance(headers, dict) else None
+        if not date_value:
+            return
+        try:
+            server_dt = parsedate_to_datetime(str(date_value)).astimezone(timezone.utc)
+            local_dt = datetime.now(tz=timezone.utc)
+            skew = (server_dt - local_dt).total_seconds()
+            if abs(skew) <= self.config.max_clock_skew_s:
+                self._clock_skew_seconds = skew
+        except Exception:
+            return
+
+    def _classify_http_error(self, status_code: int, text: str, headers: Dict[str, Any]) -> Exception:
+        msg = (text or "")[:512]
+        if status_code == 429:
+            return RateLimitError(msg)
+
+        if self._is_retryable_status(status_code):
+            return TransientError(msg)
+
+        if status_code in {401, 403}:
+            low = msg.lower()
+            if any(k in low for k in ["timestamp", "clock", "skew", "ahead", "behind", "expired"]):
+                self._update_clock_skew_from_headers(headers)
+                return ClockSkewError(msg)
+            return AuthError(msg)
+
+        return CoinbaseError(f"HTTP {status_code}: {msg}")
 
     @retry(
         retry=retry_if_exception_type((RateLimitError, TransientError, httpx.HTTPError)),
@@ -165,13 +217,10 @@ class RESTClientWrapper:
         except httpx.HTTPError as exc:
             raise
 
-        if self._is_retryable_status(response.status_code):
-            if response.status_code == 429:
-                raise RateLimitError(response.text[:512])
-            raise TransientError(response.text[:512])
+        self._update_clock_skew_from_headers(dict(response.headers))
 
         if response.status_code >= 400:
-            raise CoinbaseError(f"HTTP {response.status_code}: {response.text}")
+            raise self._classify_http_error(response.status_code, response.text, dict(response.headers))
         if not response.text:
             return {}
         return response.json()
@@ -212,6 +261,11 @@ class RESTClientWrapper:
         if method == "GET" and path.startswith("/products/") and path.endswith("/book"):
             fn = getattr(self._sdk_client, "get_product_book")
             return self._normalize_sdk_response(fn(**params))
+
+        if method == "GET" and path.startswith("/products/") and "/candles" not in path and "/book" not in path:
+            if hasattr(self._sdk_client, "get_product"):
+                fn = getattr(self._sdk_client, "get_product")
+                return self._normalize_sdk_response(fn(**params))
 
         if method == "POST" and path == "/orders":
             fn = getattr(self._sdk_client, "create_order")
@@ -360,6 +414,43 @@ class RESTClientWrapper:
         bid = _top_px(book, 0.0)
         ask = _top_px(asks, bid)
         return BestBidAsk(bid=bid, ask=ask, time=datetime.utcnow())
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def get_product(self, product_id: str) -> Dict[str, Any]:
+        data = self._request("GET", f"/products/{product_id}", params={"product_id": product_id})
+        if isinstance(data, dict):
+            return data.get("product") or data.get("response", {}).get("product", data)
+        return {}
+
+    def get_product_constraints(self, product_id: str) -> ProductConstraints:
+        data = self.get_product(product_id)
+        base_increment = self._as_float(data.get("base_increment"), 1e-8)
+        quote_increment = self._as_float(data.get("quote_increment"), 0.01)
+        base_min_size = self._as_float(data.get("base_min_size"), base_increment)
+        base_max_size_raw = data.get("base_max_size")
+        base_max_size = self._as_float(base_max_size_raw, 0.0) if base_max_size_raw is not None else None
+
+        min_notional = max(
+            self._as_float(data.get("min_market_funds"), 0.0),
+            self._as_float(data.get("quote_min_size"), 0.0),
+            self._as_float(data.get("min_order_size"), 0.0),
+        )
+        return ProductConstraints(
+            product_id=product_id,
+            base_increment=base_increment if base_increment > 0 else 1e-8,
+            quote_increment=quote_increment if quote_increment > 0 else 0.01,
+            base_min_size=base_min_size if base_min_size > 0 else base_increment,
+            base_max_size=base_max_size if base_max_size and base_max_size > 0 else None,
+            min_notional=max(0.0, min_notional),
+        )
 
     def create_order(
         self,

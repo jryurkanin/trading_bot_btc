@@ -8,7 +8,18 @@ import os
 from datetime import datetime
 import tomllib
 
-from pydantic import BaseModel, Field, validator
+try:
+    from pydantic import BaseModel, Field, field_validator
+except Exception:  # pragma: no cover - pydantic v1 compatibility
+    from pydantic import BaseModel, Field, validator
+
+    def field_validator(*fields, mode="after", **kwargs):  # type: ignore
+        pre = mode == "before"
+
+        def _wrap(fn):
+            return validator(*fields, pre=pre, always=kwargs.get("always", False))(fn)
+
+        return _wrap
 
 
 TIMEFRAME = Literal["1h", "1d"]
@@ -23,12 +34,13 @@ class CoinbaseConfig(BaseModel):
     request_burst: int = 5
     requests_per_minute: int = 120
     sandbox_error_variant: Optional[str] = Field(default=None, alias="COINBASE_SANDBOX_ERROR_VARIANT")
+    max_clock_skew_s: float = 300.0
 
-    @validator("api_key", "api_secret", always=True)
+    @field_validator("api_key", "api_secret", mode="before")
     def _trim_str(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        value = value.strip()
+        value = str(value).strip()
         return value or None
 
 
@@ -42,7 +54,7 @@ class DataConfig(BaseModel):
     daily_limit: int = 350
     force_refresh: bool = False
 
-    @validator("cache_dir", pre=True)
+    @field_validator("cache_dir", mode="before")
     def _cache_dir(cls, value: Any) -> Path:
         if isinstance(value, Path):
             return value
@@ -114,6 +126,12 @@ class RiskConfig(BaseModel):
     stale_bar_max_multiplier: int = 2
     cutoff_no_new_entries: bool = True
 
+    # kill-switches
+    daily_loss_limit_pct: Optional[float] = 0.08
+    max_consecutive_losses: Optional[int] = 6
+    manual_kill_switch: bool = False
+    safe_mode: bool = True
+
 
 class ExecutionConfig(BaseModel):
     limit_price_offset_bps: float = 3.0
@@ -125,6 +143,14 @@ class ExecutionConfig(BaseModel):
     maker_bps: float = 10.0
     taker_bps: float = 25.0
     paper_fill_delay_s: float = 0.5
+
+    # exchange constraints
+    enforce_product_constraints: bool = True
+    min_notional_buffer_quote: float = 0.0
+
+    # cancel/replace lifecycle
+    cancel_replace_on_timeout: bool = True
+    replace_with_market_on_timeout: bool = True
 
 
 class FeesConfig(BaseModel):
@@ -156,6 +182,13 @@ class RuntimeConfig(BaseModel):
     cycles: Optional[int] = None
     tick_seconds: int = 60
 
+    # operational hardening
+    healthcheck_file: str = ".trading_bot_cache/health_status.json"
+    alert_file: str = ".trading_bot_cache/alerts.log"
+    max_consecutive_cycle_failures: int = 3
+    max_consecutive_order_failures: int = 3
+    stale_feed_alert_minutes: int = 90
+
 
 class BotConfig(BaseModel):
     coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
@@ -169,7 +202,7 @@ class BotConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 
-    @validator("coinbase", "data", "public_sources", "regime", "risk", "execution", "fees", "backtest", "logging", "runtime", pre=True)
+    @field_validator("coinbase", "data", "public_sources", "regime", "risk", "execution", "fees", "backtest", "logging", "runtime", mode="before")
     def _convert_nested(cls, value: Any) -> Dict[str, Any]:
         if value is None:
             return {}

@@ -14,6 +14,11 @@ class RiskState:
     last_data_ts: pd.Timestamp | None = None
     is_stale: bool = False
 
+    day_anchor: pd.Timestamp | None = None
+    day_start_equity: float = 1.0
+    consecutive_losses: int = 0
+    last_equity: float | None = None
+
     @property
     def drawdown(self) -> float:
         if self.equity_peak <= 0:
@@ -45,11 +50,68 @@ class RiskManager:
             return 1.0
         return self.cfg.max_additional_exposure_on_drawdown
 
-    def apply_caps(self, target_fraction: float, state: RiskState, latest_bar_ts: pd.Timestamp, now: pd.Timestamp, timeframe_minutes: int = 60) -> float:
+    def update_runtime_state(self, state: RiskState, equity: float, now: pd.Timestamp) -> None:
+        now_ts = pd.Timestamp(now)
+        if now_ts.tzinfo is None:
+            now_ts = now_ts.tz_localize("UTC")
+        else:
+            now_ts = now_ts.tz_convert("UTC")
+
+        state.current_equity = float(equity)
+        if equity > state.equity_peak:
+            state.equity_peak = float(equity)
+
+        if state.day_anchor is None or state.day_anchor.date() != now_ts.date():
+            state.day_anchor = now_ts
+            state.day_start_equity = float(equity)
+            state.consecutive_losses = 0
+
+        if state.last_equity is not None:
+            if equity < state.last_equity:
+                state.consecutive_losses += 1
+            elif equity > state.last_equity:
+                state.consecutive_losses = 0
+        state.last_equity = float(equity)
+
+    def daily_pnl_pct(self, state: RiskState) -> float:
+        if state.day_start_equity <= 0:
+            return 0.0
+        return (state.current_equity / state.day_start_equity) - 1.0
+
+    def kill_switch_reason(self, state: RiskState) -> str | None:
+        if self.cfg.manual_kill_switch:
+            return "manual_kill_switch"
+
+        if self.cfg.daily_loss_limit_pct is not None:
+            if self.daily_pnl_pct(state) <= -abs(float(self.cfg.daily_loss_limit_pct)):
+                return "daily_loss_limit"
+
+        if self.cfg.max_consecutive_losses is not None:
+            if state.consecutive_losses >= int(self.cfg.max_consecutive_losses):
+                return "max_consecutive_losses"
+
+        return None
+
+    def apply_caps(
+        self,
+        target_fraction: float,
+        state: RiskState,
+        latest_bar_ts: pd.Timestamp,
+        now: pd.Timestamp,
+        timeframe_minutes: int = 60,
+        current_fraction: float = 0.0,
+    ) -> float:
         if target_fraction < 0:
             return 0.0
         if self.stale_data_breaker(latest_bar_ts, now, timeframe_minutes=timeframe_minutes):
             return 0.0
+
+        reason = self.kill_switch_reason(state)
+        if reason:
+            if self.cfg.safe_mode:
+                return 0.0
+            if self.cfg.cutoff_no_new_entries:
+                return min(target_fraction, max(0.0, current_fraction))
 
         # apply drawdown breaker
         factor = self.check_drawdown(state)

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Optional
 
 import json
 import sqlite3
+import time
 
 
 @dataclass
@@ -17,15 +18,13 @@ class TradeState:
 
 
 class BotStateStore:
-    """SQLite persistence for run state.
-
-    This is deliberately conservative and intentionally schema-stable for later upgrades.
-    """
+    """SQLite persistence for run state."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
         self._init()
 
     def _init(self):
@@ -46,7 +45,23 @@ class BotStateStore:
                 size REAL NOT NULL,
                 order_type TEXT NOT NULL,
                 price REAL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'submitted',
+                filled_size REAL NOT NULL DEFAULT 0.0,
+                last_update_ts INTEGER NOT NULL DEFAULT 0,
+                replace_count INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                client_order_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                payload TEXT
             )
             """
         )
@@ -73,6 +88,25 @@ class BotStateStore:
         )
         self.conn.commit()
 
+        # Best-effort migration for old DBs missing newer columns.
+        existing_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(open_orders)").fetchall()}
+        alter_statements = []
+        if "status" not in existing_cols:
+            alter_statements.append("ALTER TABLE open_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'submitted'")
+        if "filled_size" not in existing_cols:
+            alter_statements.append("ALTER TABLE open_orders ADD COLUMN filled_size REAL NOT NULL DEFAULT 0.0")
+        if "last_update_ts" not in existing_cols:
+            alter_statements.append("ALTER TABLE open_orders ADD COLUMN last_update_ts INTEGER NOT NULL DEFAULT 0")
+        if "replace_count" not in existing_cols:
+            alter_statements.append("ALTER TABLE open_orders ADD COLUMN replace_count INTEGER NOT NULL DEFAULT 0")
+        if "metadata" not in existing_cols:
+            alter_statements.append("ALTER TABLE open_orders ADD COLUMN metadata TEXT")
+
+        for stmt in alter_statements:
+            self.conn.execute(stmt)
+        if alter_statements:
+            self.conn.commit()
+
     def set_kv(self, key: str, value: object) -> None:
         self.conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value)))
         self.conn.commit()
@@ -86,10 +120,80 @@ class BotStateStore:
         except Exception:
             return row[0]
 
-    def put_open_order(self, order_id: str, product: str, side: str, size: float, order_type: str, price: Optional[float], created_at_ts: int) -> None:
+    def put_open_order(
+        self,
+        order_id: str,
+        product: str,
+        side: str,
+        size: float,
+        order_type: str,
+        price: Optional[float],
+        created_at_ts: int,
+        status: str = "submitted",
+        filled_size: float = 0.0,
+        replace_count: int = 0,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO open_orders(client_order_id,product,side,size,order_type,price,created_at) VALUES(?,?,?,?,?,?,?)",
-            (order_id, product, side, size, order_type, price, created_at_ts),
+            """
+            INSERT OR REPLACE INTO open_orders(
+                client_order_id,product,side,size,order_type,price,created_at,status,filled_size,last_update_ts,replace_count,metadata
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                order_id,
+                product,
+                side,
+                size,
+                order_type,
+                price,
+                created_at_ts,
+                status,
+                float(filled_size),
+                int(created_at_ts),
+                int(replace_count),
+                json.dumps(metadata or {}),
+            ),
+        )
+        self.conn.commit()
+
+    def update_open_order(
+        self,
+        order_id: str,
+        *,
+        status: Optional[str] = None,
+        filled_size: Optional[float] = None,
+        replace_count: Optional[int] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        ts: Optional[int] = None,
+    ) -> None:
+        updates: list[str] = []
+        values: list[Any] = []
+
+        if status is not None:
+            updates.append("status=?")
+            values.append(status)
+        if filled_size is not None:
+            updates.append("filled_size=?")
+            values.append(float(filled_size))
+        if replace_count is not None:
+            updates.append("replace_count=?")
+            values.append(int(replace_count))
+        if metadata is not None:
+            updates.append("metadata=?")
+            values.append(json.dumps(metadata))
+
+        updates.append("last_update_ts=?")
+        values.append(int(ts if ts is not None else time.time()))
+
+        values.append(order_id)
+        self.conn.execute(f"UPDATE open_orders SET {', '.join(updates)} WHERE client_order_id=?", values)
+        self.conn.commit()
+
+    def log_order_event(self, client_order_id: str, event: str, payload: Optional[dict[str, Any]] = None, ts: Optional[int] = None) -> None:
+        self.conn.execute(
+            "INSERT INTO order_events(ts, client_order_id, event, payload) VALUES(?,?,?,?)",
+            (int(ts if ts is not None else time.time()), client_order_id, event, json.dumps(payload or {})),
         )
         self.conn.commit()
 
@@ -98,8 +202,38 @@ class BotStateStore:
         self.conn.commit()
 
     def list_open_orders(self):
-        rows = self.conn.execute("SELECT client_order_id, product, side, size, order_type, price, created_at FROM open_orders").fetchall()
-        return rows
+        rows = self.conn.execute(
+            "SELECT client_order_id, product, side, size, order_type, price, created_at, status, filled_size, last_update_ts, replace_count, metadata FROM open_orders"
+        ).fetchall()
+        return [tuple(r) for r in rows]
+
+    def list_open_orders_dict(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT client_order_id, product, side, size, order_type, price, created_at, status, filled_size, last_update_ts, replace_count, metadata FROM open_orders"
+        ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except Exception:
+                item["metadata"] = {}
+            out.append(item)
+        return out
+
+    def get_open_order(self, order_id: str) -> Optional[dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT client_order_id, product, side, size, order_type, price, created_at, status, filled_size, last_update_ts, replace_count, metadata FROM open_orders WHERE client_order_id=?",
+            (order_id,),
+        ).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["metadata"] = json.loads(out.get("metadata") or "{}")
+        except Exception:
+            out["metadata"] = {}
+        return out
 
     def store_position(self, ts: int, product: str, btc: float, usd: float, exposure: float, comment: str = "") -> None:
         self.conn.execute(
