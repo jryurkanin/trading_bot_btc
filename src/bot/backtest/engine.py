@@ -8,7 +8,10 @@ import pandas as pd
 
 from ..config import BacktestConfig, RegimeConfig, RiskConfig, ExecutionConfig
 from ..execution.risk import RiskManager, RiskState
+from ..execution.rebalance_policy import RebalancePolicy
 from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator, RegimeDecisionBundle
+from .fill_models import BacktestOrder, MarketState, make_fill_model
+from .cost_model import CostModel
 
 
 @dataclass
@@ -19,13 +22,19 @@ class ExecutionEvent:
     target_after: float
     fraction_delta: float
     price: float
+    mark_price: float
+    slippage_bps: float
+    slippage_cost: float
     btc_qty: float
     notional: float
     fee: float
     fee_rate: float
     is_taker: bool
+    is_maker: bool
     micro_regime: str
     strategy: str
+    fill_model: str
+    rebalance_reason: str
 
 
 @dataclass
@@ -57,7 +66,7 @@ class BacktestEngine:
         cfg = self.config or BacktestConfig()
         reg_cfg = self.regime_config or RegimeConfig()
         risk_cfg = self.risk_config or RiskConfig()
-        _ = self.execution_config or ExecutionConfig()  # reserved for future execution-model params
+        exec_cfg = self.execution_config or ExecutionConfig()
 
         hourly = self.hourly_candles.copy()
         daily = self.daily_candles.copy()
@@ -87,137 +96,212 @@ class BacktestEngine:
         hourly = hourly.set_index("timestamp").sort_index()
         daily = daily.set_index("timestamp").sort_index()
 
-        # align to closed bars, drop potential current/partial bar
         now_utc = pd.Timestamp.now(tz="UTC")
         hourly = hourly[hourly.index < now_utc.floor("h")]
+
+        if len(hourly) < 2:
+            raise ValueError("Need at least 2 hourly candles for no-lookahead fill simulation")
 
         orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
 
-        equity = cfg.initial_equity
-        cash = cfg.initial_equity
+        fill_model = make_fill_model(
+            exec_cfg.fill_model,
+            slippage_bps=self.slippage_bps,
+            spread_bps=exec_cfg.spread_bps if self.use_spread_slippage else 0.0,
+            impact_bps=exec_cfg.impact_bps,
+        )
+        cost_model = CostModel(
+            maker_fee_rate=float(self.fees[0]),
+            taker_fee_rate=float(self.fees[1]),
+            spread_bps=exec_cfg.spread_bps if self.use_spread_slippage else 0.0,
+            impact_bps=exec_cfg.impact_bps,
+        )
+        rebalance = RebalancePolicy(
+            policy=exec_cfg.rebalance_policy,
+            min_trade_notional_usd=exec_cfg.min_trade_notional_usd,
+            min_exposure_delta=exec_cfg.min_exposure_delta,
+            target_quantization_step=exec_cfg.target_quantization_step,
+            min_time_between_trades_hours=exec_cfg.min_time_between_trades_hours,
+            max_trades_per_day=exec_cfg.max_trades_per_day,
+        )
+
+        cash = float(cfg.initial_equity)
         btc = 0.0
         events: List[ExecutionEvent] = []
         decisions_rows: List[Dict[str, Any]] = []
         equity_rows: List[Dict[str, Any]] = []
 
-        for i, (ts, row) in enumerate(hourly.iterrows()):
-            # make sure daily context available up to this timestamp
-            daily_ctx = daily[daily.index <= ts]
+        # Iterate on signal bar t and fill on bar t+1
+        for i in range(1, len(hourly)):
+            signal_ts = hourly.index[i - 1]
+            exec_ts = hourly.index[i]
+            bar_t = hourly.iloc[i - 1]
+            bar_t1 = hourly.iloc[i]
+
+            daily_ctx = daily[daily.index <= signal_ts]
             if daily_ctx.empty:
                 continue
-            hourly_ctx = hourly.iloc[: i + 1]
+            hourly_ctx = hourly.iloc[:i]  # includes bar t, excludes t+1
 
-            current_exposure = max(0.0, min(1.0, btc * row["close"] / equity if equity > 0 else 0.0))
-            bundle: RegimeDecisionBundle = orchestrator.compute_target_position(ts, hourly_ctx.reset_index(), daily_ctx.reset_index(), current_exposure=current_exposure)
-            target = bundle.final_target
+            mark_signal = float(bar_t.get("close", 0.0))
+            if mark_signal <= 0:
+                continue
 
-            risk_mgr.update_runtime_state(risk_state, equity, ts)
-            # apply stale data, kill-switch, and drawdown breakers
+            equity_signal = cash + btc * mark_signal
+            current_exposure = max(0.0, min(1.0, (btc * mark_signal / equity_signal) if equity_signal > 0 else 0.0))
+
+            bundle: RegimeDecisionBundle = orchestrator.compute_target_position(
+                signal_ts,
+                hourly_ctx.reset_index(),
+                daily_ctx.reset_index(),
+                current_exposure=current_exposure,
+            )
+            raw_target = float(bundle.final_target)
+
+            risk_mgr.update_runtime_state(risk_state, equity_signal, signal_ts)
             target = risk_mgr.apply_caps(
-                target,
+                raw_target,
                 risk_state,
-                ts.to_pydatetime(),
-                ts.to_pydatetime(),
+                signal_ts.to_pydatetime(),
+                signal_ts.to_pydatetime(),
                 timeframe_minutes=60,
                 current_fraction=current_exposure,
             )
-            if target != bundle.final_target:
+            if target != raw_target:
                 bundle.final_target = target
 
-            if target > current_exposure:
-                side = "BUY"
-                delta = target - current_exposure
-                is_taker = True
-                fee_rate = float(self.fees[1])
-                # apply slippage as positive drift for buys
-                fill_price = float(row["close"]) * (1 + self.slippage_bps / 1e4)
-                if self.use_spread_slippage:
-                    spread_adj = (row.get("high", row["close"]) - row.get("low", row["close"])) / max(1.0, row["close"]) / 2
-                    fill_price *= 1 + min(1.0, spread_adj)
-            elif target < current_exposure:
-                side = "SELL"
-                delta = target - current_exposure
-                is_taker = True
-                fee_rate = float(self.fees[1])
-                fill_price = float(row["close"]) * (1 - self.slippage_bps / 1e4)
-                if self.use_spread_slippage:
-                    spread_adj = (row.get("high", row["close"]) - row.get("low", row["close"])) / max(1.0, row["close"]) / 2
-                    fill_price *= 1 - min(1.0, spread_adj)
-            else:
-                side = "NONE"
-                delta = 0.0
+            should_trade, target_bucket, rebalance_reason = rebalance.should_rebalance(
+                target,
+                current_exposure,
+                equity_signal,
+                signal_ts,
+            )
 
-            if abs(delta) >= 1e-6 and equity > 0:
-                desired_notional = abs(delta) * equity
+            if should_trade:
+                delta = target_bucket - current_exposure
+                side = "BUY" if delta > 0 else "SELL"
+                desired_notional = abs(delta) * equity_signal
+                qty = desired_notional / mark_signal if mark_signal > 0 else 0.0
+
+                # Cap by available inventory/cash before attempting fill.
                 if side == "BUY":
-                    max_notional = cash / (1.0 + fee_rate)
-                    notional = max(0.0, min(desired_notional, max_notional))
-                    btc_delta = notional / max(fill_price, 1e-12)
-                    cash -= notional
-                    btc += btc_delta
+                    max_qty_by_cash = cash / (mark_signal * (1.0 + float(self.fees[1]))) if mark_signal > 0 else 0.0
+                    qty = min(qty, max(0.0, max_qty_by_cash))
                 else:
-                    max_btc = max(0.0, btc)
-                    btc_delta = min(desired_notional / max(fill_price, 1e-12), max_btc)
-                    notional = btc_delta * fill_price
-                    cash += notional
-                    btc -= btc_delta
+                    qty = min(qty, max(0.0, btc))
 
-                if notional > 0 and btc_delta > 0:
-                    fee = notional * fee_rate
-                    cash -= fee
-                    events.append(
-                        ExecutionEvent(
-                            ts=ts.to_pydatetime(),
-                            side=side,
-                            target_before=current_exposure,
-                            target_after=target,
-                            fraction_delta=delta,
-                            price=fill_price,
-                            btc_qty=btc_delta,
-                            notional=notional,
-                            fee=fee,
-                            fee_rate=fee_rate,
-                            is_taker=is_taker,
-                            micro_regime=bundle.micro_regime.value,
-                            strategy=bundle.strategy_name,
-                        )
-                    )
-                equity = cash + btc * row["close"]
-                risk_state.current_equity = equity
-            else:
-                equity = cash + btc * row["close"]
+                order_type = "market"
+                limit_price = None
+                if fill_model.name == "bid_ask" and exec_cfg.maker_first:
+                    spread_bps = exec_cfg.spread_bps if self.use_spread_slippage else 0.0
+                    mark_open = float(bar_t1.get("open", mark_signal))
+                    bid = mark_open * (1.0 - spread_bps / 20_000.0)
+                    ask = mark_open * (1.0 + spread_bps / 20_000.0)
+                    order_type = "limit"
+                    limit_price = bid if side == "BUY" else ask
 
-            risk_state.current_equity = equity
-            if equity > risk_state.equity_peak:
-                risk_state.equity_peak = equity
+                order = BacktestOrder(
+                    side=side,
+                    qty=max(0.0, qty),
+                    order_type=order_type,  # maker-first simulation for bid_ask model
+                    limit_price=limit_price,
+                    post_only=order_type == "limit",
+                )
+                market_state = MarketState(
+                    spread_bps=exec_cfg.spread_bps if self.use_spread_slippage else 0.0,
+                    impact_bps=exec_cfg.impact_bps,
+                )
+                fill = fill_model.fill(order, bar_t, bar_t1, market_state)
 
-            dd = risk_state.drawdown
-            post_exposure = max(0.0, min(1.0, (btc * row["close"] / equity) if equity > 0 else 0.0))
+                if fill.filled and fill.qty > 0:
+                    notional = float(fill.qty * fill.price)
+                    fee_rate = cost_model.fee_rate(fill.is_maker)
+                    fee = cost_model.fee(notional, fill.is_maker)
+
+                    # Enforce min notional after fill pricing.
+                    if notional >= exec_cfg.min_trade_notional_usd:
+                        qty_exec = float(fill.qty)
+
+                        if side == "BUY":
+                            max_notional = cash / (1.0 + fee_rate)
+                            notional = min(notional, max_notional)
+                            qty_exec = notional / max(fill.price, 1e-12)
+                            fee = cost_model.fee(notional, fill.is_maker)
+                            cash -= notional + fee
+                            btc += qty_exec
+                        else:
+                            qty_exec = min(qty_exec, max(0.0, btc))
+                            notional = qty_exec * fill.price
+                            fee = cost_model.fee(notional, fill.is_maker)
+                            btc -= qty_exec
+                            cash += notional - fee
+
+                        if qty_exec > 0 and notional > 0:
+                            slippage_cost = cost_model.slippage_cost(side, fill.price, fill.mark_price, qty_exec)
+                            slippage_bps = cost_model.slippage_bps(side, fill.price, fill.mark_price)
+                            events.append(
+                                ExecutionEvent(
+                                    ts=exec_ts.to_pydatetime(),
+                                    side=side,
+                                    target_before=current_exposure,
+                                    target_after=target_bucket,
+                                    fraction_delta=delta,
+                                    price=float(fill.price),
+                                    mark_price=float(fill.mark_price),
+                                    slippage_bps=float(slippage_bps),
+                                    slippage_cost=float(slippage_cost),
+                                    btc_qty=float(qty_exec),
+                                    notional=float(notional),
+                                    fee=float(fee),
+                                    fee_rate=float(fee_rate),
+                                    is_taker=not fill.is_maker,
+                                    is_maker=bool(fill.is_maker),
+                                    micro_regime=bundle.micro_regime.value,
+                                    strategy=bundle.strategy_name,
+                                    fill_model=fill_model.name,
+                                    rebalance_reason=rebalance_reason,
+                                )
+                            )
+                            rebalance.on_trade(signal_ts, target_bucket)
+
+            equity_exec = cash + btc * float(bar_t1.get("close", mark_signal))
+            risk_state.current_equity = equity_exec
+            if equity_exec > risk_state.equity_peak:
+                risk_state.equity_peak = equity_exec
+
+            drawdown = risk_state.drawdown
+            mark_exec = float(bar_t1.get("close", mark_signal))
+            post_exposure = max(0.0, min(1.0, (btc * mark_exec / equity_exec) if equity_exec > 0 else 0.0))
+
             equity_rows.append(
                 {
-                    "timestamp": ts,
-                    "equity": equity,
+                    "timestamp": exec_ts,
+                    "equity": equity_exec,
                     "cash": cash,
                     "btc": btc,
-                    "btc_price": row["close"],
+                    "btc_price": mark_exec,
                     "exposure": post_exposure,
-                    "drawdown": dd,
+                    "drawdown": drawdown,
                     "micro_regime": bundle.micro_regime.value,
                     "macro_risk_on": bundle.macro_risk_on,
                     "strategy": bundle.strategy_name,
-                    "target": bundle.final_target,
+                    "target": target_bucket,
+                    "raw_target": raw_target,
                 }
             )
             decisions_rows.append(
                 {
-                    "timestamp": ts,
+                    "timestamp": signal_ts,
+                    "decision_applies_at": exec_ts,
                     "micro_regime": bundle.micro_regime.value,
                     "strategy": bundle.strategy_name,
                     "macro_risk_on": bundle.macro_risk_on,
                     "macro_reason": bundle.macro_reason,
-                    "target": bundle.final_target,
+                    "target": target_bucket,
+                    "raw_target": raw_target,
+                    "rebalance_reason": rebalance_reason,
                     "regime_target": bundle.regime_target,
                     "base_target": bundle.base_target,
                     "metadata": bundle.metadata,
@@ -232,7 +316,6 @@ class BacktestEngine:
         dec_raw = pd.DataFrame(decisions_rows)
         dec = dec_raw.set_index("timestamp").sort_index() if not dec_raw.empty else pd.DataFrame()
 
-        # diagnostics
         from .metrics import compute_metrics
         from .regime_reports import performance_by_regime, regime_switch_count, time_in_regime, turnover_at_regime_changes
 
@@ -241,6 +324,7 @@ class BacktestEngine:
             freq_per_year = int(round(365 * 24 * 3600 / max(step_seconds, 1.0)))
         else:
             freq_per_year = 8760
+
         metrics = compute_metrics(eq_df["equity"], tr, eq_df.get("exposure"), freq_per_year=freq_per_year)
         by_regime = performance_by_regime(eq_df, tr)
         in_regime = time_in_regime(eq_df)
@@ -251,6 +335,9 @@ class BacktestEngine:
             "turnover": metrics.get("turnover", 0.0),
             "regime_switches": switches,
             "turnover_at_regime_changes": turn_reg,
+            "fill_model": fill_model.name,
+            "rebalance_policy": exec_cfg.rebalance_policy,
+            "trade_count": int(len(tr)),
         }
 
         return BacktestResult(
