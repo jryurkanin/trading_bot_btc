@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import json
 
 import numpy as np
 import pandas as pd
+
+from ..backtest.reporting import write_strict_json, dumps_strict_json
 
 
 @dataclass
@@ -192,11 +193,10 @@ def run_pnl_decomposition(
         ci_mode=ci_mode,
     )
 
-    out_path = output_dir / "execution_quality.json"
-    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    out_path = write_strict_json(output_dir / "execution_quality.json", result)
 
     print("Execution quality summary")
-    print(json.dumps({
+    print(dumps_strict_json({
         "net_return": result["net_return"],
         "gross_return": result["gross_return"],
         "total_fees": result["total_fees"],

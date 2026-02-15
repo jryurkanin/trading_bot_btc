@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -14,6 +13,7 @@ from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.backtest.engine import BacktestEngine
+from bot.backtest.reporting import write_strict_json, dumps_strict_json
 from bot.analysis.pnl_decomposition import run_pnl_decomposition
 
 
@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="regime_switching")
+    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2"])
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--initial-equity", type=float, default=10_000.0)
     p.add_argument("--maker-bps", type=float, default=10.0)
@@ -37,6 +37,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-quantization-step", type=float, default=None)
     p.add_argument("--min-time-between-trades-hours", type=float, default=None)
     p.add_argument("--max-trades-per-day", type=int, default=None)
+
+    # macro scoring + trend boost (all optional, backward-compatible)
+    p.add_argument("--macro-mode", choices=["binary", "score"], default=None)
+    p.add_argument("--macro-score-transform", choices=["linear", "piecewise"], default=None)
+    p.add_argument("--macro-score-floor", type=float, default=None)
+    p.add_argument("--macro-score-min-to-trade", type=float, default=None)
+    p.add_argument("--trend-boost-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--trend-boost-multiplier", type=float, default=None)
+    p.add_argument("--trend-boost-adx-threshold", type=float, default=None)
+    p.add_argument("--trend-boost-macro-score-threshold", type=float, default=None)
+    p.add_argument("--trend-boost-confirm-days", type=int, default=None)
+    p.add_argument("--trend-boost-min-on-days", type=int, default=None)
+
     p.add_argument("--ci-mode", action="store_true")
     p.add_argument("--no-spread", action="store_true")
     p.add_argument("--output", default="reports")
@@ -55,6 +68,12 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.initial_equity = args.initial_equity
+    cfg.backtest.strategy = args.strategy
+
+    # New strategy variant keeps backward compatibility by only applying when explicitly requested.
+    if args.strategy == "regime_switching_v2":
+        cfg.regime.macro_mode = "score"
+        cfg.regime.trend_boost_enabled = True
 
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
@@ -72,6 +91,29 @@ def main() -> int:
         cfg.execution.max_trades_per_day = int(args.max_trades_per_day)
     if args.impact_bps is not None:
         cfg.execution.impact_bps = float(args.impact_bps)
+
+    if args.macro_mode is not None:
+        cfg.regime.macro_mode = args.macro_mode
+    if args.macro_score_transform is not None:
+        cfg.regime.macro_score_transform = args.macro_score_transform
+    if args.macro_score_floor is not None:
+        cfg.regime.macro_score_floor = float(args.macro_score_floor)
+    if args.macro_score_min_to_trade is not None:
+        cfg.regime.macro_score_min_to_trade = float(args.macro_score_min_to_trade)
+
+    if args.trend_boost_enabled is not None:
+        cfg.regime.trend_boost_enabled = bool(args.trend_boost_enabled)
+    if args.trend_boost_multiplier is not None:
+        cfg.regime.trend_boost_multiplier = float(args.trend_boost_multiplier)
+    if args.trend_boost_adx_threshold is not None:
+        cfg.regime.trend_boost_adx_threshold = float(args.trend_boost_adx_threshold)
+    if args.trend_boost_macro_score_threshold is not None:
+        cfg.regime.trend_boost_macro_score_threshold = float(args.trend_boost_macro_score_threshold)
+    if args.trend_boost_confirm_days is not None:
+        cfg.regime.trend_boost_confirm_days = int(args.trend_boost_confirm_days)
+    if args.trend_boost_min_on_days is not None:
+        cfg.regime.trend_boost_min_on_days = int(args.trend_boost_min_on_days)
+
     if args.ci_mode:
         cfg.backtest.ci_mode = True
 
@@ -145,9 +187,20 @@ def main() -> int:
             "max_trades_per_day": cfg.execution.max_trades_per_day,
             "impact_bps": cfg.execution.impact_bps,
         },
+        "regime_config": {
+            "macro_mode": cfg.regime.macro_mode,
+            "macro_score_transform": cfg.regime.macro_score_transform,
+            "macro_score_floor": cfg.regime.macro_score_floor,
+            "macro_score_min_to_trade": cfg.regime.macro_score_min_to_trade,
+            "trend_boost_enabled": cfg.regime.trend_boost_enabled,
+            "trend_boost_multiplier": cfg.regime.trend_boost_multiplier,
+            "trend_boost_adx_threshold": cfg.regime.trend_boost_adx_threshold,
+            "trend_boost_macro_score_threshold": cfg.regime.trend_boost_macro_score_threshold,
+            "trend_boost_confirm_days": cfg.regime.trend_boost_confirm_days,
+            "trend_boost_min_on_days": cfg.regime.trend_boost_min_on_days,
+        },
     }
-    report_path = out / "report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report_path = write_strict_json(out / "report.json", report)
 
     execution_quality = run_pnl_decomposition(
         out / "trades.csv",
@@ -159,7 +212,7 @@ def main() -> int:
     )
 
     print("Backtest completed")
-    print(json.dumps({"metrics": report["metrics"], "execution_quality": execution_quality}, indent=2))
+    print(dumps_strict_json({"metrics": report["metrics"], "execution_quality": execution_quality}, indent=2))
     print(f"Equity curve: {out / 'equity_curve.csv'}")
     print(f"Report: {report_path}")
     return 0

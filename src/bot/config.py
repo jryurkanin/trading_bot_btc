@@ -74,6 +74,21 @@ class RegimeConfig(BaseModel):
     daily_momentum_window: int = 28
     daily_momentum_quantile: float = 0.66
 
+    # Macro scoring mode (backward-compatible default keeps legacy binary gating)
+    macro_mode: Literal["binary", "score"] = "binary"
+    macro_score_components: list[str] = Field(
+        default_factory=lambda: [
+            "close_gt_sma50",
+            "close_gt_sma200",
+            "ret_28d_pos",
+            "ret_90d_pos",
+        ]
+    )
+    macro_score_transform: Literal["linear", "piecewise"] = "linear"
+    macro_score_floor: float = 0.0
+    macro_score_min_to_trade: float = 0.25
+    macro_piecewise_levels: list[float] = Field(default_factory=lambda: [0.0, 0.33, 0.66, 1.0])
+
     # Trend playbook selection
     trend_playbook: Literal["core_momentum_daily", "breakout"] = "core_momentum_daily"
 
@@ -111,6 +126,15 @@ class RegimeConfig(BaseModel):
     vol_target_multiplier: float = 1.0
     atr_window: int = 14
     atr_mult: float = 3.0
+
+    # Trend-strength booster (disabled by default for backward compatibility)
+    trend_boost_enabled: bool = False
+    trend_boost_multiplier: float = 1.25
+    trend_boost_adx_threshold: float = 25.0
+    trend_boost_macro_score_threshold: float = 0.75
+    trend_boost_confirm_days: int = 2
+    trend_boost_min_on_days: int = 2
+    trend_boost_regime_gate: Literal["micro_trend", "daily_sma50"] = "micro_trend"
 
     # High vol
     high_vol_cap: float = 0.2

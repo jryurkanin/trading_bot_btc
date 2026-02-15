@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--config", default=None)
+    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2"])
     p.add_argument("--out", default="reports")
     p.add_argument("--grid", action="append", help="KEY=VAL, can be repeated (e.g. bb_window=20)")
     p.add_argument("--metric", default="cagr")
@@ -81,6 +82,10 @@ def main() -> int:
     args = parse_args()
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
+    cfg.backtest.strategy = args.strategy
+    if args.strategy == "regime_switching_v2":
+        cfg.regime.macro_mode = "score"
+        cfg.regime.trend_boost_enabled = True
     start = parse_ts(args.start)
     end = parse_ts(args.end)
 

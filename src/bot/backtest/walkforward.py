@@ -91,6 +91,8 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 end=train_end.to_pydatetime(),
                 config=cfg_for_run.backtest,
                 regime_config=cfg_for_run.regime,
+                risk_config=cfg_for_run.risk,
+                execution_config=cfg_for_run.execution,
             )
             _ = engine_train.run()  # warm-up only
 
@@ -102,6 +104,8 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 end=test_end.to_pydatetime(),
                 config=cfg_for_run.backtest,
                 regime_config=cfg_for_run.regime,
+                risk_config=cfg_for_run.risk,
+                execution_config=cfg_for_run.execution,
             )
             result = engine_test.run()
             results.append(
