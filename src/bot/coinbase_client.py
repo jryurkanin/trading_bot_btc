@@ -68,6 +68,8 @@ class ProductConstraints:
     base_increment: float
     quote_increment: float
     base_min_size: float
+    quote_min_size: float
+    price_increment: float
     base_max_size: Optional[float]
     min_notional: float
 
@@ -262,6 +264,10 @@ class RESTClientWrapper:
             fn = getattr(self._sdk_client, "get_product_book")
             return self._normalize_sdk_response(fn(**params))
 
+        if method == "GET" and path == "/best_bid_ask" and hasattr(self._sdk_client, "get_best_bid_ask"):
+            fn = getattr(self._sdk_client, "get_best_bid_ask")
+            return self._normalize_sdk_response(fn(**params))
+
         if method == "GET" and path.startswith("/products/") and "/candles" not in path and "/book" not in path:
             if hasattr(self._sdk_client, "get_product"):
                 fn = getattr(self._sdk_client, "get_product")
@@ -430,6 +436,33 @@ class RESTClientWrapper:
             return 86400
         raise ValueError(f"Unsupported granularity: {tf}")
 
+    def get_best_bid_ask(self, product_id: str) -> BestBidAsk:
+        # Preferred endpoint for top-of-book snapshots.
+        try:
+            data = self._request("GET", "/best_bid_ask", params={"product_ids": product_id})
+            books = []
+            if isinstance(data, dict):
+                books = data.get("pricebooks") or data.get("price_books") or data.get("books") or []
+            if books:
+                book = books[0]
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+
+                def _px(levels: list[dict[str, Any]]) -> float:
+                    if not levels:
+                        return 0.0
+                    top = levels[0]
+                    return self._as_float(top.get("price") or top.get("px"), 0.0)
+
+                bid = _px(bids)
+                ask = _px(asks)
+                return BestBidAsk(bid=bid, ask=ask if ask > 0 else bid, time=datetime.utcnow())
+        except Exception:
+            pass
+
+        # fallback to product book endpoint
+        return self.get_product_book(product_id)
+
     def get_product_book(self, product_id: str) -> BestBidAsk:
         data = self._request("GET", f"/products/{product_id}/book", params={"product_id": product_id})
         if not isinstance(data, dict):
@@ -476,7 +509,9 @@ class RESTClientWrapper:
         data = self.get_product(product_id)
         base_increment = self._as_float(data.get("base_increment"), 1e-8)
         quote_increment = self._as_float(data.get("quote_increment"), 0.01)
+        price_increment = self._as_float(data.get("price_increment"), quote_increment)
         base_min_size = self._as_float(data.get("base_min_size"), base_increment)
+        quote_min_size = self._as_float(data.get("quote_min_size"), 0.0)
         base_max_size_raw = data.get("base_max_size")
         base_max_size = self._as_float(base_max_size_raw, 0.0) if base_max_size_raw is not None else None
 
@@ -490,6 +525,8 @@ class RESTClientWrapper:
             base_increment=base_increment if base_increment > 0 else 1e-8,
             quote_increment=quote_increment if quote_increment > 0 else 0.01,
             base_min_size=base_min_size if base_min_size > 0 else base_increment,
+            quote_min_size=max(0.0, quote_min_size),
+            price_increment=price_increment if price_increment > 0 else quote_increment,
             base_max_size=base_max_size if base_max_size and base_max_size > 0 else None,
             min_notional=max(0.0, min_notional),
         )

@@ -14,6 +14,7 @@ from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.backtest.engine import BacktestEngine
+from bot.analysis.pnl_decomposition import run_pnl_decomposition
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     p.add_argument("--slippage-bps", type=float, default=5.0)
+    p.add_argument("--impact-bps", type=float, default=None)
+    p.add_argument("--fill-model", choices=["next_open", "bid_ask", "worst_case_bar"], default=None)
+    p.add_argument("--rebalance-policy", choices=["signal_change_only", "band", "always"], default=None)
+    p.add_argument("--min-trade-notional-usd", type=float, default=None)
+    p.add_argument("--min-exposure-delta", type=float, default=None)
+    p.add_argument("--target-quantization-step", type=float, default=None)
+    p.add_argument("--min-time-between-trades-hours", type=float, default=None)
+    p.add_argument("--max-trades-per-day", type=int, default=None)
+    p.add_argument("--ci-mode", action="store_true")
     p.add_argument("--no-spread", action="store_true")
     p.add_argument("--output", default="reports")
     return p.parse_args()
@@ -45,6 +55,25 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.initial_equity = args.initial_equity
+
+    if args.fill_model:
+        cfg.execution.fill_model = args.fill_model
+    if args.rebalance_policy:
+        cfg.execution.rebalance_policy = args.rebalance_policy
+    if args.min_trade_notional_usd is not None:
+        cfg.execution.min_trade_notional_usd = float(args.min_trade_notional_usd)
+    if args.min_exposure_delta is not None:
+        cfg.execution.min_exposure_delta = float(args.min_exposure_delta)
+    if args.target_quantization_step is not None:
+        cfg.execution.target_quantization_step = float(args.target_quantization_step)
+    if args.min_time_between_trades_hours is not None:
+        cfg.execution.min_time_between_trades_hours = float(args.min_time_between_trades_hours)
+    if args.max_trades_per_day is not None:
+        cfg.execution.max_trades_per_day = int(args.max_trades_per_day)
+    if args.impact_bps is not None:
+        cfg.execution.impact_bps = float(args.impact_bps)
+    if args.ci_mode:
+        cfg.backtest.ci_mode = True
 
     store = CandleStore(cfg.data)
     start = parse_ts(args.start)
@@ -85,6 +114,9 @@ def main() -> int:
         fees=(maker, taker),
         slippage_bps=args.slippage_bps,
         use_spread_slippage=not args.no_spread,
+        regime_config=cfg.regime,
+        risk_config=cfg.risk,
+        execution_config=cfg.execution,
     )
     result = engine.run()
 
@@ -103,12 +135,31 @@ def main() -> int:
         "metrics": result.metrics,
         "regime_metrics": result.regime_stats,
         "diagnostics": result.diagnostics,
+        "execution": {
+            "fill_model": cfg.execution.fill_model,
+            "rebalance_policy": cfg.execution.rebalance_policy,
+            "min_trade_notional_usd": cfg.execution.min_trade_notional_usd,
+            "min_exposure_delta": cfg.execution.min_exposure_delta,
+            "target_quantization_step": cfg.execution.target_quantization_step,
+            "min_time_between_trades_hours": cfg.execution.min_time_between_trades_hours,
+            "max_trades_per_day": cfg.execution.max_trades_per_day,
+            "impact_bps": cfg.execution.impact_bps,
+        },
     }
     report_path = out / "report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    execution_quality = run_pnl_decomposition(
+        out / "trades.csv",
+        out / "equity_curve.csv",
+        out,
+        min_trade_notional_usd=cfg.execution.min_trade_notional_usd,
+        max_allowed_slippage_bps=cfg.execution.max_allowed_slippage_bps,
+        ci_mode=cfg.backtest.ci_mode,
+    )
+
     print("Backtest completed")
-    print(json.dumps({"metrics": report["metrics"]}, indent=2))
+    print(json.dumps({"metrics": report["metrics"], "execution_quality": execution_quality}, indent=2))
     print(f"Equity curve: {out / 'equity_curve.csv'}")
     print(f"Report: {report_path}")
     return 0

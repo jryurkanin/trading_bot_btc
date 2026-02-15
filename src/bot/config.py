@@ -74,6 +74,9 @@ class RegimeConfig(BaseModel):
     daily_momentum_window: int = 28
     daily_momentum_quantile: float = 0.66
 
+    # Trend playbook selection
+    trend_playbook: Literal["core_momentum_daily", "breakout"] = "core_momentum_daily"
+
     # Micro
     adx_window: int = 14
     chop_window: int = 14
@@ -94,6 +97,10 @@ class RegimeConfig(BaseModel):
     range_max_exposure: float = 0.75
     range_min_time_between_trades_hours: float = 2.0
     range_max_trades_per_day: int = 4
+
+    # Hourly overlay controls (small add/reduce around core baseline)
+    enable_hourly_overlay: bool = True
+    overlay_max_adjustment: float = 0.25
 
     # Trend
     trend_mode: Literal["donchian", "ema_cross"] = "donchian"
@@ -118,6 +125,9 @@ class RegimeConfig(BaseModel):
     hmm_window_hours: int = 1000
     hmm_n_states: int = 3
 
+    # Back-compat switch for old sub-strategy switching behavior
+    legacy_substrategy_switching: bool = False
+
 
 class RiskConfig(BaseModel):
     max_drawdown_cut_pct: float = 0.25
@@ -140,13 +150,33 @@ class ExecutionConfig(BaseModel):
     post_only: bool = True
     max_slippage_bps: float = 35.0
     spread_bps: float = 15.0
+    impact_bps: float = 2.0
     maker_bps: float = 10.0
     taker_bps: float = 25.0
     paper_fill_delay_s: float = 0.5
 
+    # backtest execution realism
+    fill_model: Literal["next_open", "bid_ask", "worst_case_bar"] = "bid_ask"
+    rebalance_policy: Literal["signal_change_only", "band", "always"] = "signal_change_only"
+
+    # anti-churn controls
+    min_trade_notional_usd: float = 50.0
+    min_exposure_delta: float = 0.05
+    target_quantization_step: float = 0.25
+    min_time_between_trades_hours: float = 1.0
+    max_trades_per_day: int = 8
+    max_allowed_slippage_bps: float = 50.0
+
     # exchange constraints
     enforce_product_constraints: bool = True
     min_notional_buffer_quote: float = 0.0
+
+    # maker-first routing
+    maker_first: bool = True
+    maker_timeout_seconds: int = 60
+    maker_retries: int = 3
+    allow_taker_fallback: bool = False
+    taker_fallback_only_if_edge_exceeds_cost: bool = True
 
     # cancel/replace lifecycle
     cancel_replace_on_timeout: bool = True
@@ -175,6 +205,7 @@ class BacktestConfig(BaseModel):
     slippage_bps: float = 5.0
     use_spread_slippage: bool = True
     max_trades_per_year: Optional[int] = None
+    ci_mode: bool = False
 
 
 class RuntimeConfig(BaseModel):

@@ -17,6 +17,8 @@ class DummyClient:
             base_increment=0.001,
             quote_increment=0.01,
             base_min_size=0.01,
+            quote_min_size=1.0,
+            price_increment=0.01,
             base_max_size=5.0,
             min_notional=10.0,
         )

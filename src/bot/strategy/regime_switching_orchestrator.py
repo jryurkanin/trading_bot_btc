@@ -101,6 +101,30 @@ class RegimeSwitchingOrchestrator:
     def _realized_vol(self, hourly: pd.DataFrame) -> pd.Series:
         return indicators.realized_vol(hourly["close"].pct_change(), self.cfg.realized_vol_window)
 
+    def _core_momentum_ratio(self, daily_df: pd.DataFrame) -> float:
+        if len(daily_df) < max(self.cfg.daily_trend_window, self.cfg.daily_momentum_window + 1):
+            return 0.0
+        close = daily_df["close"]
+        sma = indicators.sma(close, self.cfg.daily_trend_window).iloc[-1]
+        if pd.isna(sma):
+            return 0.0
+
+        base = close.shift(self.cfg.daily_momentum_window).iloc[-1]
+        if pd.isna(base) or float(base) == 0.0:
+            return 0.0
+        momentum = float(close.iloc[-1] / base - 1.0)
+
+        if float(close.iloc[-1]) <= float(sma):
+            return 0.0
+        if momentum <= 0:
+            return 0.25
+        # slow ramp for daily trend core sizing
+        if momentum < 0.02:
+            return 0.5
+        if momentum < 0.06:
+            return 0.75
+        return 1.0
+
     def _micro_regime(self, hourly: pd.DataFrame, idx: int) -> RegimeState:
         if idx < 2 or hourly.empty:
             return RegimeState.NEUTRAL
@@ -177,35 +201,74 @@ class RegimeSwitchingOrchestrator:
 
         strategy_ratio = 0.0
         strategy_name = ""
+        overlay_adj = 0.0
         metadata: Dict[str, float | str | int] = {"realized_vol": realized_vol, "base_target": base_target}
-
-        if micro_regime == RegimeState.TREND:
-            strategy_name = self.trend_strategy.name
-            strategy_ratio = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
-            metadata.update(self.trend_strategy.signal_reason(hourly_df, current_exposure, timestamp))
-        elif micro_regime == RegimeState.RANGE:
-            strategy_name = self.range_strategy.name
-            prev_row = hourly_df.iloc[-2] if len(hourly_df) >= 2 else None
-            strategy_ratio = self.range_strategy.compute_target(
-                hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]
-            )
-            metadata.update(self.range_strategy.signal_reason(hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]))
-        elif micro_regime == RegimeState.HIGH_VOL:
-            strategy_name = "high_vol_guard"
-            if self.cfg.high_vol_cap <= 0:
-                strategy_ratio = 0.0
-            else:
-                strategy_ratio = 1.0
-        else:
-            strategy_name = "neutral"
-            strategy_ratio = min(1.0, current_exposure / base_target) if base_target > 0 else 0.0
 
         regime_mult = self.REGIME_MULTIPLIERS.get(micro_regime, 0.5)
         if micro_regime == RegimeState.HIGH_VOL and self.cfg.high_vol_cap > 0:
             regime_mult = self.cfg.high_vol_cap
 
-        regime_target = base_target * regime_mult
-        final_target = regime_target * strategy_ratio
+        # Legacy path preserves historical behavior when explicitly enabled.
+        if self.cfg.legacy_substrategy_switching:
+            if micro_regime == RegimeState.TREND:
+                strategy_name = self.trend_strategy.name
+                strategy_ratio = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
+                metadata.update(self.trend_strategy.signal_reason(hourly_df, current_exposure, timestamp))
+            elif micro_regime == RegimeState.RANGE:
+                strategy_name = self.range_strategy.name
+                prev_row = hourly_df.iloc[-2] if len(hourly_df) >= 2 else None
+                strategy_ratio = self.range_strategy.compute_target(
+                    hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]
+                )
+                metadata.update(
+                    self.range_strategy.signal_reason(hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"])
+                )
+            elif micro_regime == RegimeState.HIGH_VOL:
+                strategy_name = "high_vol_guard"
+                strategy_ratio = 1.0 if self.cfg.high_vol_cap > 0 else 0.0
+            else:
+                strategy_name = "neutral"
+                strategy_ratio = min(1.0, current_exposure / base_target) if base_target > 0 else 0.0
+
+            regime_target = base_target * regime_mult
+            final_target = regime_target * strategy_ratio
+        else:
+            # New default path: TREND uses slower daily core momentum, hourly signal only overlays.
+            regime_target = base_target * regime_mult
+            if micro_regime == RegimeState.TREND and self.cfg.trend_playbook == "core_momentum_daily":
+                strategy_name = "core_momentum_daily"
+                core_ratio = self._core_momentum_ratio(daily_df)
+                regime_target = regime_target * core_ratio
+                strategy_ratio = 1.0
+                metadata["core_ratio"] = core_ratio
+
+                if self.cfg.enable_hourly_overlay:
+                    trend_signal = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
+                    # map [0,1] signal to [-overlay_max_adjustment, +overlay_max_adjustment]
+                    overlay_adj = (trend_signal - 0.5) * 2.0 * self.cfg.overlay_max_adjustment
+                    metadata["overlay_signal"] = trend_signal
+                    metadata["overlay_adj"] = overlay_adj
+
+                final_target = regime_target * (1.0 + overlay_adj)
+            elif micro_regime == RegimeState.RANGE:
+                strategy_name = self.range_strategy.name
+                prev_row = hourly_df.iloc[-2] if len(hourly_df) >= 2 else None
+                strategy_ratio = self.range_strategy.compute_target(
+                    hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]
+                )
+                metadata.update(
+                    self.range_strategy.signal_reason(hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"])
+                )
+                final_target = regime_target * strategy_ratio
+            elif micro_regime == RegimeState.HIGH_VOL:
+                strategy_name = "high_vol_guard"
+                strategy_ratio = 1.0 if self.cfg.high_vol_cap > 0 else 0.0
+                final_target = regime_target * strategy_ratio
+            else:
+                strategy_name = "neutral_hold"
+                strategy_ratio = min(1.0, current_exposure / base_target) if base_target > 0 else 0.0
+                final_target = regime_target * strategy_ratio
+
         final_target = max(0.0, min(self.cfg.max_position_fraction, float(final_target)))
 
         return RegimeDecisionBundle(
