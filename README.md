@@ -57,6 +57,7 @@ Production-oriented Bitcoin strategy codebase for Coinbase Advanced Trade with:
 ├── scripts/
 │   ├── backtest.py
 │   ├── optimize.py
+│   ├── frontier_sweep.py
 │   └── trade.py
 ├── tests/
 └── README.md
@@ -97,7 +98,30 @@ This writes:
 - `reports/decisions.csv`
 - `reports/report.json`
 
-### 2) Walk-forward sweep
+### Macro scoring + trend booster flags (backward compatible)
+
+Defaults preserve prior behavior:
+- `macro_mode="binary"`
+- `trend_boost_enabled=false`
+
+Enable v2 behavior (score-based macro + trend boost):
+
+```bash
+python scripts/backtest.py \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --strategy regime_switching_v2 \
+  --fill-model bid_ask \
+  --macro-mode score \
+  --macro-score-floor 0.25 \
+  --macro-score-min-to-trade 0.25 \
+  --trend-boost-enabled \
+  --trend-boost-multiplier 1.25 \
+  --trend-boost-adx-threshold 25
+```
+
+### 2) Walk-forward sweep (legacy)
 
 ```bash
 python scripts/optimize.py \
@@ -108,13 +132,34 @@ python scripts/optimize.py \
   --grid range_tranche_size=0.2,0.25
 ```
 
-### 3) Paper trade (2+ cycles)
+### 3) Frontier sweep (walk-forward + cost stress)
+
+```bash
+python scripts/frontier_sweep.py \
+  --product BTC-USD \
+  --strategy regime_switching_v2 \
+  --fill-model bid_ask \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z
+```
+
+Outputs:
+- `artifacts/frontier/summary.csv` — one row per (params, window, scenario)
+- `artifacts/frontier/frontier.csv` — ranked top configs
+- `artifacts/frontier/best_config.json` — recommended config + reproduce command
+
+Interpretation:
+- ranking favors robust validation performance under stress costs,
+- then lower drawdown/turnover,
+- then higher Sharpe.
+
+### 4) Paper trade (2+ cycles)
 
 ```bash
 python scripts/trade.py --paper --product BTC-USD --cycles 2
 ```
 
-### 4) Live (sandbox)
+### 5) Live (sandbox)
 
 ```bash
 python scripts/trade.py --live --product BTC-USD --sandbox

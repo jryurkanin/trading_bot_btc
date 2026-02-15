@@ -326,7 +326,7 @@ class BacktestEngine:
             freq_per_year = 8760
 
         metrics = compute_metrics(eq_df["equity"], tr, eq_df.get("exposure"), freq_per_year=freq_per_year)
-        by_regime = performance_by_regime(eq_df, tr)
+        by_regime = performance_by_regime(eq_df, tr, decisions_df=dec, freq_per_year=freq_per_year)
         in_regime = time_in_regime(eq_df)
         switches = regime_switch_count(eq_df)
         turn_reg = turnover_at_regime_changes(eq_df, tr)
