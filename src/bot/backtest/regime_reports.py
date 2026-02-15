@@ -53,7 +53,11 @@ def turnover_at_regime_changes(equity_curve: pd.DataFrame, trades_df: pd.DataFra
     reg = eq[["ts", "micro_regime"]].copy().sort_values("ts")
     tr = trades_df[["ts", "notional"]].copy().sort_values("ts")
 
-    tr = pd.merge_asof(tr, reg, on="ts", direction="backward")
+    # normalize to epoch seconds to avoid datetime precision mismatch issues in merge_asof
+    reg["ts"] = pd.to_datetime(reg["ts"], utc=True).astype("int64") // 1_000_000_000
+    tr["ts"] = pd.to_datetime(tr["ts"], utc=True).astype("int64") // 1_000_000_000
+
+    tr = pd.merge_asof(tr.sort_values("ts"), reg.sort_values("ts"), on="ts", direction="backward")
     tr = tr.sort_values("ts")
     tr["prev_regime"] = tr["micro_regime"].shift(1)
     change = tr["micro_regime"].fillna("") != tr["prev_regime"].fillna("")

@@ -327,10 +327,16 @@ class RESTClientWrapper:
 
     def get_product_candles(self, product_id: str, start: datetime, end: datetime, timeframe: str = "1h", limit: int = 350) -> List[Any]:
         # timeframe accepted by SDK: "1h","1d" -> we also pass granularity and start/end
+        def _to_utc_naive(ts: datetime) -> datetime:
+            if ts.tzinfo is None:
+                return ts
+            return ts.astimezone(timezone.utc).replace(tzinfo=None)
+
         def _to_utc_iso(ts: datetime) -> str:
-            if ts.tzinfo is not None:
-                ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
-            return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+            return _to_utc_naive(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        start = _to_utc_naive(start)
+        end = _to_utc_naive(end)
 
         params = {
             "product_id": product_id,
@@ -339,20 +345,51 @@ class RESTClientWrapper:
             "end": _to_utc_iso(end),
             "limit": min(limit, 350),
         }
+
+        public_granularity = {
+            "1h": "ONE_HOUR",
+            "1d": "ONE_DAY",
+            "hour": "ONE_HOUR",
+            "day": "ONE_DAY",
+        }.get(timeframe, "ONE_HOUR")
         rows: List[Any] = []
         next_start = start
+        prev_start: Optional[datetime] = None
+        safety_iter = 0
         # pagination: move forward by fetched rows
         while next_start < end:
+            safety_iter += 1
+            if safety_iter > 10000:
+                raise RuntimeError("candle pagination safety stop triggered")
             chunk_end = end
-            req = self._request(
-                "GET",
-                "/products/{product_id}/candles".replace("{product_id}", product_id),
-                params={**params, "start": _to_utc_iso(next_start), "end": _to_utc_iso(chunk_end)},
-            )
-            if isinstance(req, list):
-                candles = req
-            else:
-                candles = req.get("candles") or req.get("response", {}).get("candles", [])
+            req_params = {**params, "start": _to_utc_iso(next_start), "end": _to_utc_iso(chunk_end)}
+            try:
+                req = self._request(
+                    "GET",
+                    "/products/{product_id}/candles".replace("{product_id}", product_id),
+                    params=req_params,
+                )
+                if isinstance(req, list):
+                    candles = req
+                else:
+                    candles = req.get("candles") or req.get("response", {}).get("candles", [])
+            except AuthError:
+                # Public fallback endpoint for backtests when brokerage auth is unavailable.
+                public_resp = self.sync_http.request(
+                    method="GET",
+                    url=f"/market/products/{product_id}/candles",
+                    params={
+                        "start": int(next_start.replace(tzinfo=timezone.utc).timestamp()),
+                        "end": int(chunk_end.replace(tzinfo=timezone.utc).timestamp()),
+                        "granularity": public_granularity,
+                    },
+                    headers={},
+                    timeout=self.config.request_timeout_s,
+                )
+                if public_resp.status_code >= 400:
+                    raise self._classify_http_error(public_resp.status_code, public_resp.text, dict(public_resp.headers))
+                payload = public_resp.json() if public_resp.text else {}
+                candles = payload.get("candles") if isinstance(payload, dict) else []
             if not candles:
                 break
             # Keep deterministic ordering oldest->newest
@@ -378,7 +415,12 @@ class RESTClientWrapper:
                     last_ts = int(float(last_ts))
                 except Exception:
                     last_ts = 0
-            next_start = datetime.fromtimestamp(last_ts) + timedelta(seconds=self._granularity_seconds(timeframe))
+            next_candidate = datetime.fromtimestamp(last_ts) + timedelta(seconds=self._granularity_seconds(timeframe))
+            if prev_start is not None and next_candidate <= prev_start:
+                # no forward progress from provider payload; avoid infinite loop
+                break
+            prev_start = next_start
+            next_start = next_candidate
         return rows
 
     def _granularity_seconds(self, tf: str) -> int:
