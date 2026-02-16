@@ -35,9 +35,16 @@ class TrendFollowingBreakoutStrategy:
     def reset(self):
         self.state = TrendState()
 
-    def compute_target(self, hourly: pd.DataFrame, current_exposure: float, now: pd.Timestamp) -> float:
+    def compute_target(self, hourly: pd.DataFrame, current_exposure: float, now: pd.Timestamp,
+                       idx: int | None = None, precomputed: dict | None = None) -> float:
         if hourly.empty or len(hourly) < 2:
             return current_exposure
+
+        # If caller provides index + precomputed series, use direct lookups
+        # instead of recomputing rolling indicators on a growing slice.
+        if idx is not None and precomputed:
+            return self._compute_target_indexed(hourly, current_exposure, idx, precomputed)
+
         close = hourly["close"]
         high = hourly["high"]
         low = hourly["low"]
@@ -85,6 +92,55 @@ class TrendFollowingBreakoutStrategy:
 
         if current_exposure <= 0 and target == current_exposure:
             # no signal, no change
+            return current_exposure
+        if target > current_exposure:
+            self.state.entry_price = close_v
+        return target
+
+    def _compute_target_indexed(self, hourly: pd.DataFrame, current_exposure: float,
+                                idx: int, precomputed: dict) -> float:
+        """Fast path: use precomputed indicator series with index-based lookups."""
+        close = hourly["close"]
+        target = current_exposure
+        close_v = float(close.iloc[idx])
+        close_prev = float(close.iloc[idx - 1]) if idx >= 1 else close_v
+
+        if self.cfg.mode == "ema_cross":
+            fast_s = precomputed.get("ema_fast")
+            slow_s = precomputed.get("ema_slow")
+            fast_v = float(fast_s.iloc[idx])
+            slow_v = float(slow_s.iloc[idx])
+            prev_fast = float(fast_s.iloc[idx - 1]) if idx >= 1 else fast_v
+            prev_slow = float(slow_s.iloc[idx - 1]) if idx >= 1 else slow_v
+            crossed_up = prev_fast <= prev_slow and fast_v > slow_v
+            crossed_down = prev_fast >= prev_slow and fast_v < slow_v
+        else:
+            ch_high = precomputed.get("donchian_high")
+            ch_high_v = float(ch_high.iloc[idx - 1]) if idx >= 1 else float(ch_high.iloc[idx])
+            crossed_up = close_prev <= ch_high_v and close_v > ch_high_v
+            crossed_down = False
+
+        atr_s = precomputed.get("atr")
+        atr_v = float(atr_s.iloc[idx])
+
+        if self.state.entry_price is not None:
+            stop = self.state.entry_price - self.cfg.atr_mult * atr_v
+            if close_v < stop:
+                self.state.entry_price = None
+                return 0.0
+
+        if self.cfg.mode == "ema_cross" and crossed_down:
+            self.state.entry_price = None
+            return 0.0
+
+        if self.cfg.mode == "ema_cross" and not crossed_up and current_exposure > 0:
+            return current_exposure
+
+        if crossed_up:
+            target = self.cfg.trend_exposure_cap * self.cfg.vol_target_multiplier
+            self.state.entry_price = close_v
+
+        if current_exposure <= 0 and target == current_exposure:
             return current_exposure
         if target > current_exposure:
             self.state.entry_price = close_v

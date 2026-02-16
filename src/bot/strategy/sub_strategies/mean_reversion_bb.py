@@ -54,12 +54,21 @@ class MeanReversionBBStrategy:
         self.state.last_signal_ts = now
         self.state.trades_today += 1
 
-    def compute_target(self, hourly_row: pd.Series, prev_row: Optional[pd.Series], current_exposure: float, now: pd.Timestamp, close_series: pd.Series) -> float:
-        # compute bands
-        mid, up, low = bollinger_bands(close_series, window=self.cfg.bb_window, stdev=self.cfg.bb_stdev)
-        mid = float(mid.iloc[-1])
-        up = float(up.iloc[-1])
-        low = float(low.iloc[-1])
+    def compute_target(self, hourly_row: pd.Series, prev_row: Optional[pd.Series], current_exposure: float, now: pd.Timestamp, close_series: pd.Series,
+                       idx: int | None = None, precomputed: Dict | None = None) -> float:
+        # Use precomputed Bollinger bands if available
+        if idx is not None and precomputed:
+            bb_mid_s = precomputed.get("bb_mid")
+            bb_up_s = precomputed.get("bb_upper")
+            bb_low_s = precomputed.get("bb_lower")
+            mid = float(bb_mid_s.iloc[idx])
+            up = float(bb_up_s.iloc[idx])
+            low = float(bb_low_s.iloc[idx])
+        else:
+            _mid, _up, _low = bollinger_bands(close_series, window=self.cfg.bb_window, stdev=self.cfg.bb_stdev)
+            mid = float(_mid.iloc[-1])
+            up = float(_up.iloc[-1])
+            low = float(_low.iloc[-1])
         close = float(hourly_row["close"])
 
         target = current_exposure
@@ -87,7 +96,17 @@ class MeanReversionBBStrategy:
         current_exposure: float,
         now: pd.Timestamp,
         close_series: pd.Series,
+        idx: int | None = None,
+        precomputed: Dict | None = None,
     ) -> Dict[str, float]:
+        if idx is not None and precomputed:
+            return {
+                "close": float(hourly_row["close"]),
+                "bb_mid": float(precomputed["bb_mid"].iloc[idx]),
+                "bb_up": float(precomputed["bb_upper"].iloc[idx]),
+                "bb_low": float(precomputed["bb_lower"].iloc[idx]),
+                "current_exposure": float(current_exposure),
+            }
         mid, up, lo = bollinger_bands(close_series, window=self.cfg.bb_window, stdev=self.cfg.bb_stdev)
         return {
             "close": float(hourly_row["close"]),
