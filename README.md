@@ -108,7 +108,7 @@ This writes:
 - `regime_switching_v2`: score-based macro scaling + trend booster
 - `regime_switching_v3`: stateful daily macro gate (`OFF` / `ON_HALF` / `ON_FULL`) with hysteresis + directional trend boost
 
-Defaults preserve prior behavior unless you explicitly choose `regime_switching_v2` or `regime_switching_v3`.
+Defaults preserve prior behavior unless you explicitly choose `regime_switching_v2`, `regime_switching_v3`, `regime_switching_v4_core`, or `macro_gate_benchmark`.
 
 Enable v2 behavior (score-based macro + trend boost):
 
@@ -152,6 +152,53 @@ python scripts/backtest.py \
   --trend-boost-min-off-days 1
 ```
 
+Enable v4 core strategy (macro gate + micro regime scaling + intraday suppression):
+
+```bash
+python scripts/backtest.py \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --strategy regime_switching_v4_core \
+  --fill-model bid_ask \
+  --v4-macro-enter-threshold 0.75 \
+  --v4-macro-exit-threshold 0.25 \
+  --v4-macro-confirm-days 2 \
+  --v4-macro-half-multiplier 0.5 \
+  --v4-macro-full-multiplier 1.0 \
+  --v4-micro-mult-trend 1.0 \
+  --v4-micro-mult-range 0.75 \
+  --v4-micro-mult-neutral 0.5 \
+  --v4-micro-mult-high-vol 0.0
+```
+
+Enable macro gate benchmark (same as v4 but no micro regime scaling — measures pure macro value):
+
+```bash
+python scripts/backtest.py \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --strategy macro_gate_benchmark \
+  --fill-model bid_ask
+```
+
+#### V4 Core Strategy Design
+
+The v4 core strategy introduces:
+
+- **Macro gate as primary driver**: The stateful macro gate (OFF/ON_HALF/ON_FULL) determines
+  the core allocation level. When OFF, target is always 0.
+- **Vol-targeted base fraction**: `base_fraction = min(target_ann_vol / realized_vol, max_position_fraction)`,
+  frozen at each daily refresh.
+- **Micro regime scaling (down only)**: Micro regimes (TREND/RANGE/NEUTRAL/HIGH_VOL) only
+  reduce risk via multipliers ≤ 1.0. They never increase above the macro-determined core.
+- **Intraday increase suppression**: Within a calendar day, position targets can only decrease.
+  Increases are only allowed at the daily refresh boundary.
+- **Benchmark comparison**: The `macro_gate_benchmark` strategy is identical but removes
+  micro regime effects (micro_mult = 1.0), providing a clean benchmark for evaluating
+  whether micro regimes add value.
+
 ### 2) Walk-forward sweep (legacy)
 
 ```bash
@@ -180,6 +227,16 @@ V3-specific sweep (stateful gate + directional boost parameter space):
 
 ```bash
 python scripts/frontier_sweep_v3.py \
+  --product BTC-USD \
+  --fill-model bid_ask \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z
+```
+
+V4 core sweep (compares v4 vs benchmark, requires v4 to outperform):
+
+```bash
+python scripts/frontier_sweep_core.py \
   --product BTC-USD \
   --fill-model bid_ask \
   --start 2021-01-01T00:00:00Z \

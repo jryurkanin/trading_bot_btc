@@ -13,6 +13,8 @@ from ..features import indicators
 from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
 from ..features.regime import compute_adx, compute_chop
 from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator, RegimeDecisionBundle
+from ..strategy.regime_switching_v4_core import V4CoreStrategy
+from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
 
@@ -156,7 +158,13 @@ class BacktestEngine:
                 )
             )
 
-        orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
+        strategy_id = cfg.strategy if cfg.strategy else "regime_switching"
+        if strategy_id == "regime_switching_v4_core":
+            orchestrator = V4CoreStrategy(reg_cfg)
+        elif strategy_id == "macro_gate_benchmark":
+            orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
+        else:
+            orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
 

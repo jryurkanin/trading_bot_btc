@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, ClassVar, Dict, Literal, Optional, Set
 import json
 import os
 from datetime import datetime
@@ -167,6 +167,22 @@ class RegimeConfig(BaseModel):
     # Back-compat switch for old sub-strategy switching behavior
     legacy_substrategy_switching: bool = False
 
+    # V4 core strategy config
+    v4_macro_enter_threshold: float = 0.75
+    v4_macro_exit_threshold: float = 0.25
+    v4_macro_half_threshold: float = 0.75
+    v4_macro_full_threshold: float = 1.0
+    v4_macro_confirm_days: int = 2
+    v4_macro_min_on_days: int = 2
+    v4_macro_min_off_days: int = 1
+    v4_macro_half_multiplier: float = 0.5
+    v4_macro_full_multiplier: float = 1.0
+    v4_micro_mult_trend: float = 1.0
+    v4_micro_mult_range: float = 1.0
+    v4_micro_mult_neutral: float = 1.0
+    v4_micro_mult_high_vol: float = 0.0
+    v4_core_risk_refresh: str = "daily"
+
 
 class RiskConfig(BaseModel):
     max_drawdown_cut_pct: float = 0.25
@@ -245,6 +261,20 @@ class BacktestConfig(BaseModel):
     use_spread_slippage: bool = True
     max_trades_per_year: Optional[int] = None
     ci_mode: bool = False
+
+    VALID_STRATEGIES: ClassVar[Set[str]] = {
+        "regime_switching",
+        "regime_switching_v2",
+        "regime_switching_v3",
+        "regime_switching_v4_core",
+        "macro_gate_benchmark",
+    }
+
+    @field_validator("strategy", mode="after")
+    def _validate_strategy(cls, value: str) -> str:
+        if value not in cls.VALID_STRATEGIES:
+            raise ValueError(f"Unknown strategy '{value}'. Valid: {sorted(cls.VALID_STRATEGIES)}")
+        return value
 
 
 class RuntimeConfig(BaseModel):

@@ -58,15 +58,21 @@ def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.D
     eq = eq.sort_values("timestamp").reset_index(drop=True)
     eq["merge_key"] = (eq["timestamp"].astype("int64") // 1_000_000_000).astype("int64")
 
-    if decisions_df is None or decisions_df.empty:
-        if "macro_state" in eq.columns:
-            eq["macro_bucket"] = [
-                _bucket_from_state_and_multiplier(state, mult)
-                for state, mult in zip(eq.get("macro_state"), eq.get("macro_multiplier", 0.0), strict=False)
-            ]
-            warnings.append("macro_bucket_from_equity_columns")
-            return eq, warnings
+    # Prefer equity_curve's own macro_state/macro_multiplier columns when
+    # available — these are written per-bar by the engine and are the ground
+    # truth.  The previous merge_asof approach from decisions_df was fragile
+    # and silently produced all-OFF buckets on merge misalignment.
+    if "macro_state" in eq.columns:
+        mult_col = eq.get("macro_multiplier", pd.Series(0.0, index=eq.index))
+        eq["macro_bucket"] = [
+            _bucket_from_state_and_multiplier(state, mult)
+            for state, mult in zip(eq["macro_state"], mult_col, strict=False)
+        ]
+        warnings.append("macro_bucket_from_equity_columns")
+        return eq, warnings
 
+    # Fall back: try decisions_df merge if equity_curve lacks macro columns.
+    if decisions_df is None or decisions_df.empty:
         eq["macro_bucket"] = "OFF"
         warnings.append("decisions_missing_default_off")
         return eq, warnings
