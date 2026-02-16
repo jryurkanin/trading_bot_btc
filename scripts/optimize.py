@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--config", default=None)
+    p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
     p.add_argument("--out", default="reports")
     p.add_argument("--grid", action="append", help="KEY=VAL, can be repeated (e.g. bb_window=20)")
@@ -83,6 +84,7 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.strategy = args.strategy
+    cfg.backtest.acceleration_backend = args.acceleration_backend
     # Macro benchmark optimization: keep settings explicit and deterministic.
     cfg.regime.trend_boost_enabled = False
     start = parse_ts(args.start)

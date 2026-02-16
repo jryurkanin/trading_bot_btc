@@ -45,6 +45,7 @@ class MacroOnlyV2Strategy:
         self._daily_signal_cache: dict[int, MacroState] = {}
         self._daily_realized_cache: dict[int, float] = {}
         self._daily_last_ts_cache: dict[int, pd.Timestamp | None] = {}
+        self._acceleration_backend: str = "cpu"
 
     def reset(self) -> None:
         self._gate.reset()
@@ -56,6 +57,11 @@ class MacroOnlyV2Strategy:
         self._equity_proxy = 1.0
         self._equity_proxy_initialized = False
         self._last_close = 0.0
+        self._daily_ts_cache.clear()
+        self._daily_signal_cache.clear()
+        self._daily_realized_cache.clear()
+        self._daily_last_ts_cache.clear()
+        self._acceleration_backend = "cpu"
 
     @staticmethod
     def _to_timestamp_col(df: pd.DataFrame) -> pd.Series:
@@ -201,7 +207,11 @@ class MacroOnlyV2Strategy:
         if daily_returns.empty or daily_returns.isna().all():
             return 0.0
 
-        realized = realized_vol(daily_returns.fillna(0.0), window=max(2, len(daily_returns)))
+        realized = realized_vol(
+            daily_returns.fillna(0.0),
+            window=max(2, len(daily_returns)),
+            backend=self._acceleration_backend,
+        )
         value = float(realized.iloc[-1]) if len(realized) else 0.0
         return max(0.0, value)
 
@@ -286,6 +296,11 @@ class MacroOnlyV2Strategy:
         if hourly_idx is None:
             hourly_idx = len(hourly_df) - 1
         hourly_idx = max(0, min(int(hourly_idx), len(hourly_df) - 1))
+
+        if micro_precomputed is not None:
+            backend_hint = micro_precomputed.get("acceleration_backend")
+            if isinstance(backend_hint, str) and backend_hint:
+                self._acceleration_backend = backend_hint
 
         # Normalize timestamp to UTC and detect daily refresh boundaries.
         ts = pd.Timestamp(timestamp)
@@ -396,6 +411,7 @@ class MacroOnlyV2Strategy:
             "intraday_increase_suppressed": int(intraday_suppressed),
             "macro_target": final_target,
             "base_target": float(base_fraction),
+            "acceleration_backend": str(self._acceleration_backend),
             # compat fields used in reporting
             "trend_boost_active": 0,
             "boost_multiplier_applied": 1.0,

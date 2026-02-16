@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 
 from ..config import RegimeConfig
@@ -30,11 +31,21 @@ class MacroGateBenchmarkStrategy:
         self._frozen_base_fraction: float = 0.0
         self._current_target: float = 0.0
 
+        # Cache closed-daily slices once per UTC day to avoid repeated dataframe copies.
+        self._daily_ts_cache: dict[int, pd.DataFrame] = {}
+        self._daily_last_ts_cache: dict[int, pd.Timestamp | None] = {}
+        self._daily_index_cache_sig: tuple[int, int] | None = None
+        self._daily_index_values: np.ndarray | None = None
+
     def reset(self) -> None:
         self._gate.reset()
         self._last_refresh_day = None
         self._frozen_base_fraction = 0.0
         self._current_target = 0.0
+        self._daily_ts_cache.clear()
+        self._daily_last_ts_cache.clear()
+        self._daily_index_cache_sig = None
+        self._daily_index_values = None
 
     # ------------------------------------------------------------------
     def runtime_state(self) -> dict:
@@ -108,35 +119,77 @@ class MacroGateBenchmarkStrategy:
             return pd.to_datetime(df["timestamp"], utc=True)
         return pd.to_datetime(df.index, utc=True)
 
-    def _closed_daily(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
+    @staticmethod
+    def _day_cache_key(decision_ts: pd.Timestamp) -> int:
+        ts = pd.Timestamp(decision_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.floor("D").value)
+
+    def _ensure_daily_index_cache(self, daily_df: pd.DataFrame) -> None:
+        if daily_df is None or daily_df.empty:
+            self._daily_index_cache_sig = None
+            self._daily_index_values = None
+            return
+
+        ts = self._to_timestamp_col(daily_df)
+        if len(ts):
+            ts_last = ts.iloc[-1] if isinstance(ts, pd.Series) else ts[-1]
+            last_val = int(pd.Timestamp(ts_last).value)
+        else:
+            last_val = 0
+        sig = (int(len(daily_df)), last_val)
+        if self._daily_index_cache_sig == sig and self._daily_index_values is not None:
+            return
+
+        self._daily_index_values = ts.to_numpy(dtype="datetime64[ns]")
+        self._daily_index_cache_sig = sig
+        self._daily_ts_cache.clear()
+        self._daily_last_ts_cache.clear()
+
+    def _closed_daily_cached(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
         if daily_df is None or daily_df.empty:
             return pd.DataFrame(columns=daily_df.columns if daily_df is not None else [])
 
-        d = daily_df.copy()
-        d["__ts"] = self._to_timestamp_col(d)
+        self._ensure_daily_index_cache(daily_df)
+        key = self._day_cache_key(decision_ts)
+        if key in self._daily_ts_cache:
+            return self._daily_ts_cache[key]
+
         cutoff = pd.Timestamp(decision_ts)
         if cutoff.tzinfo is None:
             cutoff = cutoff.tz_localize("UTC")
         else:
             cutoff = cutoff.tz_convert("UTC")
         closed_cutoff = cutoff.floor("D")
-        d = d[d["__ts"] < closed_cutoff].sort_values("__ts")
-        return d.drop(columns=["__ts"])
 
-    @staticmethod
-    def _latest_daily_ts(daily_df: pd.DataFrame) -> pd.Timestamp | None:
-        if daily_df is None or daily_df.empty:
-            return None
-        ts = MacroGateBenchmarkStrategy._to_timestamp_col(daily_df)
-        if isinstance(ts, pd.Series):
-            if ts.empty:
-                return None
-            ts_last = ts.iloc[-1]
+        idx_vals = self._daily_index_values
+        if idx_vals is None:
+            d = pd.DataFrame(columns=daily_df.columns)
         else:
-            if len(ts) == 0:
-                return None
-            ts_last = ts[-1]
-        return pd.to_datetime(ts_last, utc=True)
+            pos = int(np.searchsorted(idx_vals, closed_cutoff.to_numpy(), side="left"))
+            d = daily_df.iloc[:pos]
+
+        self._daily_ts_cache[key] = d
+        return d
+
+    def _latest_daily_ts_cached(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.Timestamp | None:
+        key = self._day_cache_key(decision_ts)
+        if key in self._daily_last_ts_cache:
+            return self._daily_last_ts_cache[key]
+
+        closed = self._closed_daily_cached(daily_df, decision_ts)
+        if closed.empty:
+            self._daily_last_ts_cache[key] = None
+            return None
+
+        ts = self._to_timestamp_col(closed)
+        ts_last = ts.iloc[-1] if isinstance(ts, pd.Series) else ts[-1]
+        last = pd.to_datetime(ts_last, utc=True)
+        self._daily_last_ts_cache[key] = last
+        return last
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -181,8 +234,8 @@ class MacroGateBenchmarkStrategy:
         at_daily_refresh = self._last_refresh_day is None or ts_day != self._last_refresh_day
 
         # --- Daily bar data ---
-        daily_closed = self._closed_daily(daily_df, ts)
-        daily_bar_ts = self._latest_daily_ts(daily_closed)
+        daily_closed = self._closed_daily_cached(daily_df, ts)
+        daily_bar_ts = self._latest_daily_ts_cached(daily_df, ts)
 
         # --- Macro gate ---
         macro_state, macro_mult, macro_score, macro_components = self._gate.update(
@@ -195,7 +248,9 @@ class MacroGateBenchmarkStrategy:
             rv_last = rv_pre.iloc[hourly_idx]
         else:
             rv_last = indicators.realized_vol(
-                hourly_df["close"].pct_change(), self.cfg.realized_vol_window
+                hourly_df["close"].pct_change(),
+                self.cfg.realized_vol_window,
+                backend=str((micro_precomputed or {}).get("acceleration_backend", "cpu")),
             ).iloc[hourly_idx]
 
         realized_vol = float(rv_last) if rv_last is not None and pd.notna(rv_last) else 0.0

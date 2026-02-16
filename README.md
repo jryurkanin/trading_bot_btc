@@ -84,6 +84,24 @@ export COINBASE_API_SECRET=...
 export COINBASE_API_PASSPHRASE=...
 ```
 
+### Optional CUDA acceleration
+
+Backtests can use CUDA for rolling-volatility feature pipelines when a compatible GPU
+and CuPy are available.
+
+```bash
+# example for CUDA 12.x environments
+pip install cupy-cuda12x
+```
+
+Then run with:
+
+```bash
+--acceleration-backend cuda
+```
+
+If CUDA is unavailable, the engine falls back to CPU and records the fallback reason in diagnostics.
+
 ## Quickstart
 
 ### 1) Backtest
@@ -93,7 +111,8 @@ python scripts/backtest.py \
   --product BTC-USD \
   --start 2020-01-01T00:00:00Z \
   --end 2026-01-31T00:00:00Z \
-  --initial-equity 10000
+  --initial-equity 10000 \
+  --acceleration-backend auto
 ```
 
 This writes:
@@ -176,6 +195,8 @@ python scripts/frontier_sweep_macro_only.py \
   --fill-model bid_ask \
   --start 2021-01-01T00:00:00Z \
   --test-end 2026-01-31T00:00:00Z \
+  --acceleration-backend auto \
+  --workers 4 \
   --small
 ```
 

@@ -11,6 +11,7 @@ from ..execution.risk import RiskManager, RiskState
 from ..execution.rebalance_policy import RebalancePolicy
 from ..features import indicators
 from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
+from ..acceleration.cuda_backend import resolve_acceleration_backend
 from ..features.regime import compute_adx, compute_chop
 from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
@@ -109,11 +110,23 @@ class BacktestEngine:
 
         # Precompute heavy regime inputs once so the backtest loop is O(n),
         # not O(n^2) from repeatedly recomputing rolling features.
+        acc_ctx = resolve_acceleration_backend(getattr(cfg, "acceleration_backend", "auto"))
+        acc_backend = "cpu"
+        if (
+            acc_ctx.backend == "cuda"
+            and len(hourly) >= int(getattr(cfg, "acceleration_min_bars", 2048) or 2048)
+        ):
+            acc_backend = "cuda"
+
         hourly_returns = hourly["close"].pct_change()
         vol_lookback_hours = max(24, reg_cfg.vol_lookback_days * 24)
         vol_min_periods = max(30, vol_lookback_hours // 4)
 
-        realized_vol = indicators.realized_vol(hourly_returns, reg_cfg.realized_vol_window)
+        realized_vol = indicators.realized_vol(
+            hourly_returns,
+            reg_cfg.realized_vol_window,
+            backend=acc_backend,
+        )
         hourly_precomputed: dict[str, Any] = {
             "realized_vol": realized_vol,
             "adx": compute_adx(hourly["high"], hourly["low"], hourly["close"], window=reg_cfg.adx_window),
@@ -121,6 +134,11 @@ class BacktestEngine:
             "vol_thresholds": realized_vol.rolling(vol_lookback_hours, min_periods=vol_min_periods).quantile(
                 reg_cfg.vol_high_threshold_quantile
             ),
+            "acceleration_backend": acc_backend,
+            "acceleration_requested": getattr(cfg, "acceleration_backend", "auto"),
+            "acceleration_cuda_available": int(acc_ctx.cuda_available),
+            "acceleration_device": acc_ctx.device_name,
+            "acceleration_fallback_reason": acc_ctx.reason,
         }
 
         # Precompute sub-strategy indicators for O(1) per-bar lookups.
@@ -412,6 +430,11 @@ class BacktestEngine:
             "fill_model": fill_model.name,
             "rebalance_policy": exec_cfg.rebalance_policy,
             "trade_count": int(len(tr)),
+            "acceleration_backend": hourly_precomputed.get("acceleration_backend", "cpu"),
+            "acceleration_requested": hourly_precomputed.get("acceleration_requested", "auto"),
+            "acceleration_cuda_available": int(hourly_precomputed.get("acceleration_cuda_available", 0) or 0),
+            "acceleration_device": hourly_precomputed.get("acceleration_device"),
+            "acceleration_fallback_reason": hourly_precomputed.get("acceleration_fallback_reason"),
         }
 
         return BacktestResult(

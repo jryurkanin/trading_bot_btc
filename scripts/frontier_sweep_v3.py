@@ -258,6 +258,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
+    p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
     p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
@@ -276,6 +277,7 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
+    cfg.backtest.acceleration_backend = args.acceleration_backend
     configure_v3(cfg)
 
     start = parse_ts(args.start)

@@ -6,6 +6,7 @@ import argparse
 import csv
 import itertools
 import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,77 @@ def parse_ts(raw: str) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+_WORKER_CTX: dict[str, Any] = {}
+
+
+def _worker_init(ctx: dict[str, Any]) -> None:
+    global _WORKER_CTX
+    _WORKER_CTX = ctx
+
+
+def _cfg_from_payload(payload: dict[str, Any]) -> BotConfig:
+    if hasattr(BotConfig, "model_validate"):
+        return BotConfig.model_validate(payload)
+    return BotConfig.parse_obj(payload)
+
+
+def _run_param_worker(task: tuple[int, dict[str, Any]]) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, dict[str, Any]]]]:
+    idx, params = task
+    param_id = f"p{idx:04d}"
+
+    ctx = _WORKER_CTX
+    base_cfg = _cfg_from_payload(ctx["base_cfg_payload"])
+    product = str(ctx["product"])
+    hourly = ctx["hourly"]
+    daily = ctx["daily"]
+    base_maker = float(ctx["base_maker"])
+    base_taker = float(ctx["base_taker"])
+
+    grouped_param: dict[str, dict[str, dict[str, Any]]] = {}
+    rows: list[dict[str, Any]] = []
+
+    for w_payload in ctx["windows"]:
+        window = Window(
+            str(w_payload["name"]),
+            parse_ts(str(w_payload["start"])),
+            parse_ts(str(w_payload["end"])),
+        )
+        grouped_param[window.name] = {}
+        for scenario in SCENARIOS:
+            try:
+                row = run_window(
+                    base_cfg=base_cfg,
+                    product=product,
+                    hourly=hourly,
+                    daily=daily,
+                    window=window,
+                    params=params,
+                    scenario=scenario,
+                    base_maker=base_maker,
+                    base_taker=base_taker,
+                    strategy="macro_only_v2",
+                )
+                row["param_id"] = param_id
+                row["params"] = json.dumps(params, sort_keys=True)
+                grouped_param[window.name][scenario.name] = row
+                rows.append(row)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "param_id": param_id,
+                        "params": json.dumps(params, sort_keys=True),
+                        "strategy": "macro_only_v2",
+                        "window": window.name,
+                        "scenario": scenario.name,
+                        "start": window.start.isoformat(),
+                        "end": window.end.isoformat(),
+                        "error": str(exc),
+                    }
+                )
+
+    return param_id, rows, grouped_param
 
 
 def parse_grid_values(raw: str) -> list[Any]:
@@ -277,6 +349,10 @@ def run_window(
         "taker_rate": taker_rate,
         "impact_bps": cfg.execution.impact_bps,
         "spread_bps": cfg.execution.spread_bps,
+        "acceleration_requested": getattr(cfg.backtest, "acceleration_backend", "auto"),
+        "acceleration_backend": result.diagnostics.get("acceleration_backend", "cpu"),
+        "acceleration_cuda_available": result.diagnostics.get("acceleration_cuda_available", 0),
+        "acceleration_device": result.diagnostics.get("acceleration_device"),
     }
     return row
 
@@ -293,10 +369,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
+    p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None)
     p.add_argument("--grid", action="append", default=[])
     p.add_argument("--small", action="store_true", help="smaller walk-forward grid for quick checks")
+    p.add_argument("--workers", type=int, default=1, help="parallel worker processes for parameter sets")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--top-n", type=int, default=5)
@@ -312,6 +390,7 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
+    cfg.backtest.acceleration_backend = args.acceleration_backend
 
     start = parse_ts(args.start)
     now = datetime.now(timezone.utc)
@@ -390,41 +469,103 @@ def main() -> int:
 
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
 
-    for i, params in enumerate(param_sets):
-        param_id = f"p{i:04d}"
-        grouped[param_id] = {}
-        print(f"[{i + 1}/{len(param_sets)}] {param_id}", flush=True)
+    workers = max(1, int(args.workers or 1))
+    if workers <= 1 or len(param_sets) <= 1:
+        for i, params in enumerate(param_sets):
+            param_id = f"p{i:04d}"
+            grouped[param_id] = {}
+            print(f"[{i + 1}/{len(param_sets)}] {param_id}", flush=True)
 
-        for window in windows:
-            grouped[param_id][window.name] = {}
-            for scenario in SCENARIOS:
+            for window in windows:
+                grouped[param_id][window.name] = {}
+                for scenario in SCENARIOS:
+                    try:
+                        row = run_window(
+                            base_cfg=cfg,
+                            product=args.product,
+                            hourly=hourly,
+                            daily=daily,
+                            window=window,
+                            params=params,
+                            scenario=scenario,
+                            base_maker=base_maker_rate,
+                            base_taker=base_taker_rate,
+                            strategy="macro_only_v2",
+                        )
+                        row["param_id"] = param_id
+                        row["params"] = json.dumps(params, sort_keys=True)
+                        grouped[param_id][window.name][scenario.name] = row
+                        summary_rows.append(row)
+                    except Exception as exc:
+                        summary_rows.append(
+                            {
+                                "param_id": param_id,
+                                "params": json.dumps(params, sort_keys=True),
+                                "strategy": "macro_only_v2",
+                                "window": window.name,
+                                "scenario": scenario.name,
+                                "start": window.start.isoformat(),
+                                "end": window.end.isoformat(),
+                                "error": str(exc),
+                            }
+                        )
+    else:
+        max_workers = min(workers, len(param_sets))
+        print(f"Running macro_only_v2 parameter grid with {max_workers} workers", flush=True)
+
+        if hasattr(cfg, "model_dump"):
+            base_cfg_payload = cfg.model_dump()
+        elif hasattr(cfg, "dict"):
+            base_cfg_payload = cfg.dict()
+        else:
+            base_cfg_payload = dict(cfg.__dict__)
+
+        worker_ctx = {
+            "base_cfg_payload": base_cfg_payload,
+            "product": args.product,
+            "hourly": hourly,
+            "daily": daily,
+            "base_maker": float(base_maker_rate),
+            "base_taker": float(base_taker_rate),
+            "windows": [
+                {
+                    "name": w.name,
+                    "start": w.start.isoformat(),
+                    "end": w.end.isoformat(),
+                }
+                for w in windows
+            ],
+        }
+
+        done = 0
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_worker_init,
+            initargs=(worker_ctx,),
+        ) as executor:
+            future_map = {
+                executor.submit(_run_param_worker, (i, params)): (i, params)
+                for i, params in enumerate(param_sets)
+            }
+
+            for future in as_completed(future_map):
+                i, params = future_map[future]
+                param_id = f"p{i:04d}"
                 try:
-                    row = run_window(
-                        base_cfg=cfg,
-                        product=args.product,
-                        hourly=hourly,
-                        daily=daily,
-                        window=window,
-                        params=params,
-                        scenario=scenario,
-                        base_maker=base_maker_rate,
-                        base_taker=base_taker_rate,
-                        strategy="macro_only_v2",
-                    )
-                    row["param_id"] = param_id
-                    row["params"] = json.dumps(params, sort_keys=True)
-                    grouped[param_id][window.name][scenario.name] = row
-                    summary_rows.append(row)
+                    pid, rows, grouped_param = future.result()
+                    grouped[pid] = grouped_param
+                    summary_rows.extend(rows)
+                    done += 1
+                    print(f"[{done}/{len(param_sets)}] {pid}", flush=True)
                 except Exception as exc:
+                    done += 1
+                    grouped[param_id] = {}
+                    print(f"[{done}/{len(param_sets)}] {param_id} failed", flush=True)
                     summary_rows.append(
                         {
                             "param_id": param_id,
                             "params": json.dumps(params, sort_keys=True),
                             "strategy": "macro_only_v2",
-                            "window": window.name,
-                            "scenario": scenario.name,
-                            "start": window.start.isoformat(),
-                            "end": window.end.isoformat(),
                             "error": str(exc),
                         }
                     )

@@ -313,6 +313,10 @@ class BacktestConfig(BaseModel):
     max_trades_per_year: Optional[int] = None
     ci_mode: bool = False
 
+    # compute acceleration backend for backtests (falls back to CPU if CUDA unavailable)
+    acceleration_backend: Literal["auto", "cpu", "cuda"] = "auto"
+    acceleration_min_bars: int = 2048
+
     VALID_STRATEGIES: ClassVar[Set[str]] = {
         "macro_gate_benchmark",
         "macro_only_v2",

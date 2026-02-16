@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
     p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
+    p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default=None)
     p.add_argument("--initial-equity", type=float, default=10_000.0)
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
@@ -108,6 +109,8 @@ def main() -> int:
     cfg.data.product = args.product
     cfg.backtest.initial_equity = args.initial_equity
     cfg.backtest.strategy = args.strategy
+    if args.acceleration_backend is not None:
+        cfg.backtest.acceleration_backend = args.acceleration_backend
 
     # Keep macro benchmark policy behavior only.
     cfg.regime.trend_boost_enabled = False
@@ -296,6 +299,13 @@ def main() -> int:
         "macro_bucket_attribution": macro_bucket_report,
         "artifacts": {
             "macro_bucket_attribution_csv": str(macro_bucket_csv),
+        },
+        "acceleration": {
+            "requested_backend": cfg.backtest.acceleration_backend,
+            "effective_backend": result.diagnostics.get("acceleration_backend"),
+            "cuda_available": result.diagnostics.get("acceleration_cuda_available"),
+            "device": result.diagnostics.get("acceleration_device"),
+            "fallback_reason": result.diagnostics.get("acceleration_fallback_reason"),
         },
         "execution": {
             "fill_model": cfg.execution.fill_model,

@@ -274,6 +274,7 @@ def parse_args() -> argparse.Namespace:
         default="bid_ask",
         choices=["next_open", "bid_ask", "worst_case_bar"],
     )
+    p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)
     p.add_argument(
         "--grid-config",
@@ -298,6 +299,7 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
+    cfg.backtest.acceleration_backend = args.acceleration_backend
 
     start = parse_ts(args.start)
     end = parse_ts(args.end)
