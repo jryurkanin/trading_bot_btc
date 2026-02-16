@@ -91,6 +91,7 @@ class RESTClientWrapper:
         self._request_times: deque[float] = deque(maxlen=max(config.requests_per_minute, 1) * 2)
         self._clock_skew_seconds: float = 0.0
         self._sdk_client = self._init_sdk_client()
+        self._sdk_disabled: bool = False
         self.http = httpx.AsyncClient if False else None
         self.sync_http = httpx.Client(
             timeout=config.request_timeout_s,
@@ -206,13 +207,18 @@ class RESTClientWrapper:
         headers = self._request_headers(method, path, body if method in {"POST", "PUT"} else "")
 
         # Use SDK path when possible for the common endpoints.
-        if self._sdk_client is not None and not self.config.use_sandbox:
+        if self._sdk_client is not None and not self.config.use_sandbox and not self._sdk_disabled:
             try:
                 # SDK surface is not fully stable across versions; fallback on HTTP on failure.
                 logger.debug("Using SDK request for %s %s", method, path)
                 return self._sdk_request(method, path, params, json_payload)
-            except Exception:
-                logger.exception("SDK request failed, falling back to raw HTTP")
+            except Exception as exc:
+                # Disable SDK after first compatibility failure to avoid noisy repeats.
+                self._sdk_disabled = True
+                logger.warning(
+                    "SDK request failed (%s); disabling SDK for this run and falling back to raw HTTP",
+                    exc.__class__.__name__,
+                )
 
         try:
             response = self.sync_http.request(method=method, url=url, params=params, json=json_payload, headers=headers, timeout=timeout or self.config.request_timeout_s)
@@ -253,12 +259,22 @@ class RESTClientWrapper:
             raise AttributeError("SDK account endpoint missing")
 
         if method == "GET" and path.startswith("/products/") and path.endswith("/candles"):
-            fn = getattr(self._sdk_client, "get_product_candles")
-            return self._normalize_sdk_response(fn(**params))
+            if hasattr(self._sdk_client, "get_product_candles"):
+                fn = getattr(self._sdk_client, "get_product_candles")
+                return self._normalize_sdk_response(fn(**params))
+            if hasattr(self._sdk_client, "get_public_candles"):
+                fn = getattr(self._sdk_client, "get_public_candles")
+                return self._normalize_sdk_response(fn(**params))
+            raise AttributeError("SDK candle endpoint missing")
 
         if method == "GET" and path == "/products/{product_id}/candles":
-            fn = getattr(self._sdk_client, "get_product_candles")
-            return self._normalize_sdk_response(fn(**params))
+            if hasattr(self._sdk_client, "get_product_candles"):
+                fn = getattr(self._sdk_client, "get_product_candles")
+                return self._normalize_sdk_response(fn(**params))
+            if hasattr(self._sdk_client, "get_public_candles"):
+                fn = getattr(self._sdk_client, "get_public_candles")
+                return self._normalize_sdk_response(fn(**params))
+            raise AttributeError("SDK candle endpoint missing")
 
         if method == "GET" and path.startswith("/products/") and path.endswith("/book"):
             fn = getattr(self._sdk_client, "get_product_book")
