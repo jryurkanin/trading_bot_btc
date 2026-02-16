@@ -182,7 +182,14 @@ def run_pnl_decomposition(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    trades_df = pd.read_csv(trades_path) if trades_path.exists() else pd.DataFrame()
+    if trades_path.exists():
+        try:
+            trades_df = pd.read_csv(trades_path)
+        except pd.errors.EmptyDataError:
+            trades_df = pd.DataFrame()
+    else:
+        trades_df = pd.DataFrame()
+
     equity_df = pd.read_csv(equity_curve_path)
 
     result = compute_pnl_decomposition(

@@ -75,7 +75,7 @@ class RegimeConfig(BaseModel):
     daily_momentum_quantile: float = 0.66
 
     # Macro scoring mode (backward-compatible default keeps legacy binary gating)
-    macro_mode: Literal["binary", "score"] = "binary"
+    macro_mode: Literal["binary", "score", "stateful_gate"] = "binary"
     macro_score_components: list[str] = Field(
         default_factory=lambda: [
             "close_gt_sma50",
@@ -88,6 +88,17 @@ class RegimeConfig(BaseModel):
     macro_score_floor: float = 0.0
     macro_score_min_to_trade: float = 0.25
     macro_piecewise_levels: list[float] = Field(default_factory=lambda: [0.0, 0.33, 0.66, 1.0])
+
+    # Stateful macro gate (v3)
+    macro_enter_threshold: float = 0.75
+    macro_exit_threshold: float = 0.25
+    macro_full_threshold: float = 1.0
+    macro_half_threshold: float = 0.75
+    macro_confirm_days: int = 2
+    macro_min_on_days: int = 2
+    macro_min_off_days: int = 1
+    macro_half_multiplier: float = 0.5
+    macro_full_multiplier: float = 1.0
 
     # Trend playbook selection
     trend_playbook: Literal["core_momentum_daily", "breakout"] = "core_momentum_daily"
@@ -134,7 +145,11 @@ class RegimeConfig(BaseModel):
     trend_boost_macro_score_threshold: float = 0.75
     trend_boost_confirm_days: int = 2
     trend_boost_min_on_days: int = 2
+    trend_boost_min_off_days: int = 1
     trend_boost_regime_gate: Literal["micro_trend", "daily_sma50"] = "micro_trend"
+    trend_boost_require_micro_trend: bool = True
+    trend_boost_require_above_sma200: bool = True
+    trend_boost_sma50_slope_lookback_days: int = 10
 
     # High vol
     high_vol_cap: float = 0.2

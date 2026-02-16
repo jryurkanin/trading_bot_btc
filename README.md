@@ -58,6 +58,7 @@ Production-oriented Bitcoin strategy codebase for Coinbase Advanced Trade with:
 │   ├── backtest.py
 │   ├── optimize.py
 │   ├── frontier_sweep.py
+│   ├── frontier_sweep_v3.py
 │   └── trade.py
 ├── tests/
 └── README.md
@@ -96,13 +97,18 @@ This writes:
 - `reports/equity_curve.csv`
 - `reports/trades.csv`
 - `reports/decisions.csv`
+- `reports/macro_bucket_attribution.csv`
 - `reports/report.json`
 
-### Macro scoring + trend booster flags (backward compatible)
+`report.json` includes `macro_bucket_attribution` with per-bucket (`OFF`, `ON_HALF`, `ON_FULL`) time, exposure, PnL, fees, turnover, trade count, and warnings.
 
-Defaults preserve prior behavior:
-- `macro_mode="binary"`
-- `trend_boost_enabled=false`
+### Strategy variants (backward compatible)
+
+- `regime_switching`: legacy binary macro gate behavior
+- `regime_switching_v2`: score-based macro scaling + trend booster
+- `regime_switching_v3`: stateful daily macro gate (`OFF` / `ON_HALF` / `ON_FULL`) with hysteresis + directional trend boost
+
+Defaults preserve prior behavior unless you explicitly choose `regime_switching_v2` or `regime_switching_v3`.
 
 Enable v2 behavior (score-based macro + trend boost):
 
@@ -121,6 +127,31 @@ python scripts/backtest.py \
   --trend-boost-adx-threshold 25
 ```
 
+Enable v3 behavior (stateful macro gate + bucket multipliers + directional boost):
+
+```bash
+python scripts/backtest.py \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --strategy regime_switching_v3 \
+  --fill-model bid_ask \
+  --macro-mode stateful_gate \
+  --macro-enter-threshold 0.75 \
+  --macro-exit-threshold 0.25 \
+  --macro-confirm-days 2 \
+  --macro-min-on-days 2 \
+  --macro-min-off-days 1 \
+  --macro-half-multiplier 0.5 \
+  --macro-full-multiplier 1.0 \
+  --trend-boost-enabled \
+  --trend-boost-multiplier 1.10 \
+  --trend-boost-adx-threshold 25 \
+  --trend-boost-confirm-days 2 \
+  --trend-boost-min-on-days 2 \
+  --trend-boost-min-off-days 1
+```
+
 ### 2) Walk-forward sweep (legacy)
 
 ```bash
@@ -134,6 +165,8 @@ python scripts/optimize.py \
 
 ### 3) Frontier sweep (walk-forward + cost stress)
 
+General sweep (legacy/v2 grid):
+
 ```bash
 python scripts/frontier_sweep.py \
   --product BTC-USD \
@@ -143,10 +176,20 @@ python scripts/frontier_sweep.py \
   --end 2026-01-31T00:00:00Z
 ```
 
+V3-specific sweep (stateful gate + directional boost parameter space):
+
+```bash
+python scripts/frontier_sweep_v3.py \
+  --product BTC-USD \
+  --fill-model bid_ask \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z
+```
+
 Outputs:
-- `artifacts/frontier/summary.csv` — one row per (params, window, scenario)
-- `artifacts/frontier/frontier.csv` — ranked top configs
-- `artifacts/frontier/best_config.json` — recommended config + reproduce command
+- `artifacts/frontier*/summary.csv` — one row per (params, window, scenario)
+- `artifacts/frontier*/frontier.csv` — ranked top configs
+- `artifacts/frontier*/best_config.json` — recommended config + reproduce command
 
 Interpretation:
 - ranking favors robust validation performance under stress costs,

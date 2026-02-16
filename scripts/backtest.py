@@ -14,6 +14,7 @@ from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.backtest.engine import BacktestEngine
 from bot.backtest.reporting import write_strict_json, dumps_strict_json
+from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.analysis.pnl_decomposition import run_pnl_decomposition
 
 
@@ -23,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2"])
+    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2", "regime_switching_v3"])
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--initial-equity", type=float, default=10_000.0)
     p.add_argument("--maker-bps", type=float, default=10.0)
@@ -39,16 +40,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-trades-per-day", type=int, default=None)
 
     # macro scoring + trend boost (all optional, backward-compatible)
-    p.add_argument("--macro-mode", choices=["binary", "score"], default=None)
+    p.add_argument("--macro-mode", choices=["binary", "score", "stateful_gate"], default=None)
     p.add_argument("--macro-score-transform", choices=["linear", "piecewise"], default=None)
     p.add_argument("--macro-score-floor", type=float, default=None)
     p.add_argument("--macro-score-min-to-trade", type=float, default=None)
+    p.add_argument("--macro-enter-threshold", type=float, default=None)
+    p.add_argument("--macro-exit-threshold", type=float, default=None)
+    p.add_argument("--macro-full-threshold", type=float, default=None)
+    p.add_argument("--macro-half-threshold", type=float, default=None)
+    p.add_argument("--macro-confirm-days", type=int, default=None)
+    p.add_argument("--macro-min-on-days", type=int, default=None)
+    p.add_argument("--macro-min-off-days", type=int, default=None)
+    p.add_argument("--macro-half-multiplier", type=float, default=None)
+    p.add_argument("--macro-full-multiplier", type=float, default=None)
+
     p.add_argument("--trend-boost-enabled", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--trend-boost-multiplier", type=float, default=None)
     p.add_argument("--trend-boost-adx-threshold", type=float, default=None)
     p.add_argument("--trend-boost-macro-score-threshold", type=float, default=None)
     p.add_argument("--trend-boost-confirm-days", type=int, default=None)
     p.add_argument("--trend-boost-min-on-days", type=int, default=None)
+    p.add_argument("--trend-boost-min-off-days", type=int, default=None)
+    p.add_argument("--trend-boost-require-micro-trend", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--trend-boost-require-above-sma200", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--trend-boost-sma50-slope-lookback-days", type=int, default=None)
 
     p.add_argument("--ci-mode", action="store_true")
     p.add_argument("--no-spread", action="store_true")
@@ -70,10 +85,29 @@ def main() -> int:
     cfg.backtest.initial_equity = args.initial_equity
     cfg.backtest.strategy = args.strategy
 
-    # New strategy variant keeps backward compatibility by only applying when explicitly requested.
+    # Strategy presets keep legacy behavior unless explicitly requested.
     if args.strategy == "regime_switching_v2":
         cfg.regime.macro_mode = "score"
         cfg.regime.trend_boost_enabled = True
+    elif args.strategy == "regime_switching_v3":
+        cfg.regime.macro_mode = "stateful_gate"
+        cfg.regime.trend_boost_enabled = True
+        cfg.regime.trend_boost_multiplier = 1.10
+        cfg.regime.macro_enter_threshold = 0.75
+        cfg.regime.macro_exit_threshold = 0.25
+        cfg.regime.macro_full_threshold = 1.0
+        cfg.regime.macro_half_threshold = 0.75
+        cfg.regime.macro_confirm_days = 2
+        cfg.regime.macro_min_on_days = 2
+        cfg.regime.macro_min_off_days = 1
+        cfg.regime.macro_half_multiplier = 0.5
+        cfg.regime.macro_full_multiplier = 1.0
+        cfg.regime.trend_boost_confirm_days = 2
+        cfg.regime.trend_boost_min_on_days = 2
+        cfg.regime.trend_boost_min_off_days = 1
+        cfg.regime.trend_boost_require_micro_trend = True
+        cfg.regime.trend_boost_require_above_sma200 = True
+        cfg.regime.trend_boost_sma50_slope_lookback_days = 10
 
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
@@ -100,6 +134,24 @@ def main() -> int:
         cfg.regime.macro_score_floor = float(args.macro_score_floor)
     if args.macro_score_min_to_trade is not None:
         cfg.regime.macro_score_min_to_trade = float(args.macro_score_min_to_trade)
+    if args.macro_enter_threshold is not None:
+        cfg.regime.macro_enter_threshold = float(args.macro_enter_threshold)
+    if args.macro_exit_threshold is not None:
+        cfg.regime.macro_exit_threshold = float(args.macro_exit_threshold)
+    if args.macro_full_threshold is not None:
+        cfg.regime.macro_full_threshold = float(args.macro_full_threshold)
+    if args.macro_half_threshold is not None:
+        cfg.regime.macro_half_threshold = float(args.macro_half_threshold)
+    if args.macro_confirm_days is not None:
+        cfg.regime.macro_confirm_days = int(args.macro_confirm_days)
+    if args.macro_min_on_days is not None:
+        cfg.regime.macro_min_on_days = int(args.macro_min_on_days)
+    if args.macro_min_off_days is not None:
+        cfg.regime.macro_min_off_days = int(args.macro_min_off_days)
+    if args.macro_half_multiplier is not None:
+        cfg.regime.macro_half_multiplier = float(args.macro_half_multiplier)
+    if args.macro_full_multiplier is not None:
+        cfg.regime.macro_full_multiplier = float(args.macro_full_multiplier)
 
     if args.trend_boost_enabled is not None:
         cfg.regime.trend_boost_enabled = bool(args.trend_boost_enabled)
@@ -113,6 +165,14 @@ def main() -> int:
         cfg.regime.trend_boost_confirm_days = int(args.trend_boost_confirm_days)
     if args.trend_boost_min_on_days is not None:
         cfg.regime.trend_boost_min_on_days = int(args.trend_boost_min_on_days)
+    if args.trend_boost_min_off_days is not None:
+        cfg.regime.trend_boost_min_off_days = int(args.trend_boost_min_off_days)
+    if args.trend_boost_require_micro_trend is not None:
+        cfg.regime.trend_boost_require_micro_trend = bool(args.trend_boost_require_micro_trend)
+    if args.trend_boost_require_above_sma200 is not None:
+        cfg.regime.trend_boost_require_above_sma200 = bool(args.trend_boost_require_above_sma200)
+    if args.trend_boost_sma50_slope_lookback_days is not None:
+        cfg.regime.trend_boost_sma50_slope_lookback_days = int(args.trend_boost_sma50_slope_lookback_days)
 
     if args.ci_mode:
         cfg.backtest.ci_mode = True
@@ -169,6 +229,15 @@ def main() -> int:
     result.trades.to_csv(out / "trades.csv", index=False)
     result.decisions.to_csv(out / "decisions.csv", index=True)
 
+    macro_bucket_report, macro_bucket_table = compute_macro_bucket_attribution(
+        result.equity_curve,
+        result.decisions,
+        result.trades,
+        initial_equity=cfg.backtest.initial_equity,
+    )
+    macro_bucket_csv = out / "macro_bucket_attribution.csv"
+    macro_bucket_table.to_csv(macro_bucket_csv, index=False)
+
     report = {
         "product": args.product,
         "start": args.start,
@@ -177,6 +246,10 @@ def main() -> int:
         "metrics": result.metrics,
         "regime_metrics": result.regime_stats,
         "diagnostics": result.diagnostics,
+        "macro_bucket_attribution": macro_bucket_report,
+        "artifacts": {
+            "macro_bucket_attribution_csv": str(macro_bucket_csv),
+        },
         "execution": {
             "fill_model": cfg.execution.fill_model,
             "rebalance_policy": cfg.execution.rebalance_policy,
@@ -192,12 +265,25 @@ def main() -> int:
             "macro_score_transform": cfg.regime.macro_score_transform,
             "macro_score_floor": cfg.regime.macro_score_floor,
             "macro_score_min_to_trade": cfg.regime.macro_score_min_to_trade,
+            "macro_enter_threshold": cfg.regime.macro_enter_threshold,
+            "macro_exit_threshold": cfg.regime.macro_exit_threshold,
+            "macro_full_threshold": cfg.regime.macro_full_threshold,
+            "macro_half_threshold": cfg.regime.macro_half_threshold,
+            "macro_confirm_days": cfg.regime.macro_confirm_days,
+            "macro_min_on_days": cfg.regime.macro_min_on_days,
+            "macro_min_off_days": cfg.regime.macro_min_off_days,
+            "macro_half_multiplier": cfg.regime.macro_half_multiplier,
+            "macro_full_multiplier": cfg.regime.macro_full_multiplier,
             "trend_boost_enabled": cfg.regime.trend_boost_enabled,
             "trend_boost_multiplier": cfg.regime.trend_boost_multiplier,
             "trend_boost_adx_threshold": cfg.regime.trend_boost_adx_threshold,
             "trend_boost_macro_score_threshold": cfg.regime.trend_boost_macro_score_threshold,
             "trend_boost_confirm_days": cfg.regime.trend_boost_confirm_days,
             "trend_boost_min_on_days": cfg.regime.trend_boost_min_on_days,
+            "trend_boost_min_off_days": cfg.regime.trend_boost_min_off_days,
+            "trend_boost_require_micro_trend": cfg.regime.trend_boost_require_micro_trend,
+            "trend_boost_require_above_sma200": cfg.regime.trend_boost_require_above_sma200,
+            "trend_boost_sma50_slope_lookback_days": cfg.regime.trend_boost_sma50_slope_lookback_days,
         },
     }
     report_path = write_strict_json(out / "report.json", report)
@@ -214,6 +300,7 @@ def main() -> int:
     print("Backtest completed")
     print(dumps_strict_json({"metrics": report["metrics"], "execution_quality": execution_quality}, indent=2))
     print(f"Equity curve: {out / 'equity_curve.csv'}")
+    print(f"Macro bucket attribution: {macro_bucket_csv}")
     print(f"Report: {report_path}")
     return 0
 

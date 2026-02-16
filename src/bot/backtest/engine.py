@@ -275,6 +275,12 @@ class BacktestEngine:
             mark_exec = float(bar_t1.get("close", mark_signal))
             post_exposure = max(0.0, min(1.0, (btc * mark_exec / equity_exec) if equity_exec > 0 else 0.0))
 
+            macro_state = str(bundle.metadata.get("macro_state", "OFF"))
+            macro_multiplier = float(bundle.metadata.get("macro_multiplier", 0.0) or 0.0)
+            macro_score = float(bundle.metadata.get("macro_score", 0.0) or 0.0)
+            trend_boost_active = int(bundle.metadata.get("trend_boost_active", 0) or 0)
+            boost_multiplier_applied = float(bundle.metadata.get("boost_multiplier_applied", 1.0) or 1.0)
+
             equity_rows.append(
                 {
                     "timestamp": exec_ts,
@@ -286,6 +292,10 @@ class BacktestEngine:
                     "drawdown": drawdown,
                     "micro_regime": bundle.micro_regime.value,
                     "macro_risk_on": bundle.macro_risk_on,
+                    "macro_state": macro_state,
+                    "macro_multiplier": macro_multiplier,
+                    "macro_score": macro_score,
+                    "trend_boost_active": trend_boost_active,
                     "strategy": bundle.strategy_name,
                     "target": target_bucket,
                     "raw_target": raw_target,
@@ -298,6 +308,11 @@ class BacktestEngine:
                     "micro_regime": bundle.micro_regime.value,
                     "strategy": bundle.strategy_name,
                     "macro_risk_on": bundle.macro_risk_on,
+                    "macro_state": macro_state,
+                    "macro_multiplier": macro_multiplier,
+                    "macro_score": macro_score,
+                    "boost_active": trend_boost_active,
+                    "boost_multiplier_applied": boost_multiplier_applied,
                     "macro_reason": bundle.macro_reason,
                     "target": target_bucket,
                     "raw_target": raw_target,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import pandas as pd
@@ -16,12 +17,156 @@ DEFAULT_COMPONENTS = [
 ]
 
 
+class MacroState(str, Enum):
+    OFF = "OFF"
+    ON_HALF = "ON_HALF"
+    ON_FULL = "ON_FULL"
+
+
 @dataclass
 class MacroScoreResult:
     score: float
     components: dict[str, float]
     multiplier: float
     enabled_components: list[str]
+
+
+@dataclass
+class MacroGateSnapshot:
+    state: str
+    state_age_days: int
+    last_daily_ts: str | None
+    enter_half_streak: int
+    enter_full_streak: int
+    exit_streak: int
+    deescalate_streak: int
+
+
+class MacroGateStateMachine:
+    """Daily macro gate with hysteresis and min on/off durations."""
+
+    def __init__(
+        self,
+        *,
+        enter_threshold: float = 0.75,
+        exit_threshold: float = 0.25,
+        full_threshold: float = 1.0,
+        half_threshold: float = 0.75,
+        confirm_days: int = 2,
+        min_on_days: int = 2,
+        min_off_days: int = 1,
+    ) -> None:
+        self.enter_threshold = float(enter_threshold)
+        self.exit_threshold = float(exit_threshold)
+        self.full_threshold = float(full_threshold)
+        self.half_threshold = float(half_threshold)
+        self.confirm_days = max(1, int(confirm_days))
+        self.min_on_days = max(1, int(min_on_days))
+        self.min_off_days = max(1, int(min_off_days))
+
+        self.state: MacroState = MacroState.OFF
+        self.state_age_days: int = 0
+        self.last_daily_ts: pd.Timestamp | None = None
+
+        self._enter_half_streak: int = 0
+        self._enter_full_streak: int = 0
+        self._exit_streak: int = 0
+        self._deescalate_streak: int = 0
+
+    def reset(self) -> None:
+        self.state = MacroState.OFF
+        self.state_age_days = 0
+        self.last_daily_ts = None
+        self._enter_half_streak = 0
+        self._enter_full_streak = 0
+        self._exit_streak = 0
+        self._deescalate_streak = 0
+
+    def snapshot(self) -> MacroGateSnapshot:
+        return MacroGateSnapshot(
+            state=self.state.value,
+            state_age_days=int(self.state_age_days),
+            last_daily_ts=self.last_daily_ts.isoformat() if self.last_daily_ts is not None else None,
+            enter_half_streak=int(self._enter_half_streak),
+            enter_full_streak=int(self._enter_full_streak),
+            exit_streak=int(self._exit_streak),
+            deescalate_streak=int(self._deescalate_streak),
+        )
+
+    def restore(self, payload: dict[str, Any] | None) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            self.state = MacroState(str(payload.get("state", self.state.value)))
+        except Exception:
+            self.state = MacroState.OFF
+        self.state_age_days = int(payload.get("state_age_days", self.state_age_days) or 0)
+        ts_raw = payload.get("last_daily_ts")
+        self.last_daily_ts = pd.Timestamp(ts_raw) if ts_raw else None
+        self._enter_half_streak = int(payload.get("enter_half_streak", 0) or 0)
+        self._enter_full_streak = int(payload.get("enter_full_streak", 0) or 0)
+        self._exit_streak = int(payload.get("exit_streak", 0) or 0)
+        self._deescalate_streak = int(payload.get("deescalate_streak", 0) or 0)
+
+    def _same_bar(self, daily_ts: pd.Timestamp | None) -> bool:
+        if daily_ts is None:
+            return True
+        if self.last_daily_ts is None:
+            return False
+        return pd.Timestamp(daily_ts) == pd.Timestamp(self.last_daily_ts)
+
+    def _set_state(self, state: MacroState) -> None:
+        self.state = state
+        self.state_age_days = 0
+
+    def _update_streaks(self, score: float) -> None:
+        self._enter_half_streak = self._enter_half_streak + 1 if score >= self.enter_threshold else 0
+        self._enter_full_streak = self._enter_full_streak + 1 if score >= self.full_threshold else 0
+        self._exit_streak = self._exit_streak + 1 if score <= self.exit_threshold else 0
+        self._deescalate_streak = self._deescalate_streak + 1 if score <= self.half_threshold else 0
+
+    def step(self, score: float, daily_ts: pd.Timestamp | None) -> MacroState:
+        """Advance state once per new closed daily bar."""
+        score = float(max(0.0, min(1.0, score)))
+        if daily_ts is None:
+            return self.state
+        if self._same_bar(daily_ts):
+            return self.state
+
+        self.last_daily_ts = pd.Timestamp(daily_ts)
+        self.state_age_days += 1
+        self._update_streaks(score)
+
+        if self.state == MacroState.OFF:
+            if self.state_age_days >= self.min_off_days:
+                if self._enter_full_streak >= self.confirm_days:
+                    self._set_state(MacroState.ON_FULL)
+                elif self._enter_half_streak >= self.confirm_days:
+                    self._set_state(MacroState.ON_HALF)
+            return self.state
+
+        if self.state == MacroState.ON_HALF:
+            if self._enter_full_streak >= self.confirm_days:
+                self._set_state(MacroState.ON_FULL)
+                return self.state
+            if self.state_age_days >= self.min_on_days and self._exit_streak >= self.confirm_days:
+                self._set_state(MacroState.OFF)
+            return self.state
+
+        # ON_FULL
+        if self.state_age_days >= self.min_on_days and self._exit_streak >= self.confirm_days:
+            self._set_state(MacroState.OFF)
+        elif self._deescalate_streak >= self.confirm_days:
+            self._set_state(MacroState.ON_HALF)
+        return self.state
+
+    @staticmethod
+    def multiplier(state: MacroState, half_multiplier: float = 0.5, full_multiplier: float = 1.0) -> float:
+        if state == MacroState.OFF:
+            return 0.0
+        if state == MacroState.ON_HALF:
+            return float(max(0.0, min(1.0, half_multiplier)))
+        return float(max(0.0, min(1.0, full_multiplier)))
 
 
 def _safe_component(condition: bool | float | int | None) -> float:

@@ -80,6 +80,10 @@ class LiveRunner:
                 except Exception:
                     self.risk_state.day_anchor = None
 
+        saved_orchestrator = self.state.get_kv("orchestrator_runtime", {})
+        if isinstance(saved_orchestrator, dict):
+            self.orchestrator.load_runtime_state(saved_orchestrator)
+
     def _write_health(self, status: str, payload: dict[str, Any]) -> None:
         doc = {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -366,6 +370,7 @@ class LiveRunner:
                 "kill_switch_reason": kill_reason,
             },
         )
+        self.state.set_kv("orchestrator_runtime", self.orchestrator.runtime_state())
 
         decision_payload = {
             "timestamp": str(now),
