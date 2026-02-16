@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 import pandas as pd
 
 from ..config import RegimeConfig
 from ..features import indicators
-from ..features.macro_score import macro_result
-from ..features.regime import HMMRegimeSwitcher, RegimeState, RuleBasedRegimeSwitcher, compute_adx, compute_chop
+from ..features.macro_score import MacroGateStateMachine, MacroState, macro_result
+from ..features.regime import HMMRegimeSwitcher, RegimeState, RuleBasedRegimeSwitcher, compute_adx, compute_adx_di, compute_chop
 from .sub_strategies.mean_reversion_bb import MeanReversionBBStrategy, RangeStrategyConfig
 from .sub_strategies.trend_following_breakout import TrendFollowingBreakoutStrategy, TrendStrategyConfig
 from .base import StrategyDecision
@@ -76,20 +76,60 @@ class RegimeSwitchingOrchestrator:
             )
         )
 
-        # booster state (daily cadence)
-        self._boost_condition_streak = 0
+        # Stateful macro gate (v3)
+        self._macro_gate = MacroGateStateMachine(
+            enter_threshold=cfg.macro_enter_threshold,
+            exit_threshold=cfg.macro_exit_threshold,
+            full_threshold=cfg.macro_full_threshold,
+            half_threshold=cfg.macro_half_threshold,
+            confirm_days=cfg.macro_confirm_days,
+            min_on_days=cfg.macro_min_on_days,
+            min_off_days=cfg.macro_min_off_days,
+        )
+
+        # trend booster state (daily cadence)
         self._boost_active = False
-        self._boost_on_days = 0
+        self._boost_state_age_days = 0
+        self._boost_on_streak = 0
+        self._boost_off_streak = 0
         self._boost_last_daily_ts: pd.Timestamp | None = None
 
     def reset(self):
         self.rule_switcher.reset()
         self.range_strategy.reset()
         self.trend_strategy.reset()
-        self._boost_condition_streak = 0
+        self._macro_gate.reset()
         self._boost_active = False
-        self._boost_on_days = 0
+        self._boost_state_age_days = 0
+        self._boost_on_streak = 0
+        self._boost_off_streak = 0
         self._boost_last_daily_ts = None
+
+    def runtime_state(self) -> dict[str, Any]:
+        return {
+            "macro_gate": self._macro_gate.snapshot().__dict__,
+            "boost": {
+                "active": bool(self._boost_active),
+                "state_age_days": int(self._boost_state_age_days),
+                "on_streak": int(self._boost_on_streak),
+                "off_streak": int(self._boost_off_streak),
+                "last_daily_ts": self._boost_last_daily_ts.isoformat() if self._boost_last_daily_ts is not None else None,
+            },
+        }
+
+    def load_runtime_state(self, payload: dict[str, Any] | None) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        self._macro_gate.restore(payload.get("macro_gate") if isinstance(payload.get("macro_gate"), dict) else None)
+
+        boost = payload.get("boost") if isinstance(payload.get("boost"), dict) else {}
+        self._boost_active = bool(boost.get("active", self._boost_active))
+        self._boost_state_age_days = int(boost.get("state_age_days", self._boost_state_age_days) or 0)
+        self._boost_on_streak = int(boost.get("on_streak", self._boost_on_streak) or 0)
+        self._boost_off_streak = int(boost.get("off_streak", self._boost_off_streak) or 0)
+        ts_raw = boost.get("last_daily_ts")
+        self._boost_last_daily_ts = pd.Timestamp(ts_raw) if ts_raw else self._boost_last_daily_ts
 
     @staticmethod
     def _to_timestamp_col(df: pd.DataFrame) -> pd.Series:
@@ -114,6 +154,14 @@ class RegimeSwitchingOrchestrator:
         closed_cutoff = cutoff.floor("D")
         d = d[d["__ts"] < closed_cutoff].sort_values("__ts")
         return d.drop(columns=["__ts"]) if not d.empty else d.drop(columns=["__ts"])
+
+    def _latest_daily_ts(self, daily_df: pd.DataFrame) -> pd.Timestamp | None:
+        if daily_df is None or daily_df.empty:
+            return None
+        ts = self._to_timestamp_col(daily_df)
+        if ts.empty:
+            return None
+        return pd.to_datetime(ts.iloc[-1], utc=True)
 
     def _macro_risk_binary(self, daily_df: pd.DataFrame) -> Tuple[bool, str]:
         if len(daily_df) < max(self.cfg.daily_trend_window, self.cfg.daily_momentum_window + 1):
@@ -153,7 +201,6 @@ class RegimeSwitchingOrchestrator:
             return 0.0
         if momentum <= 0:
             return 0.25
-        # slow ramp for daily trend core sizing
         if momentum < 0.02:
             return 0.5
         if momentum < 0.06:
@@ -188,14 +235,49 @@ class RegimeSwitchingOrchestrator:
         rv_val = float(rv.iloc[idx]) if idx < len(rv) and pd.notna(rv.iloc[idx]) else 0.0
         return self.rule_switcher.step(float(adx.iloc[idx]), float(chop.iloc[idx]), bool(rv_val > vol_thr))
 
-    def _daily_adx(self, daily_df: pd.DataFrame) -> float:
-        if daily_df is None or daily_df.empty or len(daily_df) < max(5, self.cfg.adx_window):
-            return 0.0
-        adx_s = compute_adx(daily_df["high"], daily_df["low"], daily_df["close"], self.cfg.adx_window)
-        if adx_s.empty:
-            return 0.0
-        v = adx_s.iloc[-1]
-        return float(v) if pd.notna(v) else 0.0
+    def _daily_directional_inputs(self, daily_df: pd.DataFrame) -> dict[str, float]:
+        if daily_df is None or daily_df.empty:
+            return {
+                "daily_adx": 0.0,
+                "plus_di": 0.0,
+                "minus_di": 0.0,
+                "sma200": 0.0,
+                "sma50": 0.0,
+                "sma50_slope": 0.0,
+                "daily_close": 0.0,
+            }
+
+        close = daily_df["close"].astype(float)
+        high = daily_df["high"].astype(float)
+        low = daily_df["low"].astype(float)
+
+        adx_s, plus_di_s, minus_di_s = compute_adx_di(high, low, close, window=self.cfg.adx_window)
+        adx = float(adx_s.iloc[-1]) if len(adx_s) and pd.notna(adx_s.iloc[-1]) else 0.0
+        plus_di = float(plus_di_s.iloc[-1]) if len(plus_di_s) and pd.notna(plus_di_s.iloc[-1]) else 0.0
+        minus_di = float(minus_di_s.iloc[-1]) if len(minus_di_s) and pd.notna(minus_di_s.iloc[-1]) else 0.0
+
+        sma200_s = indicators.sma(close, 200)
+        sma50_s = indicators.sma(close, 50)
+        sma200 = float(sma200_s.iloc[-1]) if len(sma200_s) and pd.notna(sma200_s.iloc[-1]) else 0.0
+        sma50 = float(sma50_s.iloc[-1]) if len(sma50_s) and pd.notna(sma50_s.iloc[-1]) else 0.0
+
+        lookback = max(1, int(self.cfg.trend_boost_sma50_slope_lookback_days))
+        if len(sma50_s) > lookback and pd.notna(sma50_s.iloc[-1]) and pd.notna(sma50_s.iloc[-1 - lookback]):
+            sma50_slope = float(sma50_s.iloc[-1] - sma50_s.iloc[-1 - lookback])
+        else:
+            sma50_slope = 0.0
+
+        daily_close = float(close.iloc[-1]) if len(close) else 0.0
+
+        return {
+            "daily_adx": adx,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "sma200": sma200,
+            "sma50": sma50,
+            "sma50_slope": sma50_slope,
+            "daily_close": daily_close,
+        }
 
     def _daily_boost_gate(self, daily_df: pd.DataFrame, micro_regime: RegimeState) -> bool:
         if self.cfg.trend_boost_regime_gate == "micro_trend":
@@ -213,32 +295,68 @@ class RegimeSwitchingOrchestrator:
         if daily_bar_ts is None:
             return bool(self._boost_active)
 
-        if self._boost_last_daily_ts is not None and pd.Timestamp(daily_bar_ts) == pd.Timestamp(self._boost_last_daily_ts):
+        bar_ts = pd.Timestamp(daily_bar_ts)
+        if self._boost_last_daily_ts is not None and bar_ts == pd.Timestamp(self._boost_last_daily_ts):
             return bool(self._boost_active)
 
-        self._boost_last_daily_ts = pd.Timestamp(daily_bar_ts)
+        self._boost_last_daily_ts = bar_ts
+        self._boost_state_age_days += 1
+
+        if condition:
+            self._boost_on_streak += 1
+            self._boost_off_streak = 0
+        else:
+            self._boost_off_streak += 1
+            self._boost_on_streak = 0
 
         confirm_days = max(1, int(self.cfg.trend_boost_confirm_days))
         min_on_days = max(1, int(self.cfg.trend_boost_min_on_days))
+        min_off_days = max(1, int(self.cfg.trend_boost_min_off_days))
 
-        if condition:
-            self._boost_condition_streak += 1
-            if self._boost_active:
-                self._boost_on_days += 1
-            elif self._boost_condition_streak >= confirm_days:
-                self._boost_active = True
-                self._boost_on_days = 1
+        if self._boost_active:
+            if (not condition) and self._boost_state_age_days >= min_on_days and self._boost_off_streak >= confirm_days:
+                self._boost_active = False
+                self._boost_state_age_days = 0
+                self._boost_on_streak = 0
         else:
-            self._boost_condition_streak = 0
-            if self._boost_active:
-                if self._boost_on_days >= min_on_days:
-                    self._boost_active = False
-                    self._boost_on_days = 0
-                else:
-                    # hold until minimum on-duration is reached
-                    self._boost_on_days += 1
+            if condition and self._boost_state_age_days >= min_off_days and self._boost_on_streak >= confirm_days:
+                self._boost_active = True
+                self._boost_state_age_days = 0
+                self._boost_off_streak = 0
 
         return bool(self._boost_active)
+
+    def _macro_state_and_multiplier(
+        self,
+        daily_closed: pd.DataFrame,
+        macro_score: float,
+        macro_linear_multiplier: float,
+        binary_on: bool,
+        daily_bar_ts: pd.Timestamp | None,
+    ) -> tuple[MacroState, float, bool, str]:
+        if self.cfg.macro_mode == "stateful_gate":
+            state = self._macro_gate.step(macro_score, daily_bar_ts)
+            mult = MacroGateStateMachine.multiplier(
+                state,
+                half_multiplier=self.cfg.macro_half_multiplier,
+                full_multiplier=self.cfg.macro_full_multiplier,
+            )
+            return state, float(mult), bool(mult > 0), f"stateful_{state.value.lower()}"
+
+        if self.cfg.macro_mode == "score":
+            mult = float(max(0.0, min(1.0, macro_linear_multiplier)))
+            if mult <= 0:
+                state = MacroState.OFF
+            elif mult < 0.999999:
+                state = MacroState.ON_HALF
+            else:
+                state = MacroState.ON_FULL
+            return state, mult, bool(mult > 0), "score_on" if mult > 0 else "score_below_threshold"
+
+        # binary mode
+        state = MacroState.ON_FULL if binary_on else MacroState.OFF
+        mult = 1.0 if binary_on else 0.0
+        return state, mult, bool(binary_on), "risk_on" if binary_on else "macro_off"
 
     def compute_target_position(
         self,
@@ -262,21 +380,23 @@ class RegimeSwitchingOrchestrator:
             )
 
         daily_closed = self._closed_daily(daily_df, timestamp)
+        daily_bar_ts = self._latest_daily_ts(daily_closed)
 
-        if self.cfg.macro_mode == "score":
-            macro = macro_result(daily_closed, self.cfg)
-            macro_score = float(macro.score)
-            macro_multiplier = float(macro.multiplier)
-            macro_on = macro_multiplier > 0
-            macro_reason = "score_on" if macro_on else "score_below_threshold"
-            macro_components = macro.components
-            macro_components_used = macro.enabled_components
-        else:
-            macro_on, macro_reason = self._macro_risk_binary(daily_closed)
-            macro_score = 1.0 if macro_on else 0.0
-            macro_multiplier = 1.0 if macro_on else 0.0
-            macro_components = {}
-            macro_components_used = []
+        macro = macro_result(daily_closed, self.cfg)
+        macro_score = float(macro.score)
+        macro_components = macro.components
+        macro_components_used = macro.enabled_components
+
+        binary_on, binary_reason = self._macro_risk_binary(daily_closed)
+        macro_state, macro_multiplier, macro_on, macro_reason = self._macro_state_and_multiplier(
+            daily_closed,
+            macro_score=macro_score,
+            macro_linear_multiplier=float(macro.multiplier),
+            binary_on=binary_on,
+            daily_bar_ts=daily_bar_ts,
+        )
+        if self.cfg.macro_mode == "binary":
+            macro_reason = binary_reason
 
         micro_regime = self._micro_regime(hourly_df, len(hourly_df) - 1)
 
@@ -293,14 +413,18 @@ class RegimeSwitchingOrchestrator:
             "base_target": base_target,
             "macro_mode": self.cfg.macro_mode,
             "macro_score": macro_score,
+            "macro_state": macro_state.value,
             "macro_multiplier": macro_multiplier,
             "macro_reason": macro_reason,
+            "macro_components": str(macro_components),
+            "macro_components_used": str(macro_components_used),
         }
-        if macro_components:
-            metadata["macro_components"] = str(macro_components)
-            metadata["macro_components_used"] = str(macro_components_used)
 
         if not macro_on or macro_multiplier <= 0:
+            metadata.update({
+                "trend_boost_active": 0,
+                "boost_multiplier_applied": 1.0,
+            })
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason=macro_reason,
@@ -325,7 +449,6 @@ class RegimeSwitchingOrchestrator:
         # macro multiplier scales base target before regime/sub-strategy logic.
         macro_target = base_target * macro_multiplier
 
-        # Legacy path preserves historical behavior when explicitly enabled.
         if self.cfg.legacy_substrategy_switching:
             if micro_regime == RegimeState.TREND:
                 strategy_name = self.trend_strategy.name
@@ -350,7 +473,6 @@ class RegimeSwitchingOrchestrator:
             regime_target = macro_target * regime_mult
             final_target = regime_target * strategy_ratio
         else:
-            # New path: TREND uses slower daily core momentum, hourly signal only overlays.
             regime_target = macro_target * regime_mult
             if micro_regime == RegimeState.TREND and self.cfg.trend_playbook == "core_momentum_daily":
                 strategy_name = "core_momentum_daily"
@@ -361,7 +483,6 @@ class RegimeSwitchingOrchestrator:
 
                 if self.cfg.enable_hourly_overlay:
                     trend_signal = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
-                    # map [0,1] signal to [-overlay_max_adjustment, +overlay_max_adjustment]
                     overlay_adj = (trend_signal - 0.5) * 2.0 * self.cfg.overlay_max_adjustment
                     metadata["overlay_signal"] = trend_signal
                     metadata["overlay_adj"] = overlay_adj
@@ -386,34 +507,69 @@ class RegimeSwitchingOrchestrator:
                 strategy_ratio = min(1.0, current_exposure / macro_target) if macro_target > 0 else 0.0
                 final_target = regime_target * strategy_ratio
 
-        # Optional trend-strength booster on daily ADX + macro score + trend gate.
-        daily_bar_ts: pd.Timestamp | None = None
-        if not daily_closed.empty:
-            daily_bar_ts = pd.to_datetime(self._to_timestamp_col(daily_closed).iloc[-1], utc=True)
+        # Directional daily trend inputs.
+        d = self._daily_directional_inputs(daily_closed)
+        daily_adx = float(d["daily_adx"])
+        plus_di = float(d["plus_di"])
+        minus_di = float(d["minus_di"])
+        sma200 = float(d["sma200"])
+        sma50 = float(d["sma50"])
+        sma50_slope = float(d["sma50_slope"])
+        daily_close = float(d["daily_close"])
 
-        daily_adx = self._daily_adx(daily_closed)
-        boost_gate = self._daily_boost_gate(daily_closed, micro_regime)
-        boost_condition = (
-            macro_multiplier > 0
-            and macro_score >= float(self.cfg.trend_boost_macro_score_threshold)
-            and boost_gate
-            and daily_adx >= float(self.cfg.trend_boost_adx_threshold)
-        )
+        if self.cfg.macro_mode == "stateful_gate":
+            directional_checks = [
+                macro_state == MacroState.ON_FULL,
+                daily_adx >= float(self.cfg.trend_boost_adx_threshold),
+                plus_di > minus_di,
+                sma50_slope > 0,
+            ]
+            if self.cfg.trend_boost_require_above_sma200:
+                directional_checks.append(daily_close > sma200)
+            if self.cfg.trend_boost_require_micro_trend:
+                directional_checks.append(micro_regime == RegimeState.TREND)
+            boost_condition = all(directional_checks)
+        else:
+            boost_gate = self._daily_boost_gate(daily_closed, micro_regime)
+            boost_condition = (
+                macro_multiplier > 0
+                and macro_score >= float(self.cfg.trend_boost_macro_score_threshold)
+                and boost_gate
+                and daily_adx >= float(self.cfg.trend_boost_adx_threshold)
+            )
 
         booster_active = False
+        boost_multiplier_applied = 1.0
         if self.cfg.trend_boost_enabled:
             booster_active = self._update_booster_state(daily_bar_ts, bool(boost_condition))
             if booster_active:
-                final_target = final_target * float(self.cfg.trend_boost_multiplier)
+                boost_multiplier_applied = float(self.cfg.trend_boost_multiplier)
+                final_target = final_target * boost_multiplier_applied
 
         final_target = max(0.0, min(self.cfg.max_position_fraction, float(final_target)))
 
+        # Derived multiplier from micro + strategy stack
+        pre_micro_target = max(1e-12, macro_target)
+        micro_multiplier = float((regime_target * strategy_ratio) / pre_micro_target) if pre_micro_target > 0 else 0.0
+
         metadata.update(
             {
+                "regime_multiplier": regime_mult,
+                "strategy_ratio": strategy_ratio,
+                "micro_multiplier": micro_multiplier,
+                "regime_target": regime_target,
+                "target_pre_boost": max(0.0, min(self.cfg.max_position_fraction, float(regime_target * strategy_ratio))),
                 "daily_adx": daily_adx,
+                "plus_di": plus_di,
+                "minus_di": minus_di,
+                "sma200": sma200,
+                "sma50": sma50,
+                "sma50_slope": sma50_slope,
                 "trend_boost_enabled": int(bool(self.cfg.trend_boost_enabled)),
                 "trend_boost_condition": int(bool(boost_condition)),
                 "trend_boost_active": int(bool(booster_active)),
+                "boost_multiplier_applied": boost_multiplier_applied,
+                "final_target": final_target,
             }
         )
 

@@ -17,10 +17,9 @@ class RegimeState(str, Enum):
     HIGH_VOL = "HIGH_VOL"
 
 
-def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+def compute_adx_di(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
     prev_high = high.shift(1)
     prev_low = low.shift(1)
-    prev_close = close.shift(1)
 
     up_move = high - prev_high
     down_move = prev_low - low
@@ -36,7 +35,12 @@ def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int =
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.rolling(window=window, min_periods=window).mean()
-    return adx.fillna(0.0)
+    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    adx, _, _ = compute_adx_di(high, low, close, window=window)
+    return adx
 
 
 def compute_chop(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
