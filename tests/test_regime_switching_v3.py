@@ -67,7 +67,7 @@ def test_v3_stateful_gate_bucket_scaling_and_directional_boost(monkeypatch):
         return MacroScoreResult(score=s, components={"mock": s}, multiplier=s, enabled_components=["mock"])
 
     monkeypatch.setattr(orch_mod, "macro_result", fake_macro_result)
-    monkeypatch.setattr(orch, "_micro_regime", lambda _h, _idx: RegimeState.TREND)
+    monkeypatch.setattr(orch, "_micro_regime", lambda _h, _idx, precomputed=None: RegimeState.TREND)
     monkeypatch.setattr(orch, "_realized_vol", lambda h: pd.Series([0.25] * len(h)))
     monkeypatch.setattr(orch, "_core_momentum_ratio", lambda _d: 1.0)
     monkeypatch.setattr(

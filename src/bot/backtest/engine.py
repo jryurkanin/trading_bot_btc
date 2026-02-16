@@ -9,6 +9,9 @@ import pandas as pd
 from ..config import BacktestConfig, RegimeConfig, RiskConfig, ExecutionConfig
 from ..execution.risk import RiskManager, RiskState
 from ..execution.rebalance_policy import RebalancePolicy
+from ..features import indicators
+from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
+from ..features.regime import compute_adx, compute_chop
 from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator, RegimeDecisionBundle
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
@@ -102,6 +105,57 @@ class BacktestEngine:
         if len(hourly) < 2:
             raise ValueError("Need at least 2 hourly candles for no-lookahead fill simulation")
 
+        # Precompute heavy regime inputs once so the backtest loop is O(n),
+        # not O(n^2) from repeatedly recomputing rolling features.
+        hourly_returns = hourly["close"].pct_change()
+        vol_lookback_hours = max(24, reg_cfg.vol_lookback_days * 24)
+        vol_min_periods = max(30, vol_lookback_hours // 4)
+
+        realized_vol = indicators.realized_vol(hourly_returns, reg_cfg.realized_vol_window)
+        hourly_precomputed: dict[str, Any] = {
+            "realized_vol": realized_vol,
+            "adx": compute_adx(hourly["high"], hourly["low"], hourly["close"], window=reg_cfg.adx_window),
+            "chop": compute_chop(hourly["high"], hourly["low"], hourly["close"], window=reg_cfg.chop_window),
+            "vol_thresholds": realized_vol.rolling(vol_lookback_hours, min_periods=vol_min_periods).quantile(
+                reg_cfg.vol_high_threshold_quantile
+            ),
+        }
+
+        # Precompute sub-strategy indicators for O(1) per-bar lookups.
+        _donchian_low, _donchian_high = donchian_channel(hourly["high"], hourly["low"], reg_cfg.donchian_window)
+        hourly_precomputed["donchian_high"] = _donchian_high
+        hourly_precomputed["donchian_low"] = _donchian_low
+        hourly_precomputed["atr"] = compute_atr(hourly["high"], hourly["low"], hourly["close"], reg_cfg.atr_window)
+        hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast)
+        hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow)
+        _bb_mid, _bb_upper, _bb_lower = bollinger_bands(hourly["close"], reg_cfg.bb_window, reg_cfg.bb_stdev)
+        hourly_precomputed["bb_mid"] = _bb_mid
+        hourly_precomputed["bb_upper"] = _bb_upper
+        hourly_precomputed["bb_lower"] = _bb_lower
+
+        if reg_cfg.hmm_regime_enabled:
+            hourly_precomputed["hmm_features"] = (
+                pd.concat(
+                    [
+                        hourly["close"].pct_change().fillna(0.0),
+                        hourly["high"].pct_change().fillna(0.0),
+                        hourly["low"].pct_change().fillna(0.0),
+                        hourly["volume"].pct_change().fillna(0.0),
+                        hourly_precomputed["realized_vol"].fillna(0.0),
+                    ],
+                    axis=1,
+                )
+                .rename(
+                    columns={
+                        0: "close_chg",
+                        1: "high_chg",
+                        2: "low_chg",
+                        3: "volume_chg",
+                        4: "realized_vol",
+                    }
+                )
+            )
+
         orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
@@ -140,11 +194,6 @@ class BacktestEngine:
             bar_t = hourly.iloc[i - 1]
             bar_t1 = hourly.iloc[i]
 
-            daily_ctx = daily[daily.index <= signal_ts]
-            if daily_ctx.empty:
-                continue
-            hourly_ctx = hourly.iloc[:i]  # includes bar t, excludes t+1
-
             mark_signal = float(bar_t.get("close", 0.0))
             if mark_signal <= 0:
                 continue
@@ -153,10 +202,12 @@ class BacktestEngine:
             current_exposure = max(0.0, min(1.0, (btc * mark_signal / equity_signal) if equity_signal > 0 else 0.0))
 
             bundle: RegimeDecisionBundle = orchestrator.compute_target_position(
-                signal_ts,
-                hourly_ctx.reset_index(),
-                daily_ctx.reset_index(),
+                timestamp=signal_ts,
+                hourly_df=hourly,
+                daily_df=daily,
                 current_exposure=current_exposure,
+                hourly_idx=i - 1,
+                micro_precomputed=hourly_precomputed,
             )
             raw_target = float(bundle.final_target)
 

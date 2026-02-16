@@ -94,6 +94,10 @@ class RegimeSwitchingOrchestrator:
         self._boost_off_streak = 0
         self._boost_last_daily_ts: pd.Timestamp | None = None
 
+        # Daily computation cache — avoids recomputing macro/daily signals
+        # on every hourly bar when the daily bar hasn't changed.
+        self._daily_cache: dict[str, Any] = {}
+
     def reset(self):
         self.rule_switcher.reset()
         self.range_strategy.reset()
@@ -104,6 +108,7 @@ class RegimeSwitchingOrchestrator:
         self._boost_on_streak = 0
         self._boost_off_streak = 0
         self._boost_last_daily_ts = None
+        self._daily_cache = {}
 
     def runtime_state(self) -> dict[str, Any]:
         return {
@@ -159,9 +164,15 @@ class RegimeSwitchingOrchestrator:
         if daily_df is None or daily_df.empty:
             return None
         ts = self._to_timestamp_col(daily_df)
-        if ts.empty:
-            return None
-        return pd.to_datetime(ts.iloc[-1], utc=True)
+        if isinstance(ts, pd.Series):
+            if ts.empty:
+                return None
+            ts_last = ts.iloc[-1]
+        else:
+            if len(ts) == 0:
+                return None
+            ts_last = ts[-1]
+        return pd.to_datetime(ts_last, utc=True)
 
     def _macro_risk_binary(self, daily_df: pd.DataFrame) -> Tuple[bool, str]:
         if len(daily_df) < max(self.cfg.daily_trend_window, self.cfg.daily_momentum_window + 1):
@@ -207,33 +218,62 @@ class RegimeSwitchingOrchestrator:
             return 0.75
         return 1.0
 
-    def _micro_regime(self, hourly: pd.DataFrame, idx: int) -> RegimeState:
+    def _micro_regime(self, hourly: pd.DataFrame, idx: int, precomputed: dict[str, Any] | None = None) -> RegimeState:
         if idx < 2 or hourly.empty:
             return RegimeState.NEUTRAL
 
-        adx = compute_adx(hourly["high"], hourly["low"], hourly["close"], self.cfg.adx_window)
-        chop = compute_chop(hourly["high"], hourly["low"], hourly["close"], self.cfg.chop_window)
-        rv = self._realized_vol(hourly)
+        adx = precomputed.get("adx") if precomputed else None
+        chop = precomputed.get("chop") if precomputed else None
+        rv = precomputed.get("realized_vol") if precomputed else None
+
+        if isinstance(adx, pd.Series) and len(adx) > idx:
+            adx_val = adx.iloc[idx]
+        else:
+            adx_series = compute_adx(hourly["high"], hourly["low"], hourly["close"], self.cfg.adx_window)
+            adx_val = adx_series.iloc[idx]
+
+        if isinstance(chop, pd.Series) and len(chop) > idx:
+            chop_val = chop.iloc[idx]
+        else:
+            chop_series = compute_chop(hourly["high"], hourly["low"], hourly["close"], self.cfg.chop_window)
+            chop_val = chop_series.iloc[idx]
+
+        if isinstance(rv, pd.Series) and len(rv) > idx:
+            rv_series = rv
+        else:
+            rv_series = self._realized_vol(hourly)
 
         if self.cfg.hmm_regime_enabled and len(hourly) >= self.cfg.hmm_window_hours:
             start = max(0, idx - self.cfg.hmm_window_hours + 1)
-            feats = pd.concat(
-                [
-                    hourly[["close", "high", "low", "volume"]].pct_change().fillna(0).iloc[start : idx + 1],
-                    rv.iloc[start : idx + 1],
-                ],
-                axis=1,
-            ).fillna(0)
+
+            feats_pre = precomputed.get("hmm_features") if precomputed else None
+            if isinstance(feats_pre, pd.DataFrame) and len(feats_pre) > idx:
+                feats = feats_pre.iloc[start : idx + 1]
+            else:
+                feats = pd.concat(
+                    [
+                        hourly[["close", "high", "low", "volume"]].pct_change().fillna(0).iloc[start : idx + 1],
+                        rv_series.iloc[start : idx + 1],
+                    ],
+                    axis=1,
+                ).fillna(0)
+
             if len(feats) >= 20:
                 self.hmm_switcher.fit(feats.tail(self.cfg.hmm_window_hours).values)
                 return self.hmm_switcher.predict_one(feats.iloc[-1].values)
 
         lookback = max(24, self.cfg.vol_lookback_days * 24)
-        vol_thr_series = rv.rolling(lookback, min_periods=max(30, lookback // 4)).quantile(self.cfg.vol_high_threshold_quantile)
-        vol_thr_val = vol_thr_series.iloc[idx] if idx < len(vol_thr_series) else None
-        vol_thr = float(vol_thr_val) if vol_thr_val is not None and pd.notna(vol_thr_val) else float("inf")
-        rv_val = float(rv.iloc[idx]) if idx < len(rv) and pd.notna(rv.iloc[idx]) else 0.0
-        return self.rule_switcher.step(float(adx.iloc[idx]), float(chop.iloc[idx]), bool(rv_val > vol_thr))
+        min_periods = max(30, lookback // 4)
+        vol_thr_series_pre = precomputed.get("vol_thresholds") if precomputed else None
+        if isinstance(vol_thr_series_pre, pd.Series) and len(vol_thr_series_pre) > idx:
+            vol_thr = float(vol_thr_series_pre.iloc[idx]) if pd.notna(vol_thr_series_pre.iloc[idx]) else float("inf")
+        else:
+            vol_thr_series = rv_series.rolling(lookback, min_periods=min_periods).quantile(self.cfg.vol_high_threshold_quantile)
+            vol_thr_val = vol_thr_series.iloc[idx] if idx < len(vol_thr_series) else None
+            vol_thr = float(vol_thr_val) if vol_thr_val is not None and pd.notna(vol_thr_val) else float("inf")
+        rv_val = float(rv_series.iloc[idx]) if idx < len(rv_series) and pd.notna(rv_series.iloc[idx]) else 0.0
+
+        return self.rule_switcher.step(float(adx_val), float(chop_val), bool(rv_val > vol_thr))
 
     def _daily_directional_inputs(self, daily_df: pd.DataFrame) -> dict[str, float]:
         if daily_df is None or daily_df.empty:
@@ -364,6 +404,8 @@ class RegimeSwitchingOrchestrator:
         hourly_df: pd.DataFrame,
         daily_df: pd.DataFrame,
         current_exposure: float,
+        hourly_idx: int | None = None,
+        micro_precomputed: dict[str, Any] | None = None,
     ) -> RegimeDecisionBundle:
         if hourly_df.empty:
             return RegimeDecisionBundle(
@@ -379,28 +421,79 @@ class RegimeSwitchingOrchestrator:
                 metadata={"timestamp": str(timestamp)},
             )
 
-        daily_closed = self._closed_daily(daily_df, timestamp)
-        daily_bar_ts = self._latest_daily_ts(daily_closed)
+        if hourly_idx is None:
+            hourly_idx = len(hourly_df) - 1
+        hourly_idx = max(0, min(int(hourly_idx), len(hourly_df) - 1))
 
-        macro = macro_result(daily_closed, self.cfg)
-        macro_score = float(macro.score)
-        macro_components = macro.components
-        macro_components_used = macro.enabled_components
+        # Fast path: reuse cached daily-derived results when the signal
+        # timestamp falls on the same calendar day.  All daily outputs
+        # (_closed_daily, macro scoring, directional inputs, core_momentum)
+        # are stored in a single _daily_cache dict keyed by "_ts_day".
+        _ts_floor = pd.Timestamp(timestamp)
+        if _ts_floor.tzinfo is None:
+            _ts_floor = _ts_floor.tz_localize("UTC")
+        else:
+            _ts_floor = _ts_floor.tz_convert("UTC")
+        _ts_day = _ts_floor.floor("D")
+        _dc = self._daily_cache
 
-        binary_on, binary_reason = self._macro_risk_binary(daily_closed)
-        macro_state, macro_multiplier, macro_on, macro_reason = self._macro_state_and_multiplier(
-            daily_closed,
-            macro_score=macro_score,
-            macro_linear_multiplier=float(macro.multiplier),
-            binary_on=binary_on,
-            daily_bar_ts=daily_bar_ts,
-        )
-        if self.cfg.macro_mode == "binary":
-            macro_reason = binary_reason
+        if _dc.get("_ts_day") == _ts_day and "macro_score" in _dc:
+            # Full cache hit — reuse everything.
+            daily_closed = _dc["daily_closed"]
+            daily_bar_ts = _dc["daily_bar_ts"]
+            macro_score = _dc["macro_score"]
+            macro_components = _dc["macro_components"]
+            macro_components_used = _dc["macro_components_used"]
+            binary_on = _dc["binary_on"]
+            binary_reason = _dc["binary_reason"]
+            macro_state = _dc["macro_state"]
+            macro_multiplier = _dc["macro_multiplier"]
+            macro_on = _dc["macro_on"]
+            macro_reason = _dc["macro_reason"]
+        else:
+            # Day changed — recompute everything and store.
+            daily_closed = self._closed_daily(daily_df, timestamp)
+            daily_bar_ts = self._latest_daily_ts(daily_closed)
 
-        micro_regime = self._micro_regime(hourly_df, len(hourly_df) - 1)
+            macro = macro_result(daily_closed, self.cfg)
+            macro_score = float(macro.score)
+            macro_components = macro.components
+            macro_components_used = macro.enabled_components
 
-        rv_last = self._realized_vol(hourly_df).iloc[-1]
+            binary_on, binary_reason = self._macro_risk_binary(daily_closed)
+            macro_state, macro_multiplier, macro_on, macro_reason = self._macro_state_and_multiplier(
+                daily_closed,
+                macro_score=macro_score,
+                macro_linear_multiplier=float(macro.multiplier),
+                binary_on=binary_on,
+                daily_bar_ts=daily_bar_ts,
+            )
+            if self.cfg.macro_mode == "binary":
+                macro_reason = binary_reason
+
+            self._daily_cache = {
+                "_ts_day": _ts_day,
+                "daily_bar_ts": daily_bar_ts,
+                "daily_closed": daily_closed,
+                "macro_score": macro_score,
+                "macro_components": macro_components,
+                "macro_components_used": macro_components_used,
+                "binary_on": binary_on,
+                "binary_reason": binary_reason,
+                "macro_state": macro_state,
+                "macro_multiplier": macro_multiplier,
+                "macro_on": macro_on,
+                "macro_reason": macro_reason,
+            }
+
+        micro_regime = self._micro_regime(hourly_df, hourly_idx, precomputed=micro_precomputed)
+
+        rv_pre = micro_precomputed.get("realized_vol") if micro_precomputed else None
+        if isinstance(rv_pre, pd.Series) and len(rv_pre) > hourly_idx:
+            rv_last = rv_pre.iloc[hourly_idx]
+        else:
+            rv_last = self._realized_vol(hourly_df).iloc[hourly_idx]
+
         realized_vol = float(rv_last) if rv_last is not None and pd.notna(rv_last) else 0.0
         if realized_vol <= 0 or pd.isna(realized_vol):
             realized_vol = 0.0
@@ -452,16 +545,19 @@ class RegimeSwitchingOrchestrator:
         if self.cfg.legacy_substrategy_switching:
             if micro_regime == RegimeState.TREND:
                 strategy_name = self.trend_strategy.name
-                strategy_ratio = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
-                metadata.update(self.trend_strategy.signal_reason(hourly_df, current_exposure, timestamp))
+                strategy_ratio = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp,
+                                                                     idx=hourly_idx, precomputed=micro_precomputed)
+                metadata.update(self.trend_strategy.signal_reason(hourly_df.iloc[:hourly_idx + 1], current_exposure, timestamp))
             elif micro_regime == RegimeState.RANGE:
                 strategy_name = self.range_strategy.name
-                prev_row = hourly_df.iloc[-2] if len(hourly_df) >= 2 else None
+                prev_row = hourly_df.iloc[hourly_idx - 1] if hourly_idx >= 1 else None
                 strategy_ratio = self.range_strategy.compute_target(
-                    hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]
+                    hourly_df.iloc[hourly_idx], prev_row, current_exposure, timestamp, hourly_df["close"],
+                    idx=hourly_idx, precomputed=micro_precomputed,
                 )
                 metadata.update(
-                    self.range_strategy.signal_reason(hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"])
+                    self.range_strategy.signal_reason(hourly_df.iloc[hourly_idx], prev_row, current_exposure, timestamp, hourly_df["close"],
+                                                      idx=hourly_idx, precomputed=micro_precomputed)
                 )
             elif micro_regime == RegimeState.HIGH_VOL:
                 strategy_name = "high_vol_guard"
@@ -476,13 +572,18 @@ class RegimeSwitchingOrchestrator:
             regime_target = macro_target * regime_mult
             if micro_regime == RegimeState.TREND and self.cfg.trend_playbook == "core_momentum_daily":
                 strategy_name = "core_momentum_daily"
-                core_ratio = self._core_momentum_ratio(daily_closed)
+                if "core_momentum_ratio" in self._daily_cache:
+                    core_ratio = self._daily_cache["core_momentum_ratio"]
+                else:
+                    core_ratio = self._core_momentum_ratio(daily_closed)
+                    self._daily_cache["core_momentum_ratio"] = core_ratio
                 regime_target = regime_target * core_ratio
                 strategy_ratio = 1.0
                 metadata["core_ratio"] = core_ratio
 
                 if self.cfg.enable_hourly_overlay:
-                    trend_signal = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp)
+                    trend_signal = self.trend_strategy.compute_target(hourly_df, current_exposure, timestamp,
+                                                                      idx=hourly_idx, precomputed=micro_precomputed)
                     overlay_adj = (trend_signal - 0.5) * 2.0 * self.cfg.overlay_max_adjustment
                     metadata["overlay_signal"] = trend_signal
                     metadata["overlay_adj"] = overlay_adj
@@ -490,12 +591,14 @@ class RegimeSwitchingOrchestrator:
                 final_target = regime_target * (1.0 + overlay_adj)
             elif micro_regime == RegimeState.RANGE:
                 strategy_name = self.range_strategy.name
-                prev_row = hourly_df.iloc[-2] if len(hourly_df) >= 2 else None
+                prev_row = hourly_df.iloc[hourly_idx - 1] if hourly_idx >= 1 else None
                 strategy_ratio = self.range_strategy.compute_target(
-                    hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"]
+                    hourly_df.iloc[hourly_idx], prev_row, current_exposure, timestamp, hourly_df["close"],
+                    idx=hourly_idx, precomputed=micro_precomputed,
                 )
                 metadata.update(
-                    self.range_strategy.signal_reason(hourly_df.iloc[-1], prev_row, current_exposure, timestamp, hourly_df["close"])
+                    self.range_strategy.signal_reason(hourly_df.iloc[hourly_idx], prev_row, current_exposure, timestamp, hourly_df["close"],
+                                                      idx=hourly_idx, precomputed=micro_precomputed)
                 )
                 final_target = regime_target * strategy_ratio
             elif micro_regime == RegimeState.HIGH_VOL:
@@ -507,8 +610,12 @@ class RegimeSwitchingOrchestrator:
                 strategy_ratio = min(1.0, current_exposure / macro_target) if macro_target > 0 else 0.0
                 final_target = regime_target * strategy_ratio
 
-        # Directional daily trend inputs.
-        d = self._daily_directional_inputs(daily_closed)
+        # Directional daily trend inputs (cached with daily data).
+        if "directional_inputs" in self._daily_cache:
+            d = self._daily_cache["directional_inputs"]
+        else:
+            d = self._daily_directional_inputs(daily_closed)
+            self._daily_cache["directional_inputs"] = d
         daily_adx = float(d["daily_adx"])
         plus_di = float(d["plus_di"])
         minus_di = float(d["minus_di"])
