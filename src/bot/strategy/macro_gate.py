@@ -174,10 +174,16 @@ class AdaptiveMacroGate:
         """
         shift = self._clamp(vol_z * self._sensitivity, -0.25, 0.25)
 
-        self._gate.enter_threshold = self._clamp(self._enter_base + shift, 0.10, 0.95)
+        # Upper clamp allows intentionally-high bases (e.g., 2.0) to disable
+        # the gate by producing thresholds unreachable by a [0, 1] score.
+        enter_hi = max(0.95, self._enter_base)
+        full_hi = max(1.0, self._full_base)
+        half_hi = max(0.95, self._half_base)
+
+        self._gate.enter_threshold = self._clamp(self._enter_base + shift, 0.10, enter_hi)
         self._gate.exit_threshold = self._clamp(self._exit_base - shift, 0.05, 0.90)
-        self._gate.half_threshold = self._clamp(self._half_base + shift, 0.10, 0.95)
-        self._gate.full_threshold = self._clamp(self._full_base + shift, 0.30, 1.0)
+        self._gate.half_threshold = self._clamp(self._half_base + shift, 0.10, half_hi)
+        self._gate.full_threshold = self._clamp(self._full_base + shift, 0.30, full_hi)
 
         # Enforce ordering invariants
         if self._gate.exit_threshold >= self._gate.enter_threshold:
