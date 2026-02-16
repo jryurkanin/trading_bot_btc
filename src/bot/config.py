@@ -183,6 +183,28 @@ class RegimeConfig(BaseModel):
     v4_micro_mult_high_vol: float = 0.0
     v4_core_risk_refresh: str = "daily"
 
+    # V5 adaptive strategy config
+    # -- Asymmetric micro regime multipliers (allows boost > 1.0 in trends) --
+    v5_micro_trend_mult: float = 1.15
+    v5_micro_range_mult: float = 0.85
+    v5_micro_neutral_mult: float = 1.0
+    v5_micro_high_vol_mult: float = 0.0
+    v5_micro_max_mult: float = 1.5  # hard cap on any micro multiplier
+
+    # -- Adaptive macro gate --
+    v5_adaptive_gate_enabled: bool = True
+    v5_adaptive_vol_window_days: int = 60
+    v5_adaptive_enter_base: float = 0.75
+    v5_adaptive_exit_base: float = 0.25
+    v5_adaptive_half_base: float = 0.75
+    v5_adaptive_full_base: float = 1.0
+    v5_adaptive_sensitivity: float = 0.15  # max threshold shift per unit vol-z
+    v5_adaptive_confirm_days: int = 2
+    v5_adaptive_min_on_days: int = 2
+    v5_adaptive_min_off_days: int = 1
+    v5_adaptive_half_multiplier: float = 0.5
+    v5_adaptive_full_multiplier: float = 1.0
+
 
 class RiskConfig(BaseModel):
     max_drawdown_cut_pct: float = 0.25
@@ -268,6 +290,7 @@ class BacktestConfig(BaseModel):
         "regime_switching_v3",
         "regime_switching_v4_core",
         "macro_gate_benchmark",
+        "v5_adaptive",
     }
 
     @field_validator("strategy", mode="after")
