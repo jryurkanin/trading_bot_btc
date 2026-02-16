@@ -106,7 +106,7 @@ def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.D
     return aligned, warnings
 
 
-def _label_trades_with_bucket(trades_df: pd.DataFrame | None, bar_labels: pd.DataFrame) -> pd.DataFrame:
+def _label_trades_with_bucket(trades_df: pd.DataFrame | None, decisions_df: pd.DataFrame | None) -> pd.DataFrame:
     if trades_df is None or trades_df.empty:
         return pd.DataFrame(columns=["macro_bucket", "fee", "notional"])
 
@@ -117,21 +117,51 @@ def _label_trades_with_bucket(trades_df: pd.DataFrame | None, bar_labels: pd.Dat
         else:
             tr = tr.reset_index().rename(columns={tr.index.name or "index": "ts"})
             tr["ts"] = _to_utc(tr["ts"])
-    else:
-        tr["ts"] = _to_utc(tr["ts"])
+    tr["ts"] = tr["ts"].astype("datetime64[ns, UTC]")
+    if "ts" in tr.columns and tr["ts"].dtype != "datetime64[ns, UTC]":
+        tr["ts"] = tr["ts"].astype("datetime64[ns, UTC]")
 
-    tr["merge_key"] = (tr["ts"].astype("int64") // 1_000_000_000).astype("int64")
-    bar_map = bar_labels[["merge_key", "macro_bucket"]].drop_duplicates(subset=["merge_key"], keep="last").sort_values("merge_key")
+    if decisions_df is None or decisions_df.empty:
+        out = tr[["ts"]].copy()
+        out["macro_bucket"] = "OFF"
+        out["fee"] = pd.to_numeric(out.get("fee", 0.0), errors="coerce").fillna(0.0)
+        out["notional"] = pd.to_numeric(out.get("notional", 0.0), errors="coerce").fillna(0.0)
+        return out
+
+    dec = decisions_df.copy()
+    if "decision_applies_at" in dec.columns:
+        dec["_decision_ts"] = _to_utc(dec["decision_applies_at"])
+    else:
+        dec["_decision_ts"] = _to_utc(dec.index.to_series())
+
+    if "macro_state" in dec.columns or "macro_multiplier" in dec.columns:
+        dec["macro_bucket"] = [
+            _bucket_from_state_and_multiplier(state, mult)
+            for state, mult in zip(dec.get("macro_state", "OFF"), dec.get("macro_multiplier", 0.0), strict=False)
+        ]
+    else:
+        dec["macro_bucket"] = "OFF"
+
+    dec["_decision_ts"] = dec["_decision_ts"].astype("datetime64[ns, UTC]")
+
+    dec_map = (
+        dec[["_decision_ts", "macro_bucket"]]
+        .dropna(subset=["_decision_ts"])
+        .drop_duplicates(subset=["_decision_ts"], keep="last")
+        .sort_values("_decision_ts")
+    )
 
     out = pd.merge_asof(
-        tr.sort_values("merge_key"),
-        bar_map,
-        on="merge_key",
+        tr[["ts", "fee", "notional"]].sort_values("ts"),
+        dec_map,
+        left_on="ts",
+        right_on="_decision_ts",
         direction="backward",
     )
     out["macro_bucket"] = out["macro_bucket"].fillna("OFF")
     out["fee"] = pd.to_numeric(out.get("fee", 0.0), errors="coerce").fillna(0.0)
     out["notional"] = pd.to_numeric(out.get("notional", 0.0), errors="coerce").fillna(0.0)
+    out = out.drop(columns=["_decision_ts"], errors="ignore")
     return out
 
 
@@ -179,7 +209,9 @@ def compute_macro_bucket_attribution(
     equity_prev = bars["equity"].shift(1).replace(0.0, np.nan)
     bars["turnover_bar"] = 0.0
 
-    trades_labeled = _label_trades_with_bucket(trades_df, bars)
+    trades_labeled = _label_trades_with_bucket(trades_df, decisions_df)
+    if not trades_labeled.empty:
+        warnings.append("trade_labels_from_decisions")
     if trades_labeled.empty:
         warnings.append("no_trades_for_macro_bucket_attribution")
 
@@ -190,6 +222,9 @@ def compute_macro_bucket_attribution(
             notional=("notional", "sum"),
             trade_count=("macro_bucket", "size"),
         )
+        assigned = int(trade_by_bucket["trade_count"].sum()) if not trade_by_bucket.empty else 0
+        if assigned != len(trades_labeled):
+            warnings.append("trade_bucket_count_mismatch")
     else:
         trade_by_bucket = pd.DataFrame(columns=["macro_bucket", "fees", "notional", "trade_count"])
 

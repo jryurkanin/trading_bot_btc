@@ -377,9 +377,9 @@ class TestV5AdaptiveStrategy:
 # ---------------------------------------------------------------------------
 
 class TestV5Config:
-    def test_v5_strategy_accepted(self):
-        bc = BacktestConfig(strategy="v5_adaptive")
-        assert bc.strategy == "v5_adaptive"
+    def test_v5_strategy_rejected(self):
+        with pytest.raises(Exception):
+            BacktestConfig(strategy="v5_adaptive")
 
     def test_v5_config_fields_exist(self):
         cfg = RegimeConfig()

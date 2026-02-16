@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Frontier sweep for ``macro_only_v2`` with walk-forward + cost stress."""
 from __future__ import annotations
 
 import argparse
@@ -14,34 +15,51 @@ import sys
 
 import pandas as pd
 
-# Make local src discoverable when running directly from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 from bot.backtest.engine import BacktestEngine
-from bot.backtest.reporting import dumps_strict_json, write_strict_json
+from bot.backtest.reporting import write_strict_json, dumps_strict_json
 from bot.backtest.macro_attribution import compute_macro_bucket_attribution
-from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
+from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 
 
-DEFAULT_GRID_SPACE_V3: dict[str, list[Any]] = {
-    "target_ann_vol": [0.20, 0.30, 0.40],
-    "macro_enter_threshold": [0.50, 0.75],
-    "macro_exit_threshold": [0.0, 0.25],
-    "macro_full_threshold": [1.0],
-    "macro_half_threshold": [0.75],
-    "macro_confirm_days": [1, 2],
-    "macro_min_on_days": [1, 2],
-    "macro_min_off_days": [1],
-    "macro_half_multiplier": [0.40, 0.50, 0.60],
-    "macro_full_multiplier": [1.0],
-    "trend_boost_multiplier": [1.0, 1.05, 1.10, 1.15],
-    "trend_boost_adx_threshold": [20.0, 25.0, 30.0],
-    "trend_boost_confirm_days": [1, 2],
-    "trend_boost_min_on_days": [1, 2],
-    "trend_boost_min_off_days": [1],
-    "trend_boost_sma50_slope_lookback_days": [5, 10],
+DEFAULT_GRID_MACRO_ONLY: dict[str, list[Any]] = {
+    "macro2_signal_mode": ["sma200_and_mom", "sma200_or_mom", "mom_6_12"],
+    "macro2_confirm_days": [1, 2],
+    "macro2_min_on_days": [1, 2],
+    "macro2_min_off_days": [1],
+    "macro2_weight_half": [0.4, 0.5],
+    "macro2_weight_full": [1.0],
+    "macro2_vol_mode": ["inverse_vol", "none"],
+    "macro2_vol_lookback_days": [60],
+    "macro2_vol_floor": [0.05],
+    "macro2_target_ann_vol_half": [0.25, 0.30],
+    "macro2_target_ann_vol_full": [0.50, 0.60],
+    "macro2_dd_threshold": [0.20, 0.25],
+    "macro2_dd_cooldown_days": [8, 10],
+    "macro2_dd_reentry_confirm_days": [2],
+    "macro2_dd_safe_weight": [0.0],
+}
+
+
+SMALL_GRID_MACRO_ONLY: dict[str, list[Any]] = {
+    "macro2_signal_mode": ["sma200_and_mom", "mom_6_12"],
+    "macro2_confirm_days": [2],
+    "macro2_min_on_days": [1, 2],
+    "macro2_min_off_days": [1],
+    "macro2_weight_half": [0.5],
+    "macro2_weight_full": [1.0],
+    "macro2_vol_mode": ["inverse_vol", "none"],
+    "macro2_vol_lookback_days": [60],
+    "macro2_vol_floor": [0.05],
+    "macro2_target_ann_vol_half": [0.30],
+    "macro2_target_ann_vol_full": [0.60],
+    "macro2_dd_threshold": [0.25],
+    "macro2_dd_cooldown_days": [10],
+    "macro2_dd_reentry_confirm_days": [2],
+    "macro2_dd_safe_weight": [0.0],
 }
 
 
@@ -50,13 +68,12 @@ class CostScenario:
     name: str
     fee_bps_delta: float
     impact_bps_delta: float
-    spread_bps_delta: float
 
 
 SCENARIOS = [
-    CostScenario("baseline", 0.0, 0.0, 0.0),
-    CostScenario("stress_1", 5.0, 2.0, 2.0),
-    CostScenario("stress_2", 10.0, 5.0, 5.0),
+    CostScenario("baseline", 0.0, 0.0),
+    CostScenario("stress_1", 5.0, 2.0),
+    CostScenario("stress_2", 10.0, 5.0),
 ]
 
 
@@ -75,22 +92,22 @@ def parse_ts(raw: str) -> datetime:
 
 
 def parse_grid_values(raw: str) -> list[Any]:
-    vals: list[Any] = []
+    out: list[Any] = []
     for chunk in [x.strip() for x in raw.split(",") if x.strip()]:
         low = chunk.lower()
         if low in {"true", "false", "1", "0", "yes", "no"}:
-            vals.append(low in {"true", "1", "yes"})
+            out.append(low in {"true", "1", "yes"})
             continue
         try:
             if "." in low or "e" in low:
-                vals.append(float(chunk))
+                out.append(float(chunk))
             else:
-                vals.append(int(chunk))
+                out.append(int(chunk))
             continue
         except ValueError:
             pass
-        vals.append(chunk)
-    return vals
+        out.append(chunk)
+    return out
 
 
 def parse_grid_flags(items: list[str]) -> dict[str, list[Any]]:
@@ -112,28 +129,28 @@ def product_grid(space: dict[str, list[Any]]) -> list[dict[str, Any]]:
     return combos
 
 
-def load_grid(path: str | None, grid_flags: dict[str, list[Any]]) -> list[dict[str, Any]]:
+def load_grid(path: str | None, grid_flags: dict[str, list[Any]], small: bool = False) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(payload, list):
             base = [dict(x) for x in payload if isinstance(x, dict)]
             if not grid_flags:
                 return base
-            ext = product_grid(grid_flags)
             out: list[dict[str, Any]] = []
             for b in base:
-                for e in ext:
+                for e in product_grid(grid_flags):
                     m = dict(b)
                     m.update(e)
                     out.append(m)
             return out
+
         if isinstance(payload, dict):
             space = {str(k): list(v) for k, v in payload.items() if isinstance(v, list)}
             space.update(grid_flags)
             return product_grid(space)
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
-    space = dict(DEFAULT_GRID_SPACE_V3)
+    space = dict(SMALL_GRID_MACRO_ONLY if small else DEFAULT_GRID_MACRO_ONLY)
     space.update(grid_flags)
     return product_grid(space)
 
@@ -163,10 +180,24 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
     raise KeyError(f"Unknown parameter key: {key}")
 
 
-def configure_v3(cfg: BotConfig) -> None:
-    # Use benchmark-only strategy for v3 frontier workflow.
-    cfg.backtest.strategy = "macro_gate_benchmark"
+def configure_strategy(cfg: BotConfig, strategy: str) -> None:
+    cfg.backtest.strategy = strategy
     cfg.regime.trend_boost_enabled = False
+
+
+def _bucket_fees(table: dict[str, Any] | None) -> tuple[float, float, float]:
+    if not table:
+        return 0.0, 0.0, 0.0
+    off = float((table.get("OFF") or {}).get("fees", 0.0) or 0.0)
+    half = float((table.get("ON_HALF") or {}).get("fees", 0.0) or 0.0)
+    full = float((table.get("ON_FULL") or {}).get("fees", 0.0) or 0.0)
+    return off + half + full, half, full
+
+
+def _bucket_share(table: dict[str, Any] | None, key: str) -> float:
+    if not table:
+        return 0.0
+    return float(((table.get(key) or {}).get("time_share", 0.0) or 0.0))
 
 
 def run_window(
@@ -177,21 +208,24 @@ def run_window(
     window: Window,
     params: dict[str, Any],
     scenario: CostScenario,
-    base_maker_rate: float,
-    base_taker_rate: float,
+    base_maker: float,
+    base_taker: float,
+    strategy: str,
 ) -> dict[str, Any]:
     cfg = clone_cfg(base_cfg)
     cfg.data.product = product
-    configure_v3(cfg)
+    configure_strategy(cfg, strategy)
 
     for k, v in params.items():
         set_param(cfg, k, v)
 
-    maker_rate = float(base_maker_rate + scenario.fee_bps_delta / 10_000.0)
-    taker_rate = float(base_taker_rate + scenario.fee_bps_delta / 10_000.0)
+    if strategy == "macro_only_v2" and getattr(cfg.regime, "macro2_signal_mode", None) is None:
+        cfg.regime.macro2_signal_mode = "sma200_and_mom"
+
+    maker_rate = float(base_maker + scenario.fee_bps_delta / 10_000.0)
+    taker_rate = float(base_taker + scenario.fee_bps_delta / 10_000.0)
 
     cfg.execution.impact_bps = float(cfg.execution.impact_bps + scenario.impact_bps_delta)
-    cfg.execution.spread_bps = float(cfg.execution.spread_bps + scenario.spread_bps_delta)
 
     engine = BacktestEngine(
         product=product,
@@ -202,12 +236,13 @@ def run_window(
         config=cfg.backtest,
         fees=(maker_rate, taker_rate),
         slippage_bps=cfg.backtest.slippage_bps,
-        use_spread_slippage=cfg.backtest.use_spread_slippage,
+        use_spread_slippage=cfg.backtest.use_spread_slashing if hasattr(cfg.backtest, "use_spread_slashing") else cfg.backtest.use_spread_slippage,
         regime_config=cfg.regime,
         risk_config=cfg.risk,
         execution_config=cfg.execution,
     )
     result = engine.run()
+
     eq = result.equity_curve["equity"]
     net_pnl = float(eq.iloc[-1] - eq.iloc[0]) if len(eq) else 0.0
 
@@ -218,39 +253,39 @@ def run_window(
         initial_equity=cfg.backtest.initial_equity,
     )
 
-    buckets = macro_bucket_report.get("buckets", {})
-    off_time_share = float((buckets.get("OFF") or {}).get("time_share", 0.0) or 0.0)
-    half_time_share = float((buckets.get("ON_HALF") or {}).get("time_share", 0.0) or 0.0)
-    full_time_share = float((buckets.get("ON_FULL") or {}).get("time_share", 0.0) or 0.0)
-
-    return {
+    bucket_total_fees, half_fees, full_fees = _bucket_fees(macro_bucket_report.get("buckets", {}))
+    row: dict[str, Any] = {
+        "strategy": strategy,
         "window": window.name,
         "scenario": scenario.name,
         "start": window.start.isoformat(),
         "end": window.end.isoformat(),
         "cagr": result.metrics.get("cagr"),
         "sharpe": result.metrics.get("sharpe"),
-        "sortino": result.metrics.get("sortino"),
         "max_drawdown": result.metrics.get("max_drawdown"),
         "profit_factor": result.metrics.get("profit_factor"),
         "turnover": result.metrics.get("turnover"),
         "trade_count": result.diagnostics.get("trade_count"),
         "net_pnl": net_pnl,
+        "macro_off_time_share": _bucket_share(macro_bucket_report.get("buckets", {}), "OFF"),
+        "macro_half_time_share": _bucket_share(macro_bucket_report.get("buckets", {}), "ON_HALF"),
+        "macro_full_time_share": _bucket_share(macro_bucket_report.get("buckets", {}), "ON_FULL"),
+        "macro_bucket_fees_total": bucket_total_fees,
+        "macro_bucket_fees_half": half_fees,
+        "macro_bucket_fees_full": full_fees,
         "maker_rate": maker_rate,
         "taker_rate": taker_rate,
         "impact_bps": cfg.execution.impact_bps,
         "spread_bps": cfg.execution.spread_bps,
-        "macro_off_time_share": off_time_share,
-        "macro_half_time_share": half_time_share,
-        "macro_full_time_share": full_time_share,
     }
+    return row
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run v3 frontier sweep with walk-forward windows and conservative cost stress tests.")
+    p = argparse.ArgumentParser(description="Sweep macro_only_v2 with walk-forward and stress costs")
     p.add_argument("--product", default="BTC-USD")
     p.add_argument("--start", default="2021-01-01T00:00:00Z")
-    p.add_argument("--end", default=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+    p.add_argument("--end", default=None)
     p.add_argument("--train-start", default="2021-01-01T00:00:00Z")
     p.add_argument("--train-end", default="2023-12-31T23:00:00Z")
     p.add_argument("--val-start", default="2024-01-01T00:00:00Z")
@@ -259,13 +294,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-end", default=None)
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
     p.add_argument("--config", default=None)
-    p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
-    p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
+    p.add_argument("--grid-config", default=None)
+    p.add_argument("--grid", action="append", default=[])
+    p.add_argument("--small", action="store_true", help="smaller walk-forward grid for quick checks")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
-    p.add_argument("--min-full-time-share", type=float, default=0.05)
-    p.add_argument("--top-n", type=int, default=10)
-    p.add_argument("--output-dir", default="artifacts/frontier_v3")
+    p.add_argument("--top-n", type=int, default=5)
+    p.add_argument("--output-dir", default="artifacts/frontier_macro_only_v2")
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     return p.parse_args()
@@ -273,13 +308,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
-    configure_v3(cfg)
 
     start = parse_ts(args.start)
-    end = parse_ts(args.end)
+    now = datetime.now(timezone.utc)
+    end = parse_ts(args.end) if args.end else now
     test_end = parse_ts(args.test_end) if args.test_end else end
 
     windows = [
@@ -290,8 +326,14 @@ def main() -> int:
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     store = CandleStore(cfg.data)
-    hourly = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1h", start=start, end=end))
-    daily = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1d", start=start, end=end))
+    hourly = store.get_candles(
+        client=client,
+        query=CandleQuery(product=args.product, timeframe="1h", start=start, end=end),
+    )
+    daily = store.get_candles(
+        client=client,
+        query=CandleQuery(product=args.product, timeframe="1d", start=start, end=end),
+    )
 
     base_maker_rate = args.maker_bps / 10_000.0
     base_taker_rate = args.taker_bps / 10_000.0
@@ -307,17 +349,52 @@ def main() -> int:
         pass
 
     grid_flags = parse_grid_flags(args.grid)
-    param_sets = load_grid(args.grid_config, grid_flags)
+    param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
     summary_rows: list[dict[str, Any]] = []
+
+    # Baseline benchmark rows for comparison (same windows/scenarios).
+    baseline_rows: list[dict[str, Any]] = []
+    print("Running baseline macro_gate_benchmark comparator")
+    for window in windows:
+        for scenario in SCENARIOS:
+            try:
+                row = run_window(
+                    base_cfg=cfg,
+                    product=args.product,
+                    hourly=hourly,
+                    daily=daily,
+                    window=window,
+                    params={},
+                    scenario=scenario,
+                    base_maker=base_maker_rate,
+                    base_taker=base_taker_rate,
+                    strategy="macro_gate_benchmark",
+                )
+                row["param_id"] = "baseline"
+                baseline_rows.append(row)
+            except Exception as exc:
+                baseline_rows.append(
+                    {
+                        "param_id": "baseline",
+                        "strategy": "macro_gate_benchmark",
+                        "window": window.name,
+                        "scenario": scenario.name,
+                        "start": window.start.isoformat(),
+                        "end": window.end.isoformat(),
+                        "error": str(exc),
+                    }
+                )
+
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
 
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
         grouped[param_id] = {}
+        print(f"[{i + 1}/{len(param_sets)}] {param_id}", flush=True)
+
         for window in windows:
             grouped[param_id][window.name] = {}
             for scenario in SCENARIOS:
@@ -330,18 +407,20 @@ def main() -> int:
                         window=window,
                         params=params,
                         scenario=scenario,
-                        base_maker_rate=base_maker_rate,
-                        base_taker_rate=base_taker_rate,
+                        base_maker=base_maker_rate,
+                        base_taker=base_taker_rate,
+                        strategy="macro_only_v2",
                     )
                     row["param_id"] = param_id
                     row["params"] = json.dumps(params, sort_keys=True)
-                    summary_rows.append(row)
                     grouped[param_id][window.name][scenario.name] = row
+                    summary_rows.append(row)
                 except Exception as exc:
                     summary_rows.append(
                         {
                             "param_id": param_id,
                             "params": json.dumps(params, sort_keys=True),
+                            "strategy": "macro_only_v2",
                             "window": window.name,
                             "scenario": scenario.name,
                             "start": window.start.isoformat(),
@@ -349,6 +428,8 @@ def main() -> int:
                             "error": str(exc),
                         }
                     )
+
+    summary_rows.extend(baseline_rows)
 
     summary_path = out_dir / "summary.csv"
     if summary_rows:
@@ -362,100 +443,61 @@ def main() -> int:
     ranked: list[dict[str, Any]] = []
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
-        val = grouped.get(param_id, {}).get("val", {})
-        test = grouped.get(param_id, {}).get("test", {})
 
-        base = val.get("baseline")
-        s1 = val.get("stress_1")
-        s2 = val.get("stress_2")
-
-        if not base or not s1 or not s2:
+        val_baseline = grouped.get(param_id, {}).get("val", {})
+        val = val_baseline.get("stress_1") if isinstance(val_baseline, dict) else None
+        if val is None:
             continue
 
-        if float(s1.get("net_pnl", 0.0) or 0.0) <= 0.0:
+        val2 = val_baseline.get("stress_2")
+
+        if not val or not val.get("cagr") or not val2 or not val2.get("cagr"):
             continue
 
-        max_dd_ok = (
-            abs(float(base.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
-            and abs(float(s1.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
-            and abs(float(s2.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
+        if float(val.get("cagr", 0.0) or 0.0) <= 0.0 or float(val2.get("cagr", 0.0) or 0.0) <= 0.0:
+            continue
+
+        if abs(float(val.get("max_drawdown", 0.0) or 0.0)) > args.max_drawdown_max:
+            continue
+
+        total_turnover = max(
+            float(val_baseline.get("baseline", {}).get("turnover", 0.0) or 0.0),
+            float(val.get("turnover", 0.0) or 0.0),
+            float(val2.get("turnover", 0.0) or 0.0),
         )
-        if not max_dd_ok:
+        if total_turnover > args.turnover_max:
             continue
-
-        worst_turnover = max(
-            float(base.get("turnover", 0.0) or 0.0),
-            float(s1.get("turnover", 0.0) or 0.0),
-            float(s2.get("turnover", 0.0) or 0.0),
-        )
-        if worst_turnover > args.turnover_max:
-            continue
-
-        full_share_min = min(
-            float(base.get("macro_full_time_share", 0.0) or 0.0),
-            float(s1.get("macro_full_time_share", 0.0) or 0.0),
-            float(s2.get("macro_full_time_share", 0.0) or 0.0),
-        )
-        if full_share_min < args.min_full_time_share:
-            continue
-
-        cagr_vals = [
-            float(base.get("cagr", 0.0) or 0.0),
-            float(s1.get("cagr", 0.0) or 0.0),
-            float(s2.get("cagr", 0.0) or 0.0),
-        ]
-        sharpe_vals = [
-            float(base.get("sharpe", 0.0) or 0.0),
-            float(s1.get("sharpe", 0.0) or 0.0),
-            float(s2.get("sharpe", 0.0) or 0.0),
-        ]
-        val_score = float(statistics.median(cagr_vals))
-        val_sharpe_med = float(statistics.median(sharpe_vals))
 
         ranked.append(
             {
                 "param_id": param_id,
                 "params": params,
-                "val_score": val_score,
-                "val_sharpe_med": val_sharpe_med,
-                "val_cagr_baseline": float(base.get("cagr", 0.0) or 0.0),
-                "val_cagr_stress_1": float(s1.get("cagr", 0.0) or 0.0),
-                "val_cagr_stress_2": float(s2.get("cagr", 0.0) or 0.0),
-                "val_turnover_worst": worst_turnover,
-                "val_max_drawdown_worst": min(
-                    float(base.get("max_drawdown", 0.0) or 0.0),
-                    float(s1.get("max_drawdown", 0.0) or 0.0),
-                    float(s2.get("max_drawdown", 0.0) or 0.0),
-                ),
-                "val_full_time_share_min": full_share_min,
-                "test_cagr_stress_1": float((test.get("stress_1") or {}).get("cagr", 0.0) or 0.0),
-                "test_sharpe_stress_1": float((test.get("stress_1") or {}).get("sharpe", 0.0) or 0.0),
-                "test_max_drawdown_stress_1": float((test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0),
-                "test_turnover_stress_1": float((test.get("stress_1") or {}).get("turnover", 0.0) or 0.0),
-                "test_macro_full_time_share_stress_1": float((test.get("stress_1") or {}).get("macro_full_time_share", 0.0) or 0.0),
+                "val_stress1_cagr": float(val.get("cagr", 0.0) or 0.0),
+                "val_stress1_sharpe": float(val.get("sharpe", 0.0) or 0.0),
+                "val_stress1_max_drawdown": float(val.get("max_drawdown", 0.0) or 0.0),
+                "val_stress1_fees": float(val.get("macro_bucket_fees_total", 0.0) or 0.0),
+                "val_stress1_turnover": float(val.get("turnover", 0.0) or 0.0),
             }
         )
 
     ranked.sort(
         key=lambda r: (
-            r["val_score"],
-            r["val_sharpe_med"],
-            r["val_cagr_stress_1"],
-            r["val_cagr_stress_2"],
-            r["val_max_drawdown_worst"],
-            -r["val_turnover_worst"],
+            r["val_stress1_cagr"],
+            r["val_stress1_sharpe"],
+            -abs(r["val_stress1_max_drawdown"]),
+            -r["val_stress1_fees"],
+            -r["val_stress1_turnover"],
         ),
         reverse=True,
     )
 
-    top = ranked[: max(1, int(args.top_n))]
-    frontier_rows: list[dict[str, Any]] = []
-    for r in top:
-        flat = dict(r)
-        flat["params"] = json.dumps(r["params"], sort_keys=True)
-        frontier_rows.append(flat)
-
     frontier_path = out_dir / "frontier.csv"
+    frontier_rows: list[dict[str, Any]] = []
+    for r in ranked[: max(1, int(args.top_n))]:
+        item = dict(r)
+        item["params"] = json.dumps(r["params"], sort_keys=True)
+        frontier_rows.append(item)
+
     if frontier_rows:
         cols = sorted({k for row in frontier_rows for k in row.keys()})
         with frontier_path.open("w", newline="", encoding="utf-8") as f:
@@ -464,51 +506,55 @@ def main() -> int:
             for row in frontier_rows:
                 w.writerow(row)
 
-    best = top[0] if top else None
+    best = frontier_rows[0] if frontier_rows else None
     if best is not None:
-        best_cfg_patch = {
+        best_cfg = {
             "regime": {
-                "macro_mode": "stateful_gate",
-                "trend_boost_enabled": True,
-                "trend_boost_require_micro_trend": True,
-                "trend_boost_require_above_sma200": True,
-                **best["params"],
+                "macro2_signal_mode": "sma200_and_mom",
+                **json.loads(best["params"]),
             },
-            "execution": {"fill_model": args.fill_model},
-            "backtest": {"strategy": "macro_gate_benchmark"},
+            "backtest": {
+                "strategy": "macro_only_v2",
+            },
         }
-        best_cfg_path = write_strict_json(out_dir / "best_config.json", best_cfg_patch)
+        best_cfg_path = write_strict_json(out_dir / "best_config.json", best_cfg)
 
-        repro_cmd = (
-            f"python3.14 scripts/backtest.py --product {args.product} "
-            f"--start {args.test_start} --end {(args.test_end or args.end)} "
-            f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
-            f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
+        test_benchmark = grouped.get(best.get("param_id", ""), {}).get("test", {}).get("stress_1")
+        test_repro = (
+            f"python3 scripts/backtest.py --product {args.product} "
+            f"--start {args.test_start} --end {args.test_end or end.isoformat().replace('+00:00', 'Z')} "
+            f"--strategy macro_only_v2 --config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
-        best_payload = {
+        report = {
             "best": best,
             "constraints": {
-                "turnover_max": args.turnover_max,
                 "max_drawdown_max": args.max_drawdown_max,
-                "min_full_time_share": args.min_full_time_share,
-                "validation_profit_required": "stress_1 net_pnl > 0",
+                "turnover_max": args.turnover_max,
             },
-            "reproduce_test_command": repro_cmd,
-            "paths": {
+            "reproduce_test_command": test_repro,
+            "best_config": best_cfg,
+            "files": {
                 "summary_csv": str(summary_path),
                 "frontier_csv": str(frontier_path),
-                "best_config": str(best_cfg_path),
+                "best_config_json": str(best_cfg_path),
             },
+            "test_window_stress_1": {
+                "cagr": float(test_benchmark.get("cagr", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "sharpe": float(test_benchmark.get("sharpe", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "max_drawdown": float(test_benchmark.get("max_drawdown", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+            },
+            "benchmark_summary": baseline_rows,
         }
-        write_strict_json(out_dir / "best_config.json", {**best_cfg_patch, "frontier": best_payload})
+        write_strict_json(out_dir / "best_summary.json", report)
 
-        print("V3 frontier sweep completed")
-        print(dumps_strict_json(best_payload, indent=2))
-        print("Reproduce best test run:")
-        print(repro_cmd)
+        print("macro_only_v2 frontier sweep completed — best config found")
+        print(dumps_strict_json(report, indent=2))
+        print(f"Summary: {summary_path}")
+        print(f"Frontier: {frontier_path}")
+        print(f"Reproduce best: {test_repro}")
     else:
-        print("V3 frontier sweep completed but no config satisfied constraints.")
+        print("macro_only_v2 frontier sweep completed, but no configuration passed filters.")
         print(f"Summary: {summary_path}")
 
     return 0

@@ -21,6 +21,8 @@ Production-oriented Bitcoin strategy codebase for Coinbase Advanced Trade with:
   - regime-switching orchestrator
   - RANGE mean-reversion (Bollinger)
   - TREND breakout (Donchian / EMA cross)
+  - **macro_gate_benchmark**
+  - **macro_only_v2**
 - **Risk engine**:
   - drawdown breaker + stale data breaker
   - daily loss / consecutive-loss kill switches
@@ -59,6 +61,7 @@ Production-oriented Bitcoin strategy codebase for Coinbase Advanced Trade with:
 │   ├── optimize.py
 │   ├── frontier_sweep.py
 │   ├── frontier_sweep_v3.py
+│   ├── frontier_sweep_macro_only.py
 │   └── trade.py
 ├── tests/
 └── README.md
@@ -102,77 +105,11 @@ This writes:
 
 `report.json` includes `macro_bucket_attribution` with per-bucket (`OFF`, `ON_HALF`, `ON_FULL`) time, exposure, PnL, fees, turnover, trade count, and warnings.
 
-### Strategy variants (backward compatible)
+### Strategy variants
 
-- `regime_switching`: legacy binary macro gate behavior
-- `regime_switching_v2`: score-based macro scaling + trend booster
-- `regime_switching_v3`: stateful daily macro gate (`OFF` / `ON_HALF` / `ON_FULL`) with hysteresis + directional trend boost
+This bot now runs on benchmark-only strategy by default:
 
-Defaults preserve prior behavior unless you explicitly choose `regime_switching_v2`, `regime_switching_v3`, `regime_switching_v4_core`, or `macro_gate_benchmark`.
-
-Enable v2 behavior (score-based macro + trend boost):
-
-```bash
-python scripts/backtest.py \
-  --product BTC-USD \
-  --start 2021-01-01T00:00:00Z \
-  --end 2026-01-31T00:00:00Z \
-  --strategy regime_switching_v2 \
-  --fill-model bid_ask \
-  --macro-mode score \
-  --macro-score-floor 0.25 \
-  --macro-score-min-to-trade 0.25 \
-  --trend-boost-enabled \
-  --trend-boost-multiplier 1.25 \
-  --trend-boost-adx-threshold 25
-```
-
-Enable v3 behavior (stateful macro gate + bucket multipliers + directional boost):
-
-```bash
-python scripts/backtest.py \
-  --product BTC-USD \
-  --start 2021-01-01T00:00:00Z \
-  --end 2026-01-31T00:00:00Z \
-  --strategy regime_switching_v3 \
-  --fill-model bid_ask \
-  --macro-mode stateful_gate \
-  --macro-enter-threshold 0.75 \
-  --macro-exit-threshold 0.25 \
-  --macro-confirm-days 2 \
-  --macro-min-on-days 2 \
-  --macro-min-off-days 1 \
-  --macro-half-multiplier 0.5 \
-  --macro-full-multiplier 1.0 \
-  --trend-boost-enabled \
-  --trend-boost-multiplier 1.10 \
-  --trend-boost-adx-threshold 25 \
-  --trend-boost-confirm-days 2 \
-  --trend-boost-min-on-days 2 \
-  --trend-boost-min-off-days 1
-```
-
-Enable v4 core strategy (macro gate + micro regime scaling + intraday suppression):
-
-```bash
-python scripts/backtest.py \
-  --product BTC-USD \
-  --start 2021-01-01T00:00:00Z \
-  --end 2026-01-31T00:00:00Z \
-  --strategy regime_switching_v4_core \
-  --fill-model bid_ask \
-  --v4-macro-enter-threshold 0.75 \
-  --v4-macro-exit-threshold 0.25 \
-  --v4-macro-confirm-days 2 \
-  --v4-macro-half-multiplier 0.5 \
-  --v4-macro-full-multiplier 1.0 \
-  --v4-micro-mult-trend 1.0 \
-  --v4-micro-mult-range 0.75 \
-  --v4-micro-mult-neutral 0.5 \
-  --v4-micro-mult-high-vol 0.0
-```
-
-Enable macro gate benchmark (same as v4 but no micro regime scaling — measures pure macro value):
+- `macro_gate_benchmark`: macro gate + vol-targeting without micro-regime scaling.
 
 ```bash
 python scripts/backtest.py \
@@ -183,21 +120,29 @@ python scripts/backtest.py \
   --fill-model bid_ask
 ```
 
-#### V4 Core Strategy Design
+`macro_only_v2` is a new strategy that uses only daily macro signals and stateful sizing:
+- signal modes: `sma200_band`, `mom_6_12`, `sma200_and_mom`, `sma200_or_mom`, `score4_legacy`
+- two-state macro gate with confirmation/hysteresis
+- optional realized-vol inverse targeting
+- drawdown breaker with cooldown/re-entry confirm
 
-The v4 core strategy introduces:
+Example:
 
-- **Macro gate as primary driver**: The stateful macro gate (OFF/ON_HALF/ON_FULL) determines
-  the core allocation level. When OFF, target is always 0.
-- **Vol-targeted base fraction**: `base_fraction = min(target_ann_vol / realized_vol, max_position_fraction)`,
-  frozen at each daily refresh.
-- **Micro regime scaling (down only)**: Micro regimes (TREND/RANGE/NEUTRAL/HIGH_VOL) only
-  reduce risk via multipliers ≤ 1.0. They never increase above the macro-determined core.
-- **Intraday increase suppression**: Within a calendar day, position targets can only decrease.
-  Increases are only allowed at the daily refresh boundary.
-- **Benchmark comparison**: The `macro_gate_benchmark` strategy is identical but removes
-  micro regime effects (micro_mult = 1.0), providing a clean benchmark for evaluating
-  whether micro regimes add value.
+```bash
+python scripts/backtest.py \
+  --strategy macro_only_v2 \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --macro2-signal-mode sma200_and_mom \
+  --macro2-confirm-days 2 \
+  --macro2-min-on-days 2 \
+  --macro2-min-off-days 1 \
+  --macro2-vol-mode inverse_vol \
+  --macro2-target-ann-vol-half 0.30 \
+  --macro2-target-ann-vol-full 0.60 \
+  --macro2-dd-threshold 0.25
+```
 
 ### 2) Walk-forward sweep (legacy)
 
@@ -212,46 +157,37 @@ python scripts/optimize.py \
 
 ### 3) Frontier sweep (walk-forward + cost stress)
 
-General sweep (legacy/v2 grid):
+General sweep (benchmark parameter space):
 
 ```bash
 python scripts/frontier_sweep.py \
   --product BTC-USD \
-  --strategy regime_switching_v2 \
+  --strategy macro_gate_benchmark \
   --fill-model bid_ask \
   --start 2021-01-01T00:00:00Z \
   --end 2026-01-31T00:00:00Z
 ```
 
-V3-specific sweep (stateful gate + directional boost parameter space):
+Macro-only frontier sweep (walk-forward + cost scenarios baseline/stress_1/stress_2):
 
 ```bash
-python scripts/frontier_sweep_v3.py \
+python scripts/frontier_sweep_macro_only.py \
   --product BTC-USD \
   --fill-model bid_ask \
   --start 2021-01-01T00:00:00Z \
-  --end 2026-01-31T00:00:00Z
-```
-
-V4 core sweep (compares v4 vs benchmark, requires v4 to outperform):
-
-```bash
-python scripts/frontier_sweep_core.py \
-  --product BTC-USD \
-  --fill-model bid_ask \
-  --start 2021-01-01T00:00:00Z \
-  --end 2026-01-31T00:00:00Z
+  --test-end 2026-01-31T00:00:00Z \
+  --small
 ```
 
 Outputs:
-- `artifacts/frontier*/summary.csv` — one row per (params, window, scenario)
-- `artifacts/frontier*/frontier.csv` — ranked top configs
-- `artifacts/frontier*/best_config.json` — recommended config + reproduce command
+- `artifacts/frontier_macro_only_v2/summary.csv` — one row per (params, window, scenario)
+- `artifacts/frontier_macro_only_v2/frontier.csv` — ranked top configs
+- `artifacts/frontier_macro_only_v2/best_config.json` — recommended config + benchmark summary
 
 Interpretation:
-- ranking favors robust validation performance under stress costs,
-- then lower drawdown/turnover,
-- then higher Sharpe.
+- ranking favors robust validation performance under stress-1 drawdown,
+- then Sharpe,
+- then lower drawdown / lower fees / lower turnover.
 
 ### 4) Paper trade (2+ cycles)
 

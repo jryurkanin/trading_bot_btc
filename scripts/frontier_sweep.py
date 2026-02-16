@@ -170,9 +170,6 @@ def run_window(
     cfg.data.product = product
     cfg.backtest.strategy = strategy
 
-    if strategy == "regime_switching_v2":
-        cfg.regime.macro_mode = "score"
-        cfg.regime.trend_boost_enabled = True
 
     for k, v in params.items():
         set_param(cfg, k, v)
@@ -233,7 +230,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-end", default="2024-12-31T23:00:00Z")
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
-    p.add_argument("--strategy", default="regime_switching_v2", choices=["regime_switching", "regime_switching_v2"])
+    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")

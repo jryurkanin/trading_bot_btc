@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import warnings
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -13,9 +12,9 @@ from ..execution.rebalance_policy import RebalancePolicy
 from ..features import indicators
 from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
 from ..features.regime import compute_adx, compute_chop
-from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator, RegimeDecisionBundle
-from ..strategy.regime_switching_v4_core import V4CoreStrategy
+from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
+from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
 
@@ -159,19 +158,13 @@ class BacktestEngine:
                 )
             )
 
-        strategy_id = cfg.strategy if cfg.strategy else "regime_switching"
-        if strategy_id == "regime_switching_v4_core":
-            orchestrator = V4CoreStrategy(reg_cfg)
-        elif strategy_id == "macro_gate_benchmark":
+        strategy_id = cfg.strategy if cfg.strategy else "macro_gate_benchmark"
+        if strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
-        elif strategy_id == "v5_adaptive":
-            warnings.warn(
-                "v5_adaptive has been routed to macro_gate_benchmark",
-                RuntimeWarning,
-            )
-            orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
+        elif strategy_id == "macro_only_v2":
+            orchestrator = MacroOnlyV2Strategy(reg_cfg)
         else:
-            orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
+            raise ValueError(f"Unsupported strategy '{strategy_id}'. Supported: ['macro_gate_benchmark', 'macro_only_v2']")
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
 

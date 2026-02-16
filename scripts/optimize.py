@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--config", default=None)
-    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2", "regime_switching_v3"])
+    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
     p.add_argument("--out", default="reports")
     p.add_argument("--grid", action="append", help="KEY=VAL, can be repeated (e.g. bb_window=20)")
     p.add_argument("--metric", default="cagr")
@@ -83,14 +83,8 @@ def main() -> int:
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.strategy = args.strategy
-    if args.strategy == "regime_switching_v2":
-        cfg.regime.macro_mode = "score"
-        cfg.regime.trend_boost_enabled = True
-    elif args.strategy == "regime_switching_v3":
-        cfg.regime.macro_mode = "stateful_gate"
-        cfg.regime.trend_boost_enabled = True
-        cfg.regime.trend_boost_require_micro_trend = True
-        cfg.regime.trend_boost_require_above_sma200 = True
+    # Macro benchmark optimization: keep settings explicit and deterministic.
+    cfg.regime.trend_boost_enabled = False
     start = parse_ts(args.start)
     end = parse_ts(args.end)
 

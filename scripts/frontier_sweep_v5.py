@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Frontier sweep for V5 adaptive strategy vs macro-gate benchmark.
-
-Runs both ``v5_adaptive`` and ``macro_gate_benchmark`` for each parameter
-set and compares them.  A config is only selected if V5 beats the benchmark
-on validation.
-"""
+"""Frontier sweep for macro-gate benchmark parameter exploration."""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +41,8 @@ DEFAULT_GRID_SPACE_V5: dict[str, list[Any]] = {
     "v5_adaptive_min_off_days": [1],
     "v5_adaptive_half_multiplier": [0.40, 0.50, 0.60],
     "v5_adaptive_full_multiplier": [1.0],
+    # v5-adaptive parameter names are mapped to macro-gate thresholds for benchmark mode.
+
     # Shared
     "target_ann_vol": [0.20, 0.30],
 }
@@ -65,6 +62,8 @@ SMALL_GRID_SPACE_V5: dict[str, list[Any]] = {
     "v5_adaptive_min_off_days": [1],
     "v5_adaptive_half_multiplier": [0.50],
     "v5_adaptive_full_multiplier": [1.0],
+    # v5-adaptive parameter names are mapped to macro-gate thresholds for benchmark mode.
+
     "target_ann_vol": [0.20],
 }
 
@@ -188,7 +187,8 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
 
 
 def configure_strategy(cfg: BotConfig, strategy: str) -> None:
-    cfg.backtest.strategy = strategy
+    # Frontier workflow uses benchmark strategy only.
+    cfg.backtest.strategy = "macro_gate_benchmark"
     cfg.regime.trend_boost_enabled = False
 
 
@@ -369,8 +369,8 @@ def main() -> int:
 
     grid_flags = parse_grid_flags(args.grid)
     param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
-    total_runs = len(param_sets) * 2 * len(windows) * len(SCENARIOS)
-    print(f"V5 frontier sweep: {len(param_sets)} param sets × 2 strategies × "
+    total_runs = len(param_sets) * 1 * len(windows) * len(SCENARIOS)
+    print(f"Benchmark frontier sweep: {len(param_sets)} param sets × 1 strategy × "
           f"{len(windows)} windows × {len(SCENARIOS)} scenarios = {total_runs} runs")
 
     out_dir = Path(args.output_dir)
@@ -379,7 +379,7 @@ def main() -> int:
     summary_rows: list[dict[str, Any]] = []
     grouped: dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]] = {}
 
-    strategies = ["v5_adaptive", "macro_gate_benchmark"]
+    strategies = ["macro_gate_benchmark"]
 
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
@@ -430,67 +430,59 @@ def main() -> int:
             for row in summary_rows:
                 w.writerow(row)
 
-    # --- Ranking: V5 must beat benchmark ---
+    # --- Ranking benchmark configs ---
     ranked: list[dict[str, Any]] = []
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
 
-        v5_val = grouped.get(param_id, {}).get("v5_adaptive", {}).get("val", {})
         bench_val = grouped.get(param_id, {}).get("macro_gate_benchmark", {}).get("val", {})
-        v5_test = grouped.get(param_id, {}).get("v5_adaptive", {}).get("test", {})
+        bench_test = grouped.get(param_id, {}).get("macro_gate_benchmark", {}).get("test", {})
 
-        v5_base = v5_val.get("baseline")
-        v5_s1 = v5_val.get("stress_1")
-        v5_s2 = v5_val.get("stress_2")
         bench_base = bench_val.get("baseline")
+        bench_s1 = bench_val.get("stress_1")
+        bench_s2 = bench_val.get("stress_2")
 
-        if not v5_base or not v5_s1 or not v5_s2 or not bench_base:
+        if not bench_base or not bench_s1 or not bench_s2:
             continue
 
-        # V5 must beat benchmark on validation baseline net PnL
-        v5_pnl = float(v5_base.get("net_pnl", 0.0) or 0.0)
-        bench_pnl = float(bench_base.get("net_pnl", 0.0) or 0.0)
-        if v5_pnl <= bench_pnl:
+        if float(bench_base.get("net_pnl", 0.0) or 0.0) <= 0.0:
+            continue
+        if float(bench_s1.get("net_pnl", 0.0) or 0.0) <= 0.0:
             continue
 
-        # stress_1 must be profitable
-        if float(v5_s1.get("net_pnl", 0.0) or 0.0) <= 0.0:
-            continue
-
-        # max drawdown check
         max_dd_ok = (
-            abs(float(v5_base.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
-            and abs(float(v5_s1.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
-            and abs(float(v5_s2.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
+            abs(float(bench_base.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
+            and abs(float(bench_s1.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
+            and abs(float(bench_s2.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
         )
         if not max_dd_ok:
             continue
 
         worst_turnover = max(
-            float(v5_base.get("turnover", 0.0) or 0.0),
-            float(v5_s1.get("turnover", 0.0) or 0.0),
-            float(v5_s2.get("turnover", 0.0) or 0.0),
+            float(bench_base.get("turnover", 0.0) or 0.0),
+            float(bench_s1.get("turnover", 0.0) or 0.0),
+            float(bench_s2.get("turnover", 0.0) or 0.0),
         )
         if worst_turnover > args.turnover_max:
             continue
 
         full_share_min = min(
-            float(v5_base.get("macro_full_time_share", 0.0) or 0.0),
-            float(v5_s1.get("macro_full_time_share", 0.0) or 0.0),
-            float(v5_s2.get("macro_full_time_share", 0.0) or 0.0),
+            float(bench_base.get("macro_full_time_share", 0.0) or 0.0),
+            float(bench_s1.get("macro_full_time_share", 0.0) or 0.0),
+            float(bench_s2.get("macro_full_time_share", 0.0) or 0.0),
         )
         if full_share_min < args.min_full_time_share:
             continue
 
         cagr_vals = [
-            float(v5_base.get("cagr", 0.0) or 0.0),
-            float(v5_s1.get("cagr", 0.0) or 0.0),
-            float(v5_s2.get("cagr", 0.0) or 0.0),
+            float(bench_base.get("cagr", 0.0) or 0.0),
+            float(bench_s1.get("cagr", 0.0) or 0.0),
+            float(bench_s2.get("cagr", 0.0) or 0.0),
         ]
         sharpe_vals = [
-            float(v5_base.get("sharpe", 0.0) or 0.0),
-            float(v5_s1.get("sharpe", 0.0) or 0.0),
-            float(v5_s2.get("sharpe", 0.0) or 0.0),
+            float(bench_base.get("sharpe", 0.0) or 0.0),
+            float(bench_s1.get("sharpe", 0.0) or 0.0),
+            float(bench_s2.get("sharpe", 0.0) or 0.0),
         ]
         val_score = float(statistics.median(cagr_vals))
         val_sharpe_med = float(statistics.median(sharpe_vals))
@@ -501,28 +493,19 @@ def main() -> int:
                 "params": params,
                 "val_score": val_score,
                 "val_sharpe_med": val_sharpe_med,
-                "val_v5_pnl": v5_pnl,
-                "val_bench_pnl": bench_pnl,
-                "val_v5_alpha": v5_pnl - bench_pnl,
-                "val_cagr_baseline": float(v5_base.get("cagr", 0.0) or 0.0),
-                "val_cagr_stress_1": float(v5_s1.get("cagr", 0.0) or 0.0),
-                "val_cagr_stress_2": float(v5_s2.get("cagr", 0.0) or 0.0),
+                "val_cagr_baseline": float(bench_base.get("cagr", 0.0) or 0.0),
+                "val_cagr_stress_1": float(bench_s1.get("cagr", 0.0) or 0.0),
+                "val_cagr_stress_2": float(bench_s2.get("cagr", 0.0) or 0.0),
                 "val_turnover_worst": worst_turnover,
                 "val_max_drawdown_worst": min(
-                    float(v5_base.get("max_drawdown", 0.0) or 0.0),
-                    float(v5_s1.get("max_drawdown", 0.0) or 0.0),
-                    float(v5_s2.get("max_drawdown", 0.0) or 0.0),
+                    float(bench_base.get("max_drawdown", 0.0) or 0.0),
+                    float(bench_s1.get("max_drawdown", 0.0) or 0.0),
+                    float(bench_s2.get("max_drawdown", 0.0) or 0.0),
                 ),
                 "val_full_time_share_min": full_share_min,
-                "test_cagr_stress_1": float(
-                    (v5_test.get("stress_1") or {}).get("cagr", 0.0) or 0.0
-                ),
-                "test_sharpe_stress_1": float(
-                    (v5_test.get("stress_1") or {}).get("sharpe", 0.0) or 0.0
-                ),
-                "test_max_drawdown_stress_1": float(
-                    (v5_test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0
-                ),
+                "test_cagr_stress_1": float((bench_test.get("stress_1") or {}).get("cagr", 0.0) or 0.0),
+                "test_sharpe_stress_1": float((bench_test.get("stress_1") or {}).get("sharpe", 0.0) or 0.0),
+                "test_max_drawdown_stress_1": float((bench_test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0),
             }
         )
 
@@ -530,7 +513,7 @@ def main() -> int:
         key=lambda r: (
             r["val_score"],
             r["val_sharpe_med"],
-            r["val_v5_alpha"],
+            r["val_cagr_stress_1"],
             r["val_max_drawdown_worst"],
             -r["val_turnover_worst"],
         ),
@@ -561,7 +544,7 @@ def main() -> int:
                 **best["params"],
             },
             "execution": {"fill_model": args.fill_model},
-            "backtest": {"strategy": "v5_adaptive"},
+            "backtest": {"strategy": "macro_gate_benchmark"},
         }
         best_cfg_path = write_strict_json(
             out_dir / "best_config.json", best_cfg_patch
@@ -570,7 +553,7 @@ def main() -> int:
         repro_cmd = (
             f"python3 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or args.end} "
-            f"--strategy v5_adaptive --fill-model {args.fill_model} "
+            f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
@@ -580,7 +563,7 @@ def main() -> int:
                 "turnover_max": args.turnover_max,
                 "max_drawdown_max": args.max_drawdown_max,
                 "min_full_time_share": args.min_full_time_share,
-                "v5_must_beat_benchmark": True,
+                "benchmark_positive": True,
             },
             "reproduce_test_command": repro_cmd,
             "paths": {
@@ -594,14 +577,13 @@ def main() -> int:
             {**best_cfg_patch, "frontier": best_payload},
         )
 
-        print("V5 adaptive frontier sweep completed — winning configs found!")
+        print("Macro benchmark frontier sweep completed — winning configs found!")
         print(dumps_strict_json(best_payload, indent=2))
         print("Reproduce best test run:")
         print(repro_cmd)
     else:
         print(
-            "V5 adaptive frontier sweep completed but no config satisfied constraints "
-            "(including v5 > benchmark)."
+            "Macro benchmark frontier sweep completed but no config satisfied constraints."
         )
         print(f"Summary: {summary_path}")
 

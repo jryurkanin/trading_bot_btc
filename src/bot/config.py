@@ -205,6 +205,35 @@ class RegimeConfig(BaseModel):
     v5_adaptive_half_multiplier: float = 0.5
     v5_adaptive_full_multiplier: float = 1.0
 
+    # macro_only_v2 controls
+    macro2_signal_mode: Literal[
+        "sma200_band",
+        "mom_6_12",
+        "sma200_and_mom",
+        "sma200_or_mom",
+        "score4_legacy",
+    ] = "sma200_and_mom"
+    macro2_confirm_days: int = 2
+    macro2_min_on_days: int = 2
+    macro2_min_off_days: int = 1
+    macro2_weight_off: float = 0.0
+    macro2_weight_half: float = 0.50
+    macro2_weight_full: float = 1.0
+    macro2_vol_mode: Literal["none", "inverse_vol"] = "inverse_vol"
+    macro2_vol_lookback_days: int = 60
+    macro2_vol_floor: float = 0.05
+    macro2_target_ann_vol_half: float = 0.30
+    macro2_target_ann_vol_full: float = 0.60
+    macro2_dd_enabled: bool = True
+    macro2_dd_threshold: float = 0.25
+    macro2_dd_cooldown_days: int = 10
+    macro2_dd_reentry_confirm_days: int = 2
+    macro2_dd_safe_weight: float = 0.0
+    sma200_entry_band: float = 0.0
+    sma200_exit_band: float = 0.0
+    mom_6m_days: int = 180
+    mom_12m_days: int = 365
+
 
 class RiskConfig(BaseModel):
     max_drawdown_cut_pct: float = 0.25
@@ -274,7 +303,7 @@ class LoggingConfig(BaseModel):
 class BacktestConfig(BaseModel):
     start: Optional[str] = None
     end: Optional[str] = None
-    strategy: str = "regime_switching"
+    strategy: str = "macro_gate_benchmark"
     initial_equity: float = 10000.0
     output_dir: str = "reports"
     maker_bps: float = 10.0
@@ -285,12 +314,8 @@ class BacktestConfig(BaseModel):
     ci_mode: bool = False
 
     VALID_STRATEGIES: ClassVar[Set[str]] = {
-        "regime_switching",
-        "regime_switching_v2",
-        "regime_switching_v3",
-        "regime_switching_v4_core",
         "macro_gate_benchmark",
-        "v5_adaptive",
+        "macro_only_v2",
     }
 
     @field_validator("strategy", mode="after")

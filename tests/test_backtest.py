@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pandas as pd
+import pytest
 
 from bot.config import BotConfig
 from bot.backtest.engine import BacktestEngine
@@ -67,8 +68,25 @@ def test_backtest_runs_and_outputs_metrics():
     assert res.metrics["max_drawdown"] <= 0.0
 
 
-def test_v5_strategy_aliases_to_macro_gate_benchmark():
+def test_unsupported_strategy_rejected_by_engine():
     hourly, daily = make_oscillating_candles()
+    cfg = BotConfig()
+    cfg.backtest.initial_equity = 10000
+    cfg.backtest.strategy = "macro_gate_benchmark"
+
+    eng = BacktestEngine(
+        product="BTC-USD",
+        hourly_candles=hourly,
+        daily_candles=daily,
+        start=hourly["timestamp"].iloc[0].to_pydatetime(),
+        end=hourly["timestamp"].iloc[-1].to_pydatetime(),
+        config=cfg.backtest,
+        fees=(0.0001, 0.00025),
+        slippage_bps=1.0,
+    )
+    res = eng.run()
+    assert not res.decisions.empty
+
     cfg = BotConfig()
     cfg.backtest.initial_equity = 10000
     cfg.backtest.strategy = "v5_adaptive"
@@ -84,6 +102,5 @@ def test_v5_strategy_aliases_to_macro_gate_benchmark():
         slippage_bps=1.0,
     )
 
-    res = eng.run()
-    assert not res.decisions.empty
-    assert set(res.decisions["strategy"]).issubset({"macro_gate_benchmark", "none"})
+    with pytest.raises(ValueError):
+        eng.run()

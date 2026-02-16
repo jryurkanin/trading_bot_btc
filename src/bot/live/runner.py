@@ -15,7 +15,7 @@ from ..config import BotConfig
 from ..data.candles import CandleStore, CandleQuery, align_closed_candles
 from ..execution.state_store import BotStateStore
 from ..execution.risk import RiskManager, RiskState
-from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator
+from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from .paper import PaperTrader
 from ..execution.order_router import OrderRouter
 
@@ -46,7 +46,7 @@ class LiveRunner:
         self.client = client or RESTClientWrapper(cfg.coinbase, cfg.data)
         self.state = state_store or BotStateStore(".trading_bot_cache/live_state.sqlite")
         self.store = CandleStore(cfg.data)
-        self.orchestrator = RegimeSwitchingOrchestrator(cfg.regime)
+        self.orchestrator = MacroGateBenchmarkStrategy(cfg.regime)
         self.risk_mgr = RiskManager(cfg.risk)
         self.risk_state = RiskState(equity_peak=cfg.backtest.initial_equity, current_equity=cfg.backtest.initial_equity)
         self.paper_mode = paper

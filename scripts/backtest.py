@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="regime_switching", choices=["regime_switching", "regime_switching_v2", "regime_switching_v3", "regime_switching_v4_core", "macro_gate_benchmark"])
+    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--initial-equity", type=float, default=10_000.0)
     p.add_argument("--maker-bps", type=float, default=10.0)
@@ -54,6 +54,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--macro-half-multiplier", type=float, default=None)
     p.add_argument("--macro-full-multiplier", type=float, default=None)
 
+    # macro_only_v2 controls (optional overrides)
+    p.add_argument("--macro2-signal-mode", choices=["sma200_band", "mom_6_12", "sma200_and_mom", "sma200_or_mom", "score4_legacy"], default=None)
+    p.add_argument("--macro2-confirm-days", type=int, default=None)
+    p.add_argument("--macro2-min-on-days", type=int, default=None)
+    p.add_argument("--macro2-min-off-days", type=int, default=None)
+    p.add_argument("--macro2-weight-off", type=float, default=None)
+    p.add_argument("--macro2-weight-half", type=float, default=None)
+    p.add_argument("--macro2-weight-full", type=float, default=None)
+    p.add_argument("--macro2-vol-mode", choices=["none", "inverse_vol"], default=None)
+    p.add_argument("--macro2-vol-lookback-days", type=int, default=None)
+    p.add_argument("--macro2-vol-floor", type=float, default=None)
+    p.add_argument("--macro2-target-ann-vol-half", type=float, default=None)
+    p.add_argument("--macro2-target-ann-vol-full", type=float, default=None)
+    p.add_argument("--macro2-dd-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--macro2-dd-threshold", type=float, default=None)
+    p.add_argument("--macro2-dd-cooldown-days", type=int, default=None)
+    p.add_argument("--macro2-dd-reentry-confirm-days", type=int, default=None)
+    p.add_argument("--macro2-dd-safe-weight", type=float, default=None)
+    p.add_argument("--macro2-sma200-entry-band", type=float, default=None)
+    p.add_argument("--macro2-sma200-exit-band", type=float, default=None)
+    p.add_argument("--macro2-mom-6m-days", type=int, default=None)
+    p.add_argument("--macro2-mom-12m-days", type=int, default=None)
+
     p.add_argument("--trend-boost-enabled", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--trend-boost-multiplier", type=float, default=None)
     p.add_argument("--trend-boost-adx-threshold", type=float, default=None)
@@ -65,21 +88,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trend-boost-require-above-sma200", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--trend-boost-sma50-slope-lookback-days", type=int, default=None)
 
-    # V4 core strategy flags
-    p.add_argument("--v4-macro-enter-threshold", type=float, default=None)
-    p.add_argument("--v4-macro-exit-threshold", type=float, default=None)
-    p.add_argument("--v4-macro-half-threshold", type=float, default=None)
-    p.add_argument("--v4-macro-full-threshold", type=float, default=None)
-    p.add_argument("--v4-macro-confirm-days", type=int, default=None)
-    p.add_argument("--v4-macro-min-on-days", type=int, default=None)
-    p.add_argument("--v4-macro-min-off-days", type=int, default=None)
-    p.add_argument("--v4-macro-half-multiplier", type=float, default=None)
-    p.add_argument("--v4-macro-full-multiplier", type=float, default=None)
-    p.add_argument("--v4-micro-mult-trend", type=float, default=None)
-    p.add_argument("--v4-micro-mult-range", type=float, default=None)
-    p.add_argument("--v4-micro-mult-neutral", type=float, default=None)
-    p.add_argument("--v4-micro-mult-high-vol", type=float, default=None)
-    p.add_argument("--v4-core-risk-refresh", type=str, default=None)
 
     p.add_argument("--ci-mode", action="store_true")
     p.add_argument("--no-spread", action="store_true")
@@ -101,32 +109,8 @@ def main() -> int:
     cfg.backtest.initial_equity = args.initial_equity
     cfg.backtest.strategy = args.strategy
 
-    # Strategy presets keep legacy behavior unless explicitly requested.
-    if args.strategy == "regime_switching_v2":
-        cfg.regime.macro_mode = "score"
-        cfg.regime.trend_boost_enabled = True
-    elif args.strategy == "regime_switching_v3":
-        cfg.regime.macro_mode = "stateful_gate"
-        cfg.regime.trend_boost_enabled = True
-        cfg.regime.trend_boost_multiplier = 1.10
-        cfg.regime.macro_enter_threshold = 0.75
-        cfg.regime.macro_exit_threshold = 0.25
-        cfg.regime.macro_full_threshold = 1.0
-        cfg.regime.macro_half_threshold = 0.75
-        cfg.regime.macro_confirm_days = 2
-        cfg.regime.macro_min_on_days = 2
-        cfg.regime.macro_min_off_days = 1
-        cfg.regime.macro_half_multiplier = 0.5
-        cfg.regime.macro_full_multiplier = 1.0
-        cfg.regime.trend_boost_confirm_days = 2
-        cfg.regime.trend_boost_min_on_days = 2
-        cfg.regime.trend_boost_min_off_days = 1
-        cfg.regime.trend_boost_require_micro_trend = True
-        cfg.regime.trend_boost_require_above_sma200 = True
-        cfg.regime.trend_boost_sma50_slope_lookback_days = 10
-    elif args.strategy in ("regime_switching_v4_core", "macro_gate_benchmark"):
-        # V4/benchmark presets — use v4 macro gate, no legacy boost
-        cfg.regime.trend_boost_enabled = False
+    # Keep macro benchmark policy behavior only.
+    cfg.regime.trend_boost_enabled = False
 
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
@@ -172,6 +156,49 @@ def main() -> int:
     if args.macro_full_multiplier is not None:
         cfg.regime.macro_full_multiplier = float(args.macro_full_multiplier)
 
+    if args.macro2_signal_mode is not None:
+        cfg.regime.macro2_signal_mode = args.macro2_signal_mode
+    if args.macro2_confirm_days is not None:
+        cfg.regime.macro2_confirm_days = int(args.macro2_confirm_days)
+    if args.macro2_min_on_days is not None:
+        cfg.regime.macro2_min_on_days = int(args.macro2_min_on_days)
+    if args.macro2_min_off_days is not None:
+        cfg.regime.macro2_min_off_days = int(args.macro2_min_off_days)
+    if args.macro2_weight_off is not None:
+        cfg.regime.macro2_weight_off = float(args.macro2_weight_off)
+    if args.macro2_weight_half is not None:
+        cfg.regime.macro2_weight_half = float(args.macro2_weight_half)
+    if args.macro2_weight_full is not None:
+        cfg.regime.macro2_weight_full = float(args.macro2_weight_full)
+    if args.macro2_vol_mode is not None:
+        cfg.regime.macro2_vol_mode = args.macro2_vol_mode
+    if args.macro2_vol_lookback_days is not None:
+        cfg.regime.macro2_vol_lookback_days = int(args.macro2_vol_lookback_days)
+    if args.macro2_vol_floor is not None:
+        cfg.regime.macro2_vol_floor = float(args.macro2_vol_floor)
+    if args.macro2_target_ann_vol_half is not None:
+        cfg.regime.macro2_target_ann_vol_half = float(args.macro2_target_ann_vol_half)
+    if args.macro2_target_ann_vol_full is not None:
+        cfg.regime.macro2_target_ann_vol_full = float(args.macro2_target_ann_vol_full)
+    if args.macro2_dd_enabled is not None:
+        cfg.regime.macro2_dd_enabled = bool(args.macro2_dd_enabled)
+    if args.macro2_dd_threshold is not None:
+        cfg.regime.macro2_dd_threshold = float(args.macro2_dd_threshold)
+    if args.macro2_dd_cooldown_days is not None:
+        cfg.regime.macro2_dd_cooldown_days = int(args.macro2_dd_cooldown_days)
+    if args.macro2_dd_reentry_confirm_days is not None:
+        cfg.regime.macro2_dd_reentry_confirm_days = int(args.macro2_dd_reentry_confirm_days)
+    if args.macro2_dd_safe_weight is not None:
+        cfg.regime.macro2_dd_safe_weight = float(args.macro2_dd_safe_weight)
+    if args.macro2_sma200_entry_band is not None:
+        cfg.regime.sma200_entry_band = float(args.macro2_sma200_entry_band)
+    if args.macro2_sma200_exit_band is not None:
+        cfg.regime.sma200_exit_band = float(args.macro2_sma200_exit_band)
+    if args.macro2_mom_6m_days is not None:
+        cfg.regime.mom_6m_days = int(args.macro2_mom_6m_days)
+    if args.macro2_mom_12m_days is not None:
+        cfg.regime.mom_12m_days = int(args.macro2_mom_12m_days)
+
     if args.trend_boost_enabled is not None:
         cfg.regime.trend_boost_enabled = bool(args.trend_boost_enabled)
     if args.trend_boost_multiplier is not None:
@@ -193,35 +220,6 @@ def main() -> int:
     if args.trend_boost_sma50_slope_lookback_days is not None:
         cfg.regime.trend_boost_sma50_slope_lookback_days = int(args.trend_boost_sma50_slope_lookback_days)
 
-    # V4 core strategy CLI overrides
-    if args.v4_macro_enter_threshold is not None:
-        cfg.regime.v4_macro_enter_threshold = float(args.v4_macro_enter_threshold)
-    if args.v4_macro_exit_threshold is not None:
-        cfg.regime.v4_macro_exit_threshold = float(args.v4_macro_exit_threshold)
-    if args.v4_macro_half_threshold is not None:
-        cfg.regime.v4_macro_half_threshold = float(args.v4_macro_half_threshold)
-    if args.v4_macro_full_threshold is not None:
-        cfg.regime.v4_macro_full_threshold = float(args.v4_macro_full_threshold)
-    if args.v4_macro_confirm_days is not None:
-        cfg.regime.v4_macro_confirm_days = int(args.v4_macro_confirm_days)
-    if args.v4_macro_min_on_days is not None:
-        cfg.regime.v4_macro_min_on_days = int(args.v4_macro_min_on_days)
-    if args.v4_macro_min_off_days is not None:
-        cfg.regime.v4_macro_min_off_days = int(args.v4_macro_min_off_days)
-    if args.v4_macro_half_multiplier is not None:
-        cfg.regime.v4_macro_half_multiplier = float(args.v4_macro_half_multiplier)
-    if args.v4_macro_full_multiplier is not None:
-        cfg.regime.v4_macro_full_multiplier = float(args.v4_macro_full_multiplier)
-    if args.v4_micro_mult_trend is not None:
-        cfg.regime.v4_micro_mult_trend = float(args.v4_micro_mult_trend)
-    if args.v4_micro_mult_range is not None:
-        cfg.regime.v4_micro_mult_range = float(args.v4_micro_mult_range)
-    if args.v4_micro_mult_neutral is not None:
-        cfg.regime.v4_micro_mult_neutral = float(args.v4_micro_mult_neutral)
-    if args.v4_micro_mult_high_vol is not None:
-        cfg.regime.v4_micro_mult_high_vol = float(args.v4_micro_mult_high_vol)
-    if args.v4_core_risk_refresh is not None:
-        cfg.regime.v4_core_risk_refresh = str(args.v4_core_risk_refresh)
 
     if args.ci_mode:
         cfg.backtest.ci_mode = True
@@ -333,22 +331,27 @@ def main() -> int:
             "trend_boost_require_micro_trend": cfg.regime.trend_boost_require_micro_trend,
             "trend_boost_require_above_sma200": cfg.regime.trend_boost_require_above_sma200,
             "trend_boost_sma50_slope_lookback_days": cfg.regime.trend_boost_sma50_slope_lookback_days,
-        },
-        "v4_config": {
-            "v4_macro_enter_threshold": cfg.regime.v4_macro_enter_threshold,
-            "v4_macro_exit_threshold": cfg.regime.v4_macro_exit_threshold,
-            "v4_macro_half_threshold": cfg.regime.v4_macro_half_threshold,
-            "v4_macro_full_threshold": cfg.regime.v4_macro_full_threshold,
-            "v4_macro_confirm_days": cfg.regime.v4_macro_confirm_days,
-            "v4_macro_min_on_days": cfg.regime.v4_macro_min_on_days,
-            "v4_macro_min_off_days": cfg.regime.v4_macro_min_off_days,
-            "v4_macro_half_multiplier": cfg.regime.v4_macro_half_multiplier,
-            "v4_macro_full_multiplier": cfg.regime.v4_macro_full_multiplier,
-            "v4_micro_mult_trend": cfg.regime.v4_micro_mult_trend,
-            "v4_micro_mult_range": cfg.regime.v4_micro_mult_range,
-            "v4_micro_mult_neutral": cfg.regime.v4_micro_mult_neutral,
-            "v4_micro_mult_high_vol": cfg.regime.v4_micro_mult_high_vol,
-            "v4_core_risk_refresh": cfg.regime.v4_core_risk_refresh,
+            "macro2_signal_mode": cfg.regime.macro2_signal_mode,
+            "macro2_confirm_days": cfg.regime.macro2_confirm_days,
+            "macro2_min_on_days": cfg.regime.macro2_min_on_days,
+            "macro2_min_off_days": cfg.regime.macro2_min_off_days,
+            "macro2_weight_off": cfg.regime.macro2_weight_off,
+            "macro2_weight_half": cfg.regime.macro2_weight_half,
+            "macro2_weight_full": cfg.regime.macro2_weight_full,
+            "macro2_vol_mode": cfg.regime.macro2_vol_mode,
+            "macro2_vol_lookback_days": cfg.regime.macro2_vol_lookback_days,
+            "macro2_vol_floor": cfg.regime.macro2_vol_floor,
+            "macro2_target_ann_vol_half": cfg.regime.macro2_target_ann_vol_half,
+            "macro2_target_ann_vol_full": cfg.regime.macro2_target_ann_vol_full,
+            "macro2_dd_enabled": cfg.regime.macro2_dd_enabled,
+            "macro2_dd_threshold": cfg.regime.macro2_dd_threshold,
+            "macro2_dd_cooldown_days": cfg.regime.macro2_dd_cooldown_days,
+            "macro2_dd_reentry_confirm_days": cfg.regime.macro2_dd_reentry_confirm_days,
+            "macro2_dd_safe_weight": cfg.regime.macro2_dd_safe_weight,
+            "sma200_entry_band": cfg.regime.sma200_entry_band,
+            "sma200_exit_band": cfg.regime.sma200_exit_band,
+            "mom_6m_days": cfg.regime.mom_6m_days,
+            "mom_12m_days": cfg.regime.mom_12m_days,
         },
     }
     report_path = write_strict_json(out / "report.json", report)
