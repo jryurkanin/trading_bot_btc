@@ -15,6 +15,7 @@ from ..features.regime import compute_adx, compute_chop
 from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator, RegimeDecisionBundle
 from ..strategy.regime_switching_v4_core import V4CoreStrategy
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
+from ..strategy.v5_adaptive import V5AdaptiveStrategy
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
 
@@ -163,6 +164,8 @@ class BacktestEngine:
             orchestrator = V4CoreStrategy(reg_cfg)
         elif strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
+        elif strategy_id == "v5_adaptive":
+            orchestrator = V5AdaptiveStrategy(reg_cfg)
         else:
             orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
         risk_mgr = RiskManager(risk_cfg)
