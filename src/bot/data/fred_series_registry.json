@@ -1,0 +1,135 @@
+[
+  {
+    "series_id": "VIXCLS",
+    "friendly_name": "CBOE Volatility Index",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "SP500",
+    "friendly_name": "S&P 500 Index",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": true
+  },
+  {
+    "series_id": "DFF",
+    "friendly_name": "Effective Federal Funds Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "SOFR",
+    "friendly_name": "Secured Overnight Financing Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "DGS3MO",
+    "friendly_name": "3-Month Treasury Constant Maturity Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "DGS2",
+    "friendly_name": "2-Year Treasury Constant Maturity Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "DGS10",
+    "friendly_name": "10-Year Treasury Constant Maturity Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "T10Y2Y",
+    "friendly_name": "10Y-2Y Treasury Slope",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "T10Y3M",
+    "friendly_name": "10Y-3M Treasury Slope",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "DTWEXBGS",
+    "friendly_name": "Nominal Broad U.S. Dollar Index",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": true
+  },
+  {
+    "series_id": "BAA10Y",
+    "friendly_name": "Baa Corporate Bond Spread over 10Y Treasury",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "BAMLH0A0HYM2",
+    "friendly_name": "ICE BofA US High Yield OAS",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "T10YIE",
+    "friendly_name": "10-Year Breakeven Inflation Rate",
+    "native_frequency_hint": "daily",
+    "availability_lag_hours": 24,
+    "index_like": false
+  },
+  {
+    "series_id": "STLFSI4",
+    "friendly_name": "St. Louis Fed Financial Stress Index",
+    "native_frequency_hint": "weekly",
+    "availability_lag_hours": 168,
+    "index_like": false
+  },
+  {
+    "series_id": "NFCI",
+    "friendly_name": "Chicago Fed National Financial Conditions Index",
+    "native_frequency_hint": "weekly",
+    "availability_lag_hours": 168,
+    "index_like": false
+  },
+  {
+    "series_id": "WALCL",
+    "friendly_name": "Fed Total Assets",
+    "native_frequency_hint": "weekly",
+    "availability_lag_hours": 168,
+    "index_like": false
+  },
+  {
+    "series_id": "CPIAUCSL",
+    "friendly_name": "Consumer Price Index",
+    "native_frequency_hint": "monthly",
+    "availability_lag_hours": 840,
+    "index_like": false
+  },
+  {
+    "series_id": "UNRATE",
+    "friendly_name": "Unemployment Rate",
+    "native_frequency_hint": "monthly",
+    "availability_lag_hours": 840,
+    "index_like": false
+  },
+  {
+    "series_id": "M2SL",
+    "friendly_name": "M2 Money Stock",
+    "native_frequency_hint": "monthly",
+    "availability_lag_hours": 840,
+    "index_like": false
+  }
+]

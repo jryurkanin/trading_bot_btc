@@ -191,6 +191,15 @@ class MacroGateBenchmarkStrategy:
         self._daily_last_ts_cache[key] = last
         return last
 
+    @staticmethod
+    def _latest_daily_feature(daily_df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+        if daily_df is None or daily_df.empty or column not in daily_df.columns:
+            return float(default)
+        series = pd.to_numeric(daily_df[column], errors="coerce").dropna()
+        if series.empty:
+            return float(default)
+        return float(series.iloc[-1])
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -241,6 +250,10 @@ class MacroGateBenchmarkStrategy:
         macro_state, macro_mult, macro_score, macro_components = self._gate.update(
             daily_closed, daily_bar_ts
         )
+        macro_score_raw = float(macro_components.get("macro_score_raw", macro_score))
+        macro_score_after_fred = float(macro_components.get("macro_score_after_fred", macro_score))
+        fred_risk_off_score = float(macro_components.get("fred_risk_off_score", 0.0))
+        fred_penalty_multiplier = float(macro_components.get("fred_penalty_multiplier", 1.0))
 
         # --- Realized vol & base fraction ---
         rv_pre = micro_precomputed.get("realized_vol") if micro_precomputed else None
@@ -290,7 +303,19 @@ class MacroGateBenchmarkStrategy:
         metadata: Dict[str, float | str | int] = {
             "realized_vol": realized_vol,
             "base_fraction": base_fraction,
-            "macro_score": macro_score,
+            "macro_score": macro_score_after_fred,
+            "macro_score_raw": macro_score_raw,
+            "macro_score_after_fred": macro_score_after_fred,
+            "fred_risk_off_score": float(max(0.0, min(1.0, fred_risk_off_score))),
+            "fred_penalty_multiplier": float(max(0.0, min(1.0, fred_penalty_multiplier))),
+            "fred_comp_vix_z": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_z_level", default=np.nan)),
+            "fred_comp_hy_oas_z": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_z_level", default=np.nan)),
+            "fred_comp_stlfsi_z": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_z_level", default=np.nan)),
+            "fred_comp_nfci_z": float(self._latest_daily_feature(daily_closed, "fred_NFCI_z_level", default=np.nan)),
+            "fred_vix_level": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_level", default=np.nan)),
+            "fred_hy_oas_level": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_level", default=np.nan)),
+            "fred_stlfsi_level": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_level", default=np.nan)),
+            "fred_nfci_level": float(self._latest_daily_feature(daily_closed, "fred_NFCI_level", default=np.nan)),
             "macro_state": macro_state.value,
             "macro_multiplier": macro_mult,
             "macro_mult": macro_mult,

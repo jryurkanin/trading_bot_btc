@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
+import numpy as np
 import pandas as pd
 
 from ..config import RegimeConfig
@@ -215,6 +216,10 @@ class V4CoreStrategy:
         macro_state, macro_mult, macro_score, macro_components = self._gate.update(
             daily_closed, daily_bar_ts
         )
+        macro_score_raw = float(macro_components.get("macro_score_raw", macro_score))
+        macro_score_after_fred = float(macro_components.get("macro_score_after_fred", macro_score))
+        fred_risk_off_score = float(macro_components.get("fred_risk_off_score", 0.0))
+        fred_penalty_multiplier = float(macro_components.get("fred_penalty_multiplier", 1.0))
 
         # --- Realized vol & base fraction ---
         rv_pre = micro_precomputed.get("realized_vol") if micro_precomputed else None
@@ -264,7 +269,15 @@ class V4CoreStrategy:
         metadata: Dict[str, float | str | int] = {
             "realized_vol": realized_vol,
             "base_fraction": base_fraction,
-            "macro_score": macro_score,
+            "macro_score": macro_score_after_fred,
+            "macro_score_raw": macro_score_raw,
+            "macro_score_after_fred": macro_score_after_fred,
+            "fred_risk_off_score": fred_risk_off_score,
+            "fred_penalty_multiplier": fred_penalty_multiplier,
+            "fred_comp_vix_z": float(macro_components.get("fred_VIXCLS_z_level", np.nan)),
+            "fred_comp_hy_oas_z": float(macro_components.get("fred_BAMLH0A0HYM2_z_level", np.nan)),
+            "fred_comp_stlfsi_z": float(macro_components.get("fred_STLFSI4_z_level", np.nan)),
+            "fred_comp_nfci_z": float(macro_components.get("fred_NFCI_z_level", np.nan)),
             "macro_state": macro_state.value,
             "macro_multiplier": macro_mult,
             "macro_mult": macro_mult,

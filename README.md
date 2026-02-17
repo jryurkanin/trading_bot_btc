@@ -84,6 +84,12 @@ export COINBASE_API_SECRET=...
 export COINBASE_API_PASSPHRASE=...
 ```
 
+Optional FRED key (required only when FRED overlay is enabled):
+
+```bash
+export FRED_API_KEY=your_fred_key
+```
+
 ### Optional CUDA acceleration
 
 Backtests can use CUDA for rolling-volatility feature pipelines when a compatible GPU
@@ -101,6 +107,30 @@ Then run with:
 ```
 
 If CUDA is unavailable, the engine falls back to CPU and records the fallback reason in diagnostics.
+
+### Optional FRED macro overlay
+
+FRED integration is **off by default** for safety. When enabled, it:
+- fetches public macro/financial condition series from the official FRED API,
+- caches responses locally,
+- applies conservative availability lags (daily/weekly/monthly),
+- builds `fred_risk_off_score` and `fred_penalty_multiplier`,
+- scales macro score as a headwind/tailwind overlay (no micro-regime switching changes).
+
+Enable via config (`fred.enabled=true`) or CLI flags on backtests:
+
+```bash
+python scripts/backtest.py \
+  --product BTC-USD \
+  --start 2021-01-01T00:00:00Z \
+  --end 2026-01-31T00:00:00Z \
+  --fred-enabled \
+  --fred-max-risk-off-penalty 0.5 \
+  --fred-risk-off-score-ema-span 16 \
+  --fred-lag-stress-multiplier 1.0
+```
+
+`report.json` includes a `fred` section with series provenance, lags, weights, warnings, and cache stats.
 
 ## Quickstart
 
@@ -198,6 +228,17 @@ python scripts/frontier_sweep_macro_only.py \
   --acceleration-backend auto \
   --workers 4 \
   --small
+```
+
+Include FRED dimensions in the sweep grid (optional):
+
+```bash
+python scripts/frontier_sweep_macro_only.py \
+  --product BTC-USD \
+  --fill-model bid_ask \
+  --start 2021-01-01T00:00:00Z \
+  --test-end 2026-01-31T00:00:00Z \
+  --include-fred-grid
 ```
 
 Outputs:

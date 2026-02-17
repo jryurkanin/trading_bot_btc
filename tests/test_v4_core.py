@@ -588,8 +588,8 @@ class TestMacroBucketAttributionFromEquityCurve:
         assert buckets["ON_HALF"]["avg_exposure"] == pytest.approx(0.25, abs=0.01)
         assert buckets["ON_FULL"]["avg_exposure"] == pytest.approx(0.5, abs=0.01)
 
-    def test_buckets_prefer_equity_over_decisions_merge(self):
-        """Even when decisions_df IS provided, equity_curve columns take priority."""
+    def test_buckets_prefer_decisions_when_provided(self):
+        """When decisions_df is provided, macro bucket attribution should use it."""
         from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 
         n = 60
@@ -605,7 +605,7 @@ class TestMacroBucketAttributionFromEquityCurve:
         }, index=ts)
         eq.index.name = "timestamp"
 
-        # Build a dummy decisions_df with WRONG macro_state (all OFF)
+        # decisions_df deliberately conflicts (all OFF) and should take precedence.
         dec = pd.DataFrame({
             "decision_applies_at": ts,
             "macro_state": ["OFF"] * n,
@@ -615,7 +615,8 @@ class TestMacroBucketAttributionFromEquityCurve:
 
         report, table = compute_macro_bucket_attribution(eq, dec, None, initial_equity=10000)
 
-        # Should use equity_curve's columns, NOT decisions_df
         buckets = report["buckets"]
-        assert buckets["OFF"]["time_bars"] == 20
-        assert buckets["ON_FULL"]["time_bars"] == 40
+        assert buckets["OFF"]["time_bars"] == 60
+        assert buckets["ON_HALF"]["time_bars"] == 0
+        assert buckets["ON_FULL"]["time_bars"] == 0
+        assert "macro_bucket_from_decisions" in report.get("warnings", [])

@@ -64,6 +64,15 @@ SMALL_GRID_MACRO_ONLY: dict[str, list[Any]] = {
 }
 
 
+DEFAULT_FRED_SWEEP_SPACE: dict[str, list[Any]] = {
+    "fred.enabled": [False, True],
+    "fred.max_risk_off_penalty": [0.0, 0.25, 0.5, 0.75],
+    "fred.risk_off_score_ema_span": [8, 16, 32],
+    "fred.lag_stress_multiplier": [1.0, 1.5, 2.0],
+    "fred_risk_weight_scale": [1.0],
+}
+
+
 @dataclass(frozen=True)
 class CostScenario:
     name: str
@@ -201,7 +210,13 @@ def product_grid(space: dict[str, list[Any]]) -> list[dict[str, Any]]:
     return combos
 
 
-def load_grid(path: str | None, grid_flags: dict[str, list[Any]], small: bool = False) -> list[dict[str, Any]]:
+def load_grid(
+    path: str | None,
+    grid_flags: dict[str, list[Any]],
+    *,
+    small: bool = False,
+    include_fred_grid: bool = False,
+) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(payload, list):
@@ -223,6 +238,8 @@ def load_grid(path: str | None, grid_flags: dict[str, list[Any]], small: bool = 
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
     space = dict(SMALL_GRID_MACRO_ONLY if small else DEFAULT_GRID_MACRO_ONLY)
+    if include_fred_grid:
+        space.update(DEFAULT_FRED_SWEEP_SPACE)
     space.update(grid_flags)
     return product_grid(space)
 
@@ -236,6 +253,14 @@ def clone_cfg(cfg: BotConfig) -> BotConfig:
 
 
 def set_param(cfg: BotConfig, key: str, value: Any) -> None:
+    if key == "fred_risk_weight_scale":
+        scale = float(value)
+        cfg.fred.risk_off_weights = {
+            str(k): float(v) * scale
+            for k, v in cfg.fred.risk_off_weights.items()
+        }
+        return
+
     if "." in key:
         obj: Any = cfg
         parts = key.split(".")
@@ -244,7 +269,7 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
         setattr(obj, parts[-1], value)
         return
 
-    for section in [cfg.regime, cfg.execution, cfg.backtest, cfg.risk]:
+    for section in [cfg.regime, cfg.execution, cfg.backtest, cfg.risk, cfg.fred]:
         if hasattr(section, key):
             setattr(section, key, value)
             return
@@ -312,6 +337,7 @@ def run_window(
         regime_config=cfg.regime,
         risk_config=cfg.risk,
         execution_config=cfg.execution,
+        fred_config=cfg.fred,
     )
     result = engine.run()
 
@@ -353,6 +379,12 @@ def run_window(
         "acceleration_backend": result.diagnostics.get("acceleration_backend", "cpu"),
         "acceleration_cuda_available": result.diagnostics.get("acceleration_cuda_available", 0),
         "acceleration_device": result.diagnostics.get("acceleration_device"),
+        "fred_enabled": bool(cfg.fred.enabled),
+        "fred_max_risk_off_penalty": float(cfg.fred.max_risk_off_penalty),
+        "fred_risk_off_score_ema_span": int(cfg.fred.risk_off_score_ema_span),
+        "fred_lag_stress_multiplier": float(cfg.fred.lag_stress_multiplier),
+        "fred_cache_hit_rate": float((result.diagnostics.get("fred") or {}).get("cache_hit_rate", 0.0) or 0.0),
+        "fred_series_used_count": int(len((result.diagnostics.get("fred") or {}).get("series_used", []))),
     }
     return row
 
@@ -374,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grid-config", default=None)
     p.add_argument("--grid", action="append", default=[])
     p.add_argument("--small", action="store_true", help="smaller walk-forward grid for quick checks")
+    p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay parameters in sweep grid")
     p.add_argument("--workers", type=int, default=1, help="parallel worker processes for parameter sets")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
@@ -428,7 +461,12 @@ def main() -> int:
         pass
 
     grid_flags = parse_grid_flags(args.grid)
-    param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
+    param_sets = load_grid(
+        args.grid_config,
+        grid_flags,
+        small=args.small,
+        include_fred_grid=bool(args.include_fred_grid),
+    )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -649,15 +687,30 @@ def main() -> int:
 
     best = frontier_rows[0] if frontier_rows else None
     if best is not None:
+        best_params = json.loads(best["params"])
+        best_regime: dict[str, Any] = {"macro2_signal_mode": "sma200_and_mom"}
+        best_fred: dict[str, Any] = {}
+
+        for k, v in best_params.items():
+            if str(k).startswith("fred."):
+                best_fred[str(k).split(".", 1)[1]] = v
+            elif str(k) == "fred_risk_weight_scale":
+                scale = float(v)
+                best_fred["risk_off_weights"] = {
+                    str(name): float(weight) * scale
+                    for name, weight in cfg.fred.risk_off_weights.items()
+                }
+            else:
+                best_regime[str(k)] = v
+
         best_cfg = {
-            "regime": {
-                "macro2_signal_mode": "sma200_and_mom",
-                **json.loads(best["params"]),
-            },
+            "regime": best_regime,
             "backtest": {
                 "strategy": "macro_only_v2",
             },
         }
+        if best_fred:
+            best_cfg["fred"] = best_fred
         best_cfg_path = write_strict_json(out_dir / "best_config.json", best_cfg)
 
         test_benchmark = grouped.get(best.get("param_id", ""), {}).get("test", {}).get("stress_1")

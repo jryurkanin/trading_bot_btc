@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from . import indicators
@@ -25,7 +26,10 @@ class MacroState(str, Enum):
 
 @dataclass
 class MacroScoreResult:
+    raw_score: float
     score: float
+    fred_risk_off_score: float
+    fred_penalty_multiplier: float
     components: dict[str, float]
     multiplier: float
     enabled_components: list[str]
@@ -258,13 +262,48 @@ def macro_multiplier_from_score(
     return float(max(0.0, min(1.0, linear)))
 
 
+def _latest_numeric_column(df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+    if df is None or df.empty or column not in df.columns:
+        return float(default)
+    series = pd.to_numeric(df[column], errors="coerce").dropna()
+    if series.empty:
+        return float(default)
+    return float(series.iloc[-1])
+
+
 def macro_result(daily_df: pd.DataFrame, cfg: Any) -> MacroScoreResult:
-    score, components, used = compute_macro_score(daily_df, getattr(cfg, "macro_score_components", None))
+    raw_score, components, used = compute_macro_score(daily_df, getattr(cfg, "macro_score_components", None))
+
+    fred_risk_off = _latest_numeric_column(daily_df, "fred_risk_off_score_smooth", default=np.nan)
+    if pd.isna(fred_risk_off):
+        fred_risk_off = _latest_numeric_column(daily_df, "fred_risk_off_score", default=0.0)
+
+    fred_penalty_multiplier = _latest_numeric_column(daily_df, "fred_penalty_multiplier", default=np.nan)
+    if pd.isna(fred_penalty_multiplier):
+        fred_penalty_multiplier = 1.0
+
+    score_after_fred = float(max(0.0, min(1.0, raw_score * fred_penalty_multiplier)))
+
     mult = macro_multiplier_from_score(
-        score,
+        score_after_fred,
         transform=str(getattr(cfg, "macro_score_transform", "linear")),
         floor=float(getattr(cfg, "macro_score_floor", 0.0)),
         min_to_trade=float(getattr(cfg, "macro_score_min_to_trade", 0.25)),
         piecewise_levels=list(getattr(cfg, "macro_piecewise_levels", [0.0, 0.33, 0.66, 1.0])),
     )
-    return MacroScoreResult(score=score, components=components, multiplier=mult, enabled_components=used)
+
+    components_out = dict(components)
+    components_out["macro_score_raw"] = float(raw_score)
+    components_out["fred_risk_off_score"] = float(max(0.0, min(1.0, fred_risk_off)))
+    components_out["fred_penalty_multiplier"] = float(max(0.0, min(1.0, fred_penalty_multiplier)))
+    components_out["macro_score_after_fred"] = float(score_after_fred)
+
+    return MacroScoreResult(
+        raw_score=float(raw_score),
+        score=float(score_after_fred),
+        fred_risk_off_score=float(max(0.0, min(1.0, fred_risk_off))),
+        fred_penalty_multiplier=float(max(0.0, min(1.0, fred_penalty_multiplier))),
+        components=components_out,
+        multiplier=mult,
+        enabled_components=used,
+    )

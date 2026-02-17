@@ -3,21 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import logging
 
 import pandas as pd
 
-from ..config import BacktestConfig, RegimeConfig, RiskConfig, ExecutionConfig
+from ..config import BacktestConfig, RegimeConfig, RiskConfig, ExecutionConfig, FredConfig
 from ..execution.risk import RiskManager, RiskState
 from ..execution.rebalance_policy import RebalancePolicy
 from ..features import indicators
 from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
 from ..acceleration.cuda_backend import resolve_acceleration_backend
 from ..features.regime import compute_adx, compute_chop
+from ..features.fred_features import build_fred_daily_overlay_features
 from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
+
+
+logger = logging.getLogger("trading_bot.backtest.engine")
 
 
 @dataclass
@@ -67,12 +72,14 @@ class BacktestEngine:
     regime_config: Optional[RegimeConfig] = None
     risk_config: Optional[RiskConfig] = None
     execution_config: Optional[ExecutionConfig] = None
+    fred_config: Optional[FredConfig] = None
 
     def run(self) -> BacktestResult:
         cfg = self.config or BacktestConfig()
         reg_cfg = self.regime_config or RegimeConfig()
         risk_cfg = self.risk_config or RiskConfig()
         exec_cfg = self.execution_config or ExecutionConfig()
+        fred_cfg = self.fred_config or FredConfig()
 
         hourly = self.hourly_candles.copy()
         daily = self.daily_candles.copy()
@@ -98,6 +105,27 @@ class BacktestEngine:
             raise ValueError("No hourly candles in backtest window")
         if daily.empty:
             raise ValueError("No daily candles in backtest window")
+
+        fred_report: dict[str, Any] = {
+            "enabled": bool(getattr(fred_cfg, "enabled", False)),
+            "series_used": [],
+            "series_lags_hours": {},
+            "warnings": [],
+        }
+
+        if bool(getattr(fred_cfg, "enabled", False)):
+            try:
+                fred_build = build_fred_daily_overlay_features(daily, fred_cfg)
+                daily = fred_build.daily_features
+                fred_report = dict(fred_build.report)
+            except Exception as exc:
+                logger.warning("FRED overlay build failed; continuing without FRED features: %s", exc)
+                fred_report = {
+                    "enabled": True,
+                    "series_used": [],
+                    "series_lags_hours": {},
+                    "warnings": [f"fred_overlay_failed:{exc.__class__.__name__}"],
+                }
 
         hourly = hourly.set_index("timestamp").sort_index()
         daily = daily.set_index("timestamp").sort_index()
@@ -212,6 +240,15 @@ class BacktestEngine:
         events: List[ExecutionEvent] = []
         decisions_rows: List[Dict[str, Any]] = []
         equity_rows: List[Dict[str, Any]] = []
+
+        def _meta_float(meta: dict[str, Any], key: str, default: float) -> float:
+            try:
+                value = float(meta.get(key, default))
+                if value != value:  # NaN-safe check
+                    return float(default)
+                return value
+            except Exception:
+                return float(default)
 
         # Iterate on signal bar t and fill on bar t+1
         for i in range(1, len(hourly)):
@@ -353,10 +390,22 @@ class BacktestEngine:
             post_exposure = max(0.0, min(1.0, (btc * mark_exec / equity_exec) if equity_exec > 0 else 0.0))
 
             macro_state = str(bundle.metadata.get("macro_state", "OFF"))
-            macro_multiplier = float(bundle.metadata.get("macro_multiplier", 0.0) or 0.0)
-            macro_score = float(bundle.metadata.get("macro_score", 0.0) or 0.0)
+            macro_multiplier = _meta_float(bundle.metadata, "macro_multiplier", 0.0)
+            macro_score = _meta_float(bundle.metadata, "macro_score", 0.0)
+            macro_score_raw = _meta_float(bundle.metadata, "macro_score_raw", macro_score)
+            macro_score_after_fred = _meta_float(bundle.metadata, "macro_score_after_fred", macro_score)
+            fred_risk_off_score = _meta_float(bundle.metadata, "fred_risk_off_score", 0.0)
+            fred_penalty_multiplier = _meta_float(bundle.metadata, "fred_penalty_multiplier", 1.0)
+            fred_comp_vix_z = _meta_float(bundle.metadata, "fred_comp_vix_z", float("nan"))
+            fred_comp_hy_oas_z = _meta_float(bundle.metadata, "fred_comp_hy_oas_z", float("nan"))
+            fred_comp_stlfsi_z = _meta_float(bundle.metadata, "fred_comp_stlfsi_z", float("nan"))
+            fred_comp_nfci_z = _meta_float(bundle.metadata, "fred_comp_nfci_z", float("nan"))
+            fred_vix_level = _meta_float(bundle.metadata, "fred_vix_level", float("nan"))
+            fred_hy_oas_level = _meta_float(bundle.metadata, "fred_hy_oas_level", float("nan"))
+            fred_stlfsi_level = _meta_float(bundle.metadata, "fred_stlfsi_level", float("nan"))
+            fred_nfci_level = _meta_float(bundle.metadata, "fred_nfci_level", float("nan"))
             trend_boost_active = int(bundle.metadata.get("trend_boost_active", 0) or 0)
-            boost_multiplier_applied = float(bundle.metadata.get("boost_multiplier_applied", 1.0) or 1.0)
+            boost_multiplier_applied = _meta_float(bundle.metadata, "boost_multiplier_applied", 1.0)
 
             equity_rows.append(
                 {
@@ -371,7 +420,19 @@ class BacktestEngine:
                     "macro_risk_on": bundle.macro_risk_on,
                     "macro_state": macro_state,
                     "macro_multiplier": macro_multiplier,
-                    "macro_score": macro_score,
+                    "macro_score": macro_score_after_fred,
+                    "macro_score_raw": macro_score_raw,
+                    "macro_score_after_fred": macro_score_after_fred,
+                    "fred_risk_off_score": fred_risk_off_score,
+                    "fred_penalty_multiplier": fred_penalty_multiplier,
+                    "fred_comp_vix_z": fred_comp_vix_z,
+                    "fred_comp_hy_oas_z": fred_comp_hy_oas_z,
+                    "fred_comp_stlfsi_z": fred_comp_stlfsi_z,
+                    "fred_comp_nfci_z": fred_comp_nfci_z,
+                    "fred_vix_level": fred_vix_level,
+                    "fred_hy_oas_level": fred_hy_oas_level,
+                    "fred_stlfsi_level": fred_stlfsi_level,
+                    "fred_nfci_level": fred_nfci_level,
                     "trend_boost_active": trend_boost_active,
                     "strategy": bundle.strategy_name,
                     "target": target_bucket,
@@ -387,7 +448,19 @@ class BacktestEngine:
                     "macro_risk_on": bundle.macro_risk_on,
                     "macro_state": macro_state,
                     "macro_multiplier": macro_multiplier,
-                    "macro_score": macro_score,
+                    "macro_score": macro_score_after_fred,
+                    "macro_score_raw": macro_score_raw,
+                    "macro_score_after_fred": macro_score_after_fred,
+                    "fred_risk_off_score": fred_risk_off_score,
+                    "fred_penalty_multiplier": fred_penalty_multiplier,
+                    "fred_comp_vix_z": fred_comp_vix_z,
+                    "fred_comp_hy_oas_z": fred_comp_hy_oas_z,
+                    "fred_comp_stlfsi_z": fred_comp_stlfsi_z,
+                    "fred_comp_nfci_z": fred_comp_nfci_z,
+                    "fred_vix_level": fred_vix_level,
+                    "fred_hy_oas_level": fred_hy_oas_level,
+                    "fred_stlfsi_level": fred_stlfsi_level,
+                    "fred_nfci_level": fred_nfci_level,
                     "boost_active": trend_boost_active,
                     "boost_multiplier_applied": boost_multiplier_applied,
                     "macro_reason": bundle.macro_reason,
@@ -435,6 +508,7 @@ class BacktestEngine:
             "acceleration_cuda_available": int(hourly_precomputed.get("acceleration_cuda_available", 0) or 0),
             "acceleration_device": hourly_precomputed.get("acceleration_device"),
             "acceleration_fallback_reason": hourly_precomputed.get("acceleration_fallback_reason"),
+            "fred": fred_report,
         }
 
         return BacktestResult(

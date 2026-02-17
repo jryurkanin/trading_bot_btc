@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any
 
+import numpy as np
 import pandas as pd
 
 from ..config import RegimeConfig
@@ -442,6 +443,9 @@ class RegimeSwitchingOrchestrator:
             daily_closed = _dc["daily_closed"]
             daily_bar_ts = _dc["daily_bar_ts"]
             macro_score = _dc["macro_score"]
+            macro_score_raw = _dc.get("macro_score_raw", macro_score)
+            fred_risk_off_score = _dc.get("fred_risk_off_score", 0.0)
+            macro_score_after_fred = _dc.get("macro_score_after_fred", macro_score)
             macro_components = _dc["macro_components"]
             macro_components_used = _dc["macro_components_used"]
             binary_on = _dc["binary_on"]
@@ -457,6 +461,9 @@ class RegimeSwitchingOrchestrator:
 
             macro = macro_result(daily_closed, self.cfg)
             macro_score = float(macro.score)
+            macro_score_raw = float(macro.raw_score)
+            fred_risk_off_score = float(macro.fred_risk_off_score)
+            macro_score_after_fred = float(macro.score)
             macro_components = macro.components
             macro_components_used = macro.enabled_components
 
@@ -476,6 +483,9 @@ class RegimeSwitchingOrchestrator:
                 "daily_bar_ts": daily_bar_ts,
                 "daily_closed": daily_closed,
                 "macro_score": macro_score,
+                "macro_score_raw": macro_score_raw,
+                "fred_risk_off_score": fred_risk_off_score,
+                "macro_score_after_fred": macro_score_after_fred,
                 "macro_components": macro_components,
                 "macro_components_used": macro_components_used,
                 "binary_on": binary_on,
@@ -505,7 +515,15 @@ class RegimeSwitchingOrchestrator:
             "realized_vol": realized_vol,
             "base_target": base_target,
             "macro_mode": self.cfg.macro_mode,
-            "macro_score": macro_score,
+            "macro_score": macro_score_after_fred,
+            "macro_score_raw": macro_score_raw,
+            "macro_score_after_fred": macro_score_after_fred,
+            "fred_risk_off_score": fred_risk_off_score,
+            "fred_penalty_multiplier": float(macro_components.get("fred_penalty_multiplier", 1.0)),
+            "fred_comp_vix_z": float(macro_components.get("fred_VIXCLS_z_level", np.nan)) if isinstance(macro_components, dict) else np.nan,
+            "fred_comp_hy_oas_z": float(macro_components.get("fred_BAMLH0A0HYM2_z_level", np.nan)) if isinstance(macro_components, dict) else np.nan,
+            "fred_comp_stlfsi_z": float(macro_components.get("fred_STLFSI4_z_level", np.nan)) if isinstance(macro_components, dict) else np.nan,
+            "fred_comp_nfci_z": float(macro_components.get("fred_NFCI_z_level", np.nan)) if isinstance(macro_components, dict) else np.nan,
             "macro_state": macro_state.value,
             "macro_multiplier": macro_multiplier,
             "macro_reason": macro_reason,

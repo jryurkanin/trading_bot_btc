@@ -64,7 +64,7 @@ def test_v3_stateful_gate_bucket_scaling_and_directional_boost(monkeypatch):
 
     def fake_macro_result(_daily, _cfg):
         s = float(next(scores))
-        return MacroScoreResult(score=s, components={"mock": s}, multiplier=s, enabled_components=["mock"])
+        return MacroScoreResult(raw_score=s, score=s, fred_risk_off_score=0.0, fred_penalty_multiplier=1.0, components={"mock": s}, multiplier=s, enabled_components=["mock"])
 
     monkeypatch.setattr(orch_mod, "macro_result", fake_macro_result)
     monkeypatch.setattr(orch, "_micro_regime", lambda _h, _idx, precomputed=None: RegimeState.TREND)

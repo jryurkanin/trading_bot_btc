@@ -25,6 +25,19 @@ except Exception:  # pragma: no cover - pydantic v1 compatibility
 TIMEFRAME = Literal["1h", "1d"]
 
 
+def _load_default_fred_series_registry() -> list[dict[str, Any]]:
+    registry_path = Path(__file__).resolve().parent / "data" / "fred_series_registry.json"
+    if not registry_path.exists():
+        return []
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return [dict(x) for x in payload if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
 class CoinbaseConfig(BaseModel):
     api_key: Optional[str] = Field(default=None, alias="COINBASE_API_KEY")
     api_secret: Optional[str] = Field(default=None, alias="COINBASE_API_SECRET")
@@ -66,6 +79,64 @@ class PublicSourcesConfig(BaseModel):
     fear_greed_enabled: bool = False
     blockchain_enabled: bool = False
     cache_ttl_minutes: int = 60
+
+
+class FredConfig(BaseModel):
+    enabled: bool = False
+    api_key: Optional[str] = Field(default=None, alias="FRED_API_KEY")
+    api_base_url: str = "https://api.stlouisfed.org/fred"
+    cache_dir: Path = Field(default=Path(".trading_bot_cache/fred"))
+    http_timeout_seconds: float = 15.0
+    max_retries: int = 5
+    backoff_seconds: float = 0.5
+    cache_ttl_hours: float = 24.0
+    use_stale_cache_for_backtest: bool = True
+
+    # Data treatment
+    realtime_mode: Literal["lagged_latest", "vintage_dates"] = "lagged_latest"
+    default_availability_lag_hours_daily: int = 24
+    default_availability_lag_hours_weekly: int = 7 * 24
+    default_availability_lag_hours_monthly: int = 35 * 24
+    lag_stress_multiplier: float = 1.0
+
+    # Feature engineering
+    daily_z_lookback: int = 252
+    weekly_z_lookback: int = 104
+    monthly_z_lookback: int = 60
+    zscore_clip: float = 4.0
+
+    # Macro overlay controls
+    max_risk_off_penalty: float = 0.5
+    risk_off_score_ema_span: int = 16
+    risk_off_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "VIXCLS": 1.0,
+            "BAMLH0A0HYM2": 1.0,
+            "BAA10Y": 0.8,
+            "STLFSI4": 0.7,
+            "NFCI": 0.7,
+            "DTWEXBGS": 0.4,
+            "curve_inversion": 0.8,
+            "WALCL": 0.2,
+            "M2SL": 0.2,
+        }
+    )
+
+    # Series registry loaded from repo-local defaults and overrideable in config.
+    series: list[dict[str, Any]] = Field(default_factory=_load_default_fred_series_registry)
+
+    @field_validator("api_key", mode="before")
+    def _trim_api_key(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        out = str(value).strip()
+        return out or None
+
+    @field_validator("cache_dir", mode="before")
+    def _cache_dir(cls, value: Any) -> Path:
+        if isinstance(value, Path):
+            return value
+        return Path(value)
 
 
 class RegimeConfig(BaseModel):
@@ -346,6 +417,7 @@ class BotConfig(BaseModel):
     coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     public_sources: PublicSourcesConfig = Field(default_factory=PublicSourcesConfig)
+    fred: FredConfig = Field(default_factory=FredConfig)
     regime: RegimeConfig = Field(default_factory=RegimeConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -354,7 +426,7 @@ class BotConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 
-    @field_validator("coinbase", "data", "public_sources", "regime", "risk", "execution", "fees", "backtest", "logging", "runtime", mode="before")
+    @field_validator("coinbase", "data", "public_sources", "fred", "regime", "risk", "execution", "fees", "backtest", "logging", "runtime", mode="before")
     def _convert_nested(cls, value: Any) -> Dict[str, Any]:
         if value is None:
             return {}
@@ -393,10 +465,19 @@ class BotConfig(BaseModel):
                 return cast(raw_value)
             return cast(raw_value)
 
+        coinbase_raw = raw.get("coinbase", {}) if isinstance(raw.get("coinbase", {}), dict) else {}
+        fred_raw = raw.get("fred", {}) if isinstance(raw.get("fred", {}), dict) else {}
+
         env_overrides = {
-            "coinbase.api_key": env("COINBASE_API_KEY", raw.get("coinbase", {}).get("api_key") if isinstance(raw.get("coinbase", {}), dict) else None),
-            "coinbase.api_secret": env("COINBASE_API_SECRET", raw.get("coinbase", {}).get("api_secret") if isinstance(raw.get("coinbase", {}), dict) else None),
-            "coinbase.use_sandbox": env("COINBASE_USE_SANDBOX", raw.get("coinbase", {}).get("use_sandbox") if isinstance(raw.get("coinbase", {}), dict) else False, bool),
+            # Use alias keys so pydantic accepts them consistently across v1/v2.
+            "coinbase.COINBASE_API_KEY": env("COINBASE_API_KEY", coinbase_raw.get("COINBASE_API_KEY", coinbase_raw.get("api_key"))),
+            "coinbase.COINBASE_API_SECRET": env("COINBASE_API_SECRET", coinbase_raw.get("COINBASE_API_SECRET", coinbase_raw.get("api_secret"))),
+            "coinbase.COINBASE_API_PASSPHRASE": env("COINBASE_API_PASSPHRASE", coinbase_raw.get("COINBASE_API_PASSPHRASE", coinbase_raw.get("api_passphrase"))),
+            "coinbase.COINBASE_USE_SANDBOX": env("COINBASE_USE_SANDBOX", coinbase_raw.get("COINBASE_USE_SANDBOX", coinbase_raw.get("use_sandbox", False)), bool),
+            "fred.FRED_API_KEY": os.getenv(
+                "FRED_API_KEY",
+                env("FRED_API_KEY", fred_raw.get("FRED_API_KEY", fred_raw.get("api_key"))),
+            ),
         }
 
         def _set_path(d: dict[str, Any], dotted: str, value: Any) -> None:
@@ -411,13 +492,36 @@ class BotConfig(BaseModel):
             cur[parts[-1]] = value
 
         merged = dict(raw)
+
+        # Backward compatibility: map non-aliased keys in config files to aliases.
+        coinbase_merged = merged.setdefault("coinbase", {}) if isinstance(merged.get("coinbase", {}), dict) else {}
+        if isinstance(coinbase_merged, dict):
+            if "api_key" in coinbase_merged and "COINBASE_API_KEY" not in coinbase_merged:
+                coinbase_merged["COINBASE_API_KEY"] = coinbase_merged.get("api_key")
+            if "api_secret" in coinbase_merged and "COINBASE_API_SECRET" not in coinbase_merged:
+                coinbase_merged["COINBASE_API_SECRET"] = coinbase_merged.get("api_secret")
+            if "api_passphrase" in coinbase_merged and "COINBASE_API_PASSPHRASE" not in coinbase_merged:
+                coinbase_merged["COINBASE_API_PASSPHRASE"] = coinbase_merged.get("api_passphrase")
+            if "use_sandbox" in coinbase_merged and "COINBASE_USE_SANDBOX" not in coinbase_merged:
+                coinbase_merged["COINBASE_USE_SANDBOX"] = coinbase_merged.get("use_sandbox")
+
+        fred_merged = merged.setdefault("fred", {}) if isinstance(merged.get("fred", {}), dict) else {}
+        if isinstance(fred_merged, dict):
+            if "api_key" in fred_merged and "FRED_API_KEY" not in fred_merged:
+                fred_merged["FRED_API_KEY"] = fred_merged.get("api_key")
+
         for k, v in env_overrides.items():
             _set_path(merged, k, v)
 
-        # Also expose direct env vars for convenience
-        merged.setdefault("coinbase", {}).setdefault("api_key", os.getenv("COINBASE_API_KEY", merged.get("coinbase", {}).get("api_key")))
-        merged.setdefault("coinbase", {}).setdefault("api_secret", os.getenv("COINBASE_API_SECRET", merged.get("coinbase", {}).get("api_secret")))
-        merged.setdefault("coinbase", {}).setdefault("api_passphrase", os.getenv("COINBASE_API_PASSPHRASE", merged.get("coinbase", {}).get("api_passphrase")))
+        # Also expose direct env vars for convenience.
+        if isinstance(merged.get("coinbase"), dict):
+            c = merged["coinbase"]
+            c.setdefault("COINBASE_API_KEY", os.getenv("COINBASE_API_KEY", c.get("COINBASE_API_KEY")))
+            c.setdefault("COINBASE_API_SECRET", os.getenv("COINBASE_API_SECRET", c.get("COINBASE_API_SECRET")))
+            c.setdefault("COINBASE_API_PASSPHRASE", os.getenv("COINBASE_API_PASSPHRASE", c.get("COINBASE_API_PASSPHRASE")))
+        if isinstance(merged.get("fred"), dict):
+            f = merged["fred"]
+            f.setdefault("FRED_API_KEY", os.getenv("FRED_API_KEY", f.get("FRED_API_KEY")))
 
         if hasattr(cls, "model_validate"):
             cfg = cls.model_validate(merged)

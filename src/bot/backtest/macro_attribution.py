@@ -47,6 +47,32 @@ def _safe_int(x: int | float | None, default: int = 0) -> int:
         return default
 
 
+def _safe_optional_float(x: float | int | np.floating | None) -> float | None:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if not np.isfinite(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+FRED_DECISION_FIELDS = [
+    "fred_risk_off_score",
+    "fred_penalty_multiplier",
+    "fred_comp_vix_z",
+    "fred_comp_hy_oas_z",
+    "fred_comp_stlfsi_z",
+    "fred_comp_nfci_z",
+    "fred_vix_level",
+    "fred_hy_oas_level",
+    "fred_stlfsi_level",
+    "fred_nfci_level",
+]
+
+
 def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.DataFrame | None) -> tuple[pd.DataFrame, list[str]]:
     warnings: list[str] = []
 
@@ -58,52 +84,51 @@ def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.D
     eq = eq.sort_values("timestamp").reset_index(drop=True)
     eq["merge_key"] = (eq["timestamp"].astype("int64") // 1_000_000_000).astype("int64")
 
-    # Prefer equity_curve's own macro_state/macro_multiplier columns when
-    # available — these are written per-bar by the engine and are the ground
-    # truth.  The previous merge_asof approach from decisions_df was fragile
-    # and silently produced all-OFF buckets on merge misalignment.
+    if decisions_df is not None and not decisions_df.empty:
+        dec = decisions_df.copy()
+        if "timestamp" not in dec.columns:
+            dec = dec.reset_index().rename(columns={dec.index.name or "index": "timestamp"})
+
+        dec["timestamp"] = _to_utc(dec["timestamp"])
+        applies_col = "decision_applies_at" if "decision_applies_at" in dec.columns else "timestamp"
+        dec["decision_applies_at"] = _to_utc(dec[applies_col])
+        dec = dec.sort_values("decision_applies_at").reset_index(drop=True)
+
+        if "macro_state" not in dec.columns:
+            warnings.append("macro_state_missing_in_decisions_used_multiplier")
+
+        dec["macro_bucket"] = [
+            _bucket_from_state_and_multiplier(state, mult)
+            for state, mult in zip(dec.get("macro_state", "OFF"), dec.get("macro_multiplier", 0.0), strict=False)
+        ]
+        dec["merge_key"] = (dec["decision_applies_at"].astype("int64") // 1_000_000_000).astype("int64")
+
+        keep_cols = ["merge_key", "macro_bucket"] + [c for c in FRED_DECISION_FIELDS if c in dec.columns]
+        labels = dec[keep_cols].drop_duplicates(subset=["merge_key"], keep="last").sort_values("merge_key")
+
+        aligned = pd.merge_asof(
+            eq.sort_values("merge_key"),
+            labels,
+            on="merge_key",
+            direction="backward",
+        )
+        aligned["macro_bucket"] = aligned["macro_bucket"].fillna("OFF")
+        warnings.append("macro_bucket_from_decisions")
+        return aligned, warnings
+
+    # Fallback for legacy callers that do not provide decisions.
     if "macro_state" in eq.columns:
         mult_col = eq.get("macro_multiplier", pd.Series(0.0, index=eq.index))
         eq["macro_bucket"] = [
             _bucket_from_state_and_multiplier(state, mult)
             for state, mult in zip(eq["macro_state"], mult_col, strict=False)
         ]
-        warnings.append("macro_bucket_from_equity_columns")
+        warnings.append("decisions_missing_used_equity_columns")
         return eq, warnings
 
-    # Fall back: try decisions_df merge if equity_curve lacks macro columns.
-    if decisions_df is None or decisions_df.empty:
-        eq["macro_bucket"] = "OFF"
-        warnings.append("decisions_missing_default_off")
-        return eq, warnings
-
-    dec = decisions_df.copy()
-    if "timestamp" not in dec.columns:
-        dec = dec.reset_index().rename(columns={dec.index.name or "index": "timestamp"})
-
-    dec["timestamp"] = _to_utc(dec["timestamp"])
-    applies_col = "decision_applies_at" if "decision_applies_at" in dec.columns else "timestamp"
-    dec["decision_applies_at"] = _to_utc(dec[applies_col])
-    dec = dec.sort_values("decision_applies_at").reset_index(drop=True)
-
-    if "macro_state" not in dec.columns:
-        warnings.append("macro_state_missing_in_decisions_used_multiplier")
-
-    dec["macro_bucket"] = [
-        _bucket_from_state_and_multiplier(state, mult)
-        for state, mult in zip(dec.get("macro_state", "OFF"), dec.get("macro_multiplier", 0.0), strict=False)
-    ]
-    dec["merge_key"] = (dec["decision_applies_at"].astype("int64") // 1_000_000_000).astype("int64")
-
-    labels = dec[["merge_key", "macro_bucket"]].drop_duplicates(subset=["merge_key"], keep="last").sort_values("merge_key")
-    aligned = pd.merge_asof(
-        eq.sort_values("merge_key"),
-        labels,
-        on="merge_key",
-        direction="backward",
-    )
-    aligned["macro_bucket"] = aligned["macro_bucket"].fillna("OFF")
-    return aligned, warnings
+    eq["macro_bucket"] = "OFF"
+    warnings.append("decisions_missing_default_off")
+    return eq, warnings
 
 
 def _label_trades_with_bucket(trades_df: pd.DataFrame | None, decisions_df: pd.DataFrame | None) -> pd.DataFrame:
@@ -165,7 +190,7 @@ def _label_trades_with_bucket(trades_df: pd.DataFrame | None, decisions_df: pd.D
     return out
 
 
-def _empty_bucket_row(bucket: str) -> dict[str, float | int | str]:
+def _empty_bucket_row(bucket: str) -> dict[str, float | int | str | None]:
     return {
         "bucket": bucket,
         "time_bars": 0,
@@ -178,6 +203,16 @@ def _empty_bucket_row(bucket: str) -> dict[str, float | int | str]:
         "turnover": 0.0,
         "trade_count": 0,
         "net_return": 0.0,
+        "fred_risk_off_score_mean": None,
+        "fred_risk_off_score_median": None,
+        "fred_vix_level_mean": None,
+        "fred_hy_oas_level_mean": None,
+        "fred_stlfsi_level_mean": None,
+        "fred_nfci_level_mean": None,
+        "fred_comp_vix_z_mean": None,
+        "fred_comp_hy_oas_z_mean": None,
+        "fred_comp_stlfsi_z_mean": None,
+        "fred_comp_nfci_z_mean": None,
     }
 
 
@@ -252,14 +287,35 @@ def compute_macro_bucket_attribution(
         initial_equity = float(bars["equity"].iloc[0]) if len(bars) else 0.0
     init_eq = max(1e-12, float(initial_equity))
 
-    grouped = bars.groupby("macro_bucket", as_index=False).agg(
-        time_bars=("macro_bucket", "size"),
-        time_hours=("time_hours", "sum"),
-        avg_exposure=("exposure", "mean"),
-        median_exposure=("exposure", "median"),
-        net_pnl=("pnl", "sum"),
-        turnover=("turnover_bar", "sum"),
-    )
+    agg_map: dict[str, tuple[str, str]] = {
+        "time_bars": ("macro_bucket", "size"),
+        "time_hours": ("time_hours", "sum"),
+        "avg_exposure": ("exposure", "mean"),
+        "median_exposure": ("exposure", "median"),
+        "net_pnl": ("pnl", "sum"),
+        "turnover": ("turnover_bar", "sum"),
+    }
+
+    if "fred_risk_off_score" in bars.columns:
+        bars["fred_risk_off_score"] = pd.to_numeric(bars["fred_risk_off_score"], errors="coerce")
+        agg_map["fred_risk_off_score_mean"] = ("fred_risk_off_score", "mean")
+        agg_map["fred_risk_off_score_median"] = ("fred_risk_off_score", "median")
+
+    for fred_col in [
+        "fred_vix_level",
+        "fred_hy_oas_level",
+        "fred_stlfsi_level",
+        "fred_nfci_level",
+        "fred_comp_vix_z",
+        "fred_comp_hy_oas_z",
+        "fred_comp_stlfsi_z",
+        "fred_comp_nfci_z",
+    ]:
+        if fred_col in bars.columns:
+            bars[fred_col] = pd.to_numeric(bars[fred_col], errors="coerce")
+            agg_map[f"{fred_col}_mean"] = (fred_col, "mean")
+
+    grouped = bars.groupby("macro_bucket", as_index=False).agg(**agg_map)
 
     grouped = grouped.merge(trade_by_bucket, left_on="macro_bucket", right_on="macro_bucket", how="left")
     grouped["fees"] = grouped.get("fees", 0.0).fillna(0.0)
@@ -267,7 +323,7 @@ def compute_macro_bucket_attribution(
     grouped["time_share"] = grouped["time_bars"].astype(float) / float(total_bars)
     grouped["net_return"] = grouped["net_pnl"].astype(float) / init_eq
 
-    rows: list[dict[str, float | int | str]] = []
+    rows: list[dict[str, float | int | str | None]] = []
     present = set(grouped["macro_bucket"].tolist())
     for bucket in BUCKETS:
         if bucket not in present:
@@ -289,6 +345,16 @@ def compute_macro_bucket_attribution(
                 "turnover": _safe_float(row.get("turnover"), 0.0),
                 "trade_count": _safe_int(row.get("trade_count"), 0),
                 "net_return": _safe_float(row.get("net_return"), 0.0),
+                "fred_risk_off_score_mean": _safe_optional_float(row.get("fred_risk_off_score_mean")),
+                "fred_risk_off_score_median": _safe_optional_float(row.get("fred_risk_off_score_median")),
+                "fred_vix_level_mean": _safe_optional_float(row.get("fred_vix_level_mean")),
+                "fred_hy_oas_level_mean": _safe_optional_float(row.get("fred_hy_oas_level_mean")),
+                "fred_stlfsi_level_mean": _safe_optional_float(row.get("fred_stlfsi_level_mean")),
+                "fred_nfci_level_mean": _safe_optional_float(row.get("fred_nfci_level_mean")),
+                "fred_comp_vix_z_mean": _safe_optional_float(row.get("fred_comp_vix_z_mean")),
+                "fred_comp_hy_oas_z_mean": _safe_optional_float(row.get("fred_comp_hy_oas_z_mean")),
+                "fred_comp_stlfsi_z_mean": _safe_optional_float(row.get("fred_comp_stlfsi_z_mean")),
+                "fred_comp_nfci_z_mean": _safe_optional_float(row.get("fred_comp_nfci_z_mean")),
             }
         )
 

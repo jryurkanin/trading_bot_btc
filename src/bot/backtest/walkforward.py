@@ -33,6 +33,31 @@ def make_windows(start: pd.Timestamp, end: pd.Timestamp, train_years: int = 3, t
     return windows
 
 
+def _set_cfg_param(cfg: BotConfig, key: str, value: Any) -> None:
+    if key == "fred_risk_weight_scale":
+        scale = float(value)
+        cfg.fred.risk_off_weights = {
+            str(k): float(v) * scale
+            for k, v in cfg.fred.risk_off_weights.items()
+        }
+        return
+
+    if "." in key:
+        obj: Any = cfg
+        parts = key.split(".")
+        for part in parts[:-1]:
+            obj = getattr(obj, part)
+        setattr(obj, parts[-1], value)
+        return
+
+    for section in [cfg.regime, cfg.execution, cfg.backtest, cfg.risk, cfg.fred]:
+        if hasattr(section, key):
+            setattr(section, key, value)
+            return
+
+    raise KeyError(f"Unknown walk-forward parameter: {key}")
+
+
 def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig, param_grid: Iterable[Dict[str, Any]], initial_equity: float = 10_000.0) -> List[WalkForwardResult]:
     # anchored walk-forward windows from 2020-2023 train -> 2024 test
     results: List[WalkForwardResult] = []
@@ -51,13 +76,20 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
     windows = make_windows(overall_start, overall_end, train_years=3, test_years=1)
 
     for p in param_grid:
-        if hasattr(cfg.regime, "model_dump"):
-            reg_dict = cfg.regime.model_dump()
-        elif hasattr(cfg.regime, "dict"):
-            reg_dict = cfg.regime.dict()
+        if hasattr(cfg, "model_dump"):
+            raw_cfg = cfg.model_dump()
+        elif hasattr(cfg, "dict"):
+            raw_cfg = cfg.dict()
         else:
-            reg_dict = dict(cfg.regime.__dict__)
-        reg_dict.update(p)
+            raw_cfg = dict(cfg.__dict__)
+
+        try:
+            cfg_for_param = BotConfig(**raw_cfg)
+            for k, v in dict(p).items():
+                _set_cfg_param(cfg_for_param, str(k), v)
+        except Exception:
+            continue
+
         # keep HMM strictly training-window only via backtest windows used
         for train_start, train_end, test_start, test_end in windows:
             hourly_train = h[(h["timestamp"] >= train_start) & (h["timestamp"] < train_end)]
@@ -68,20 +100,30 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
             if hourly_train.empty or hourly_test.empty or daily_train.empty or daily_test.empty:
                 continue
 
-            # train: just instantiate regime switcher once and run; in this scaffold training is internal to orchestrator.
-            # HMM leakage is prevented by using only test slices in each window.
-            if hasattr(cfg, "model_dump"):
-                raw_cfg = cfg.model_dump()
-            elif hasattr(cfg, "dict"):
-                raw_cfg = cfg.dict()
+            # train: run on training slice first, then evaluate on out-of-sample test slice.
+            # Feature pipelines only use values available at each bar timestamp.
+            if hasattr(cfg_for_param, "model_dump"):
+                raw_run_cfg = cfg_for_param.model_dump()
+            elif hasattr(cfg_for_param, "dict"):
+                raw_run_cfg = cfg_for_param.dict()
             else:
-                raw_cfg = dict(cfg.__dict__)
-            cfg_for_run = BotConfig(**raw_cfg)
-            try:
-                cfg_for_run.regime = type(cfg.regime)(**reg_dict)
-            except Exception:
-                continue
-            cfg_for_run.backtest = type(cfg.backtest)(start=str(train_start.date()), end=str(train_end.date()), initial_equity=initial_equity)
+                raw_run_cfg = dict(cfg_for_param.__dict__)
+
+            cfg_for_run = BotConfig(**raw_run_cfg)
+            if hasattr(cfg_for_param.backtest, "model_dump"):
+                bt_payload = cfg_for_param.backtest.model_dump()
+            elif hasattr(cfg_for_param.backtest, "dict"):
+                bt_payload = cfg_for_param.backtest.dict()
+            else:
+                bt_payload = dict(cfg_for_param.backtest.__dict__)
+            bt_payload.update(
+                {
+                    "start": str(train_start.date()),
+                    "end": str(train_end.date()),
+                    "initial_equity": initial_equity,
+                }
+            )
+            cfg_for_run.backtest = type(cfg_for_param.backtest)(**bt_payload)
 
             engine_train = BacktestEngine(
                 product=cfg.data.product,
@@ -93,6 +135,7 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 regime_config=cfg_for_run.regime,
                 risk_config=cfg_for_run.risk,
                 execution_config=cfg_for_run.execution,
+                fred_config=cfg_for_run.fred,
             )
             _ = engine_train.run()  # warm-up only
 
@@ -106,6 +149,7 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 regime_config=cfg_for_run.regime,
                 risk_config=cfg_for_run.risk,
                 execution_config=cfg_for_run.execution,
+                fred_config=cfg_for_run.fred,
             )
             result = engine_test.run()
             results.append(

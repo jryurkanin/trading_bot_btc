@@ -149,6 +149,14 @@ def clone_cfg(cfg: BotConfig) -> BotConfig:
 
 
 def set_param(cfg: BotConfig, key: str, value: Any) -> None:
+    if key == "fred_risk_weight_scale":
+        scale = float(value)
+        cfg.fred.risk_off_weights = {
+            str(k): float(v) * scale
+            for k, v in cfg.fred.risk_off_weights.items()
+        }
+        return
+
     if "." in key:
         obj: Any = cfg
         parts = key.split(".")
@@ -157,7 +165,7 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
         setattr(obj, parts[-1], value)
         return
 
-    for section in [cfg.regime, cfg.execution, cfg.backtest, cfg.risk]:
+    for section in [cfg.regime, cfg.execution, cfg.backtest, cfg.risk, cfg.fred]:
         if hasattr(section, key):
             setattr(section, key, value)
             return
@@ -209,6 +217,7 @@ def run_window(
         regime_config=cfg.regime,
         risk_config=cfg.risk,
         execution_config=cfg.execution,
+        fred_config=cfg.fred,
     )
     result = engine.run()
     eq = result.equity_curve["equity"]

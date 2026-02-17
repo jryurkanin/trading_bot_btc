@@ -158,6 +158,15 @@ class MacroOnlyV2Strategy:
         return pd.to_datetime(ts_last, utc=True)
 
     @staticmethod
+    def _latest_daily_feature(daily_df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+        if daily_df is None or daily_df.empty or column not in daily_df.columns:
+            return float(default)
+        series = pd.to_numeric(daily_df[column], errors="coerce").dropna()
+        if series.empty:
+            return float(default)
+        return float(series.iloc[-1])
+
+    @staticmethod
     def _macro_state_to_strength(state: MacroState) -> MacroStrength:
         if state == MacroState.ON_FULL:
             return MacroStrength.ON_FULL
@@ -354,9 +363,17 @@ class MacroOnlyV2Strategy:
                 raw_target=target_pre_breaker,
             )
 
+        fred_risk_off_score = self._latest_daily_feature(daily_closed, "fred_risk_off_score_smooth", default=np.nan)
+        if np.isnan(fred_risk_off_score):
+            fred_risk_off_score = self._latest_daily_feature(daily_closed, "fred_risk_off_score", default=0.0)
+        fred_penalty_multiplier = self._latest_daily_feature(daily_closed, "fred_penalty_multiplier", default=1.0)
+        fred_penalty_multiplier = max(0.0, min(1.0, float(fred_penalty_multiplier)))
+
+        target_after_fred = float(target_after_breaker) * float(fred_penalty_multiplier)
+
         # Intraday hold: do not increase target within a day; keep last observed value.
         intraday_suppressed = False
-        desired_target = target_after_breaker
+        desired_target = target_after_fred
         if not at_daily_refresh and desired_target > self._current_target:
             desired_target = self._current_target
             intraday_suppressed = True
@@ -397,6 +414,17 @@ class MacroOnlyV2Strategy:
             "base_fraction": float(base_fraction),
             "target_pre_breaker": float(target_pre_breaker),
             "target_after_breaker": float(target_after_breaker),
+            "target_after_fred": float(target_after_fred),
+            "fred_risk_off_score": float(max(0.0, min(1.0, fred_risk_off_score))),
+            "fred_penalty_multiplier": float(fred_penalty_multiplier),
+            "fred_comp_vix_z": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_z_level", default=np.nan)),
+            "fred_comp_hy_oas_z": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_z_level", default=np.nan)),
+            "fred_comp_stlfsi_z": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_z_level", default=np.nan)),
+            "fred_comp_nfci_z": float(self._latest_daily_feature(daily_closed, "fred_NFCI_z_level", default=np.nan)),
+            "fred_vix_level": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_level", default=np.nan)),
+            "fred_hy_oas_level": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_level", default=np.nan)),
+            "fred_stlfsi_level": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_level", default=np.nan)),
+            "fred_nfci_level": float(self._latest_daily_feature(daily_closed, "fred_NFCI_level", default=np.nan)),
             "macro_refresh": int(at_daily_refresh),
             "macro2_dd_enabled": int(int(self.cfg.macro2_dd_enabled)),
             "macro2_dd_active": int(self._breaker.active),

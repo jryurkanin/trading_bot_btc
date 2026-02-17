@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default=None)
+    p.add_argument("--fred-enabled", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--fred-max-risk-off-penalty", type=float, default=None)
+    p.add_argument("--fred-risk-off-score-ema-span", type=int, default=None)
+    p.add_argument("--fred-lag-stress-multiplier", type=float, default=None)
+    p.add_argument("--fred-realtime-mode", choices=["lagged_latest", "vintage_dates"], default=None)
     p.add_argument("--initial-equity", type=float, default=10_000.0)
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
@@ -111,6 +116,17 @@ def main() -> int:
     cfg.backtest.strategy = args.strategy
     if args.acceleration_backend is not None:
         cfg.backtest.acceleration_backend = args.acceleration_backend
+
+    if args.fred_enabled is not None:
+        cfg.fred.enabled = bool(args.fred_enabled)
+    if args.fred_max_risk_off_penalty is not None:
+        cfg.fred.max_risk_off_penalty = float(args.fred_max_risk_off_penalty)
+    if args.fred_risk_off_score_ema_span is not None:
+        cfg.fred.risk_off_score_ema_span = int(args.fred_risk_off_score_ema_span)
+    if args.fred_lag_stress_multiplier is not None:
+        cfg.fred.lag_stress_multiplier = float(args.fred_lag_stress_multiplier)
+    if args.fred_realtime_mode is not None:
+        cfg.fred.realtime_mode = str(args.fred_realtime_mode)
 
     # Keep macro benchmark policy behavior only.
     cfg.regime.trend_boost_enabled = False
@@ -269,6 +285,7 @@ def main() -> int:
         regime_config=cfg.regime,
         risk_config=cfg.risk,
         execution_config=cfg.execution,
+        fred_config=cfg.fred,
     )
     result = engine.run()
 
@@ -306,6 +323,10 @@ def main() -> int:
             "cuda_available": result.diagnostics.get("acceleration_cuda_available"),
             "device": result.diagnostics.get("acceleration_device"),
             "fallback_reason": result.diagnostics.get("acceleration_fallback_reason"),
+        },
+        "fred": {
+            "enabled": bool(cfg.fred.enabled),
+            **(result.diagnostics.get("fred", {}) if isinstance(result.diagnostics.get("fred"), dict) else {}),
         },
         "execution": {
             "fill_model": cfg.execution.fill_model,

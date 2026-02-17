@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..features.macro_score import MacroGateStateMachine, MacroState, compute_macro_score
+from ..features.macro_score import MacroGateStateMachine, MacroState, macro_result
 from ..config import RegimeConfig
 
 
@@ -57,7 +57,9 @@ class V4MacroGate:
                     self._cached_components,
                 )
 
-        score, components, _ = compute_macro_score(daily_closed)
+        macro = macro_result(daily_closed, self.cfg)
+        score = float(macro.score)
+        components = dict(macro.components)
         state = self._gate.step(score, daily_bar_ts)
         mult = MacroGateStateMachine.multiplier(
             state,
@@ -230,7 +232,9 @@ class AdaptiveMacroGate:
         self._vol_history.append(daily_vol)
 
         # Score and step
-        score, components, _ = compute_macro_score(daily_closed)
+        macro = macro_result(daily_closed, self.cfg)
+        score = float(macro.score)
+        components = dict(macro.components)
         state = self._gate.step(score, daily_bar_ts)
         mult = MacroGateStateMachine.multiplier(
             state,
