@@ -163,9 +163,13 @@ This writes:
 
 ### Strategy variants
 
-This bot now runs on benchmark-only strategy by default:
+Default strategy is still `macro_gate_benchmark`, and legacy strategies are now re-enabled:
 
 - `macro_gate_benchmark`: macro gate + vol-targeting without micro-regime scaling.
+- `macro_only_v2`: daily macro-only state machine with vol sizing and drawdown breaker.
+- `regime_switching_v3`: legacy orchestrator (macro + micro + sub-strategy switching).
+- `regime_switching_v4_core`: v4 core (macro gate + micro scaling).
+- `v5_adaptive`: adaptive macro gate + asymmetric micro multipliers.
 
 ```bash
 python scripts/backtest.py \

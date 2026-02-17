@@ -24,7 +24,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", required=True)
     p.add_argument("--config", default=None)
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=[
+            "macro_gate_benchmark",
+            "macro_only_v2",
+            "regime_switching_v3",
+            "regime_switching_v4_core",
+            "v5_adaptive",
+        ],
+    )
     p.add_argument("--out", default="reports")
     p.add_argument("--grid", action="append", help="KEY=VAL, can be repeated (e.g. bb_window=20)")
     p.add_argument("--metric", default="cagr")

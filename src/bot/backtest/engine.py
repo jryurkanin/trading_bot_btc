@@ -15,9 +15,11 @@ from ..features.indicators import donchian_channel, ema, atr as compute_atr, bol
 from ..acceleration.cuda_backend import resolve_acceleration_backend
 from ..features.regime import compute_adx, compute_chop
 from ..features.fred_features import build_fred_daily_overlay_features
-from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle
+from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle, RegimeSwitchingOrchestrator
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
+from ..strategy.regime_switching_v4_core import V4CoreStrategy
+from ..strategy.v5_adaptive import V5AdaptiveStrategy
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
 
@@ -213,13 +215,23 @@ class BacktestEngine:
                 )
             )
 
-        strategy_id = cfg.strategy if cfg.strategy else "macro_gate_benchmark"
+        strategy_id = str(cfg.strategy) if cfg.strategy else "macro_gate_benchmark"
         if strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
         elif strategy_id == "macro_only_v2":
             orchestrator = MacroOnlyV2Strategy(reg_cfg)
+        elif strategy_id in {"regime_switching_v3", "regime_switching_orchestrator", "regime_switching"}:
+            orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
+        elif strategy_id in {"regime_switching_v4_core", "v4_core"}:
+            orchestrator = V4CoreStrategy(reg_cfg)
+        elif strategy_id == "v5_adaptive":
+            orchestrator = V5AdaptiveStrategy(reg_cfg)
         else:
-            raise ValueError(f"Unsupported strategy '{strategy_id}'. Supported: ['macro_gate_benchmark', 'macro_only_v2']")
+            raise ValueError(
+                "Unsupported strategy "
+                f"'{strategy_id}'. Supported: ['macro_gate_benchmark', 'macro_only_v2', "
+                "'regime_switching_v3', 'regime_switching_v4_core', 'v5_adaptive']"
+            )
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
 

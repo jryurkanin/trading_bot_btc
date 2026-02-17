@@ -26,7 +26,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=[
+            "macro_gate_benchmark",
+            "macro_only_v2",
+            "regime_switching_v3",
+            "regime_switching_v4_core",
+            "v5_adaptive",
+        ],
+    )
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default=None)
     p.add_argument("--fred-enabled", action=argparse.BooleanOptionalAction, default=None)

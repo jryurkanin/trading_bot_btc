@@ -271,7 +271,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-end", default="2024-12-31T23:00:00Z")
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=[
+            "macro_gate_benchmark",
+            "macro_only_v2",
+            "regime_switching_v3",
+            "regime_switching_v4_core",
+            "v5_adaptive",
+        ],
+    )
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)

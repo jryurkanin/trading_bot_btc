@@ -446,10 +446,10 @@ class TestConfigValidation:
         bc = BacktestConfig(strategy="macro_gate_benchmark")
         assert bc.strategy == "macro_gate_benchmark"
 
-    def test_v4_core_strategy_rejected(self):
+    def test_v4_core_strategy_accepted(self):
         from bot.config import BacktestConfig
-        with pytest.raises(Exception):
-            BacktestConfig(strategy="regime_switching_v4_core")
+        bc = BacktestConfig(strategy="regime_switching_v4_core")
+        assert bc.strategy == "regime_switching_v4_core"
 
     def test_invalid_strategy_rejected(self):
         from bot.config import BacktestConfig

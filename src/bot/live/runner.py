@@ -16,6 +16,10 @@ from ..data.candles import CandleStore, CandleQuery, align_closed_candles
 from ..execution.state_store import BotStateStore
 from ..execution.risk import RiskManager, RiskState
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
+from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
+from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator
+from ..strategy.regime_switching_v4_core import V4CoreStrategy
+from ..strategy.v5_adaptive import V5AdaptiveStrategy
 from .paper import PaperTrader
 from ..execution.order_router import OrderRouter
 
@@ -34,6 +38,21 @@ class RunnerDecision:
 
 
 class LiveRunner:
+    @staticmethod
+    def _build_orchestrator(cfg: BotConfig):
+        strategy_id = str(getattr(cfg.backtest, "strategy", "macro_gate_benchmark") or "macro_gate_benchmark")
+        if strategy_id == "macro_gate_benchmark":
+            return MacroGateBenchmarkStrategy(cfg.regime)
+        if strategy_id == "macro_only_v2":
+            return MacroOnlyV2Strategy(cfg.regime)
+        if strategy_id in {"regime_switching_v3", "regime_switching_orchestrator", "regime_switching"}:
+            return RegimeSwitchingOrchestrator(cfg.regime)
+        if strategy_id in {"regime_switching_v4_core", "v4_core"}:
+            return V4CoreStrategy(cfg.regime)
+        if strategy_id == "v5_adaptive":
+            return V5AdaptiveStrategy(cfg.regime)
+        raise ValueError(f"Unsupported live strategy '{strategy_id}'")
+
     def __init__(
         self,
         cfg: BotConfig,
@@ -46,7 +65,7 @@ class LiveRunner:
         self.client = client or RESTClientWrapper(cfg.coinbase, cfg.data)
         self.state = state_store or BotStateStore(".trading_bot_cache/live_state.sqlite")
         self.store = CandleStore(cfg.data)
-        self.orchestrator = MacroGateBenchmarkStrategy(cfg.regime)
+        self.orchestrator = self._build_orchestrator(cfg)
         self.risk_mgr = RiskManager(cfg.risk)
         self.risk_state = RiskState(equity_peak=cfg.backtest.initial_equity, current_equity=cfg.backtest.initial_equity)
         self.paper_mode = paper
@@ -81,7 +100,7 @@ class LiveRunner:
                     self.risk_state.day_anchor = None
 
         saved_orchestrator = self.state.get_kv("orchestrator_runtime", {})
-        if isinstance(saved_orchestrator, dict):
+        if isinstance(saved_orchestrator, dict) and hasattr(self.orchestrator, "load_runtime_state"):
             self.orchestrator.load_runtime_state(saved_orchestrator)
 
     def _write_health(self, status: str, payload: dict[str, Any]) -> None:
@@ -381,7 +400,10 @@ class LiveRunner:
                 "kill_switch_reason": kill_reason,
             },
         )
-        self.state.set_kv("orchestrator_runtime", self.orchestrator.runtime_state())
+        if hasattr(self.orchestrator, "runtime_state"):
+            self.state.set_kv("orchestrator_runtime", self.orchestrator.runtime_state())
+        else:
+            self.state.set_kv("orchestrator_runtime", {})
 
         decision_payload = {
             "timestamp": str(now),

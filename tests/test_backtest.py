@@ -69,11 +69,21 @@ def test_backtest_runs_and_outputs_metrics():
     assert res.metrics["max_drawdown"] <= 0.0
 
 
-def test_unsupported_strategy_rejected_by_engine():
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "macro_gate_benchmark",
+        "macro_only_v2",
+        "regime_switching_v3",
+        "regime_switching_v4_core",
+        "v5_adaptive",
+    ],
+)
+def test_supported_strategies_run(strategy: str):
     hourly, daily = make_oscillating_candles()
     cfg = BotConfig()
     cfg.backtest.initial_equity = 10000
-    cfg.backtest.strategy = "macro_gate_benchmark"
+    cfg.backtest.strategy = strategy
 
     eng = BacktestEngine(
         product="BTC-USD",
@@ -84,13 +94,20 @@ def test_unsupported_strategy_rejected_by_engine():
         config=cfg.backtest,
         fees=(0.0001, 0.00025),
         slippage_bps=1.0,
+        regime_config=cfg.regime,
+        risk_config=cfg.risk,
+        execution_config=cfg.execution,
     )
     res = eng.run()
     assert not res.decisions.empty
 
+
+def test_unknown_strategy_rejected_by_engine():
+    hourly, daily = make_oscillating_candles()
     cfg = BotConfig()
     cfg.backtest.initial_equity = 10000
-    cfg.backtest.strategy = "v5_adaptive"
+    # Bypass config validation intentionally to hit engine guardrail.
+    cfg.backtest.strategy = "nonexistent_strategy"
 
     eng = BacktestEngine(
         product="BTC-USD",
