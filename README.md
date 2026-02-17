@@ -111,9 +111,9 @@ If CUDA is unavailable, the engine falls back to CPU and records the fallback re
 ### Optional FRED macro overlay
 
 FRED integration is **off by default** for safety. When enabled, it:
-- fetches public macro/financial condition series from the official FRED API,
-- caches responses locally,
-- applies conservative availability lags (daily/weekly/monthly),
+- fetches public macro/financial condition series from the official FRED API (`/series/observations`),
+- caches responses locally with retry/backoff and stable request-key hashing,
+- applies conservative availability lags (daily/weekly/monthly) before merge-asof alignment,
 - builds `fred_risk_off_score` and `fred_penalty_multiplier`,
 - scales macro score as a headwind/tailwind overlay (no micro-regime switching changes).
 
@@ -129,6 +129,13 @@ python scripts/backtest.py \
   --fred-risk-off-score-ema-span 16 \
   --fred-lag-stress-multiplier 1.0
 ```
+
+Main FRED config knobs live under `fred.*`, including:
+- `fred.realtime_mode`: `lagged_latest` (default) or `vintage_dates`
+- `fred.default_availability_lag_hours`: `{daily, weekly, monthly}`
+- `fred.max_risk_off_penalty`, `fred.risk_off_score_ema_span`
+- `fred.risk_off_weights`
+- `fred.series` registry (default file: `src/bot/data/fred_series_registry.json`)
 
 `report.json` includes a `fred` section with series provenance, lags, weights, warnings, and cache stats.
 

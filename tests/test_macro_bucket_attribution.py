@@ -73,6 +73,9 @@ def test_macro_bucket_attribution_fred_aggregates_from_decisions():
             "decision_applies_at": [ts[0], ts[2]],
             "macro_state": ["OFF", "ON_FULL"],
             "macro_multiplier": [0.0, 1.0],
+            "macro_score_raw": [0.6, 0.8],
+            "macro_score_after_fred": [0.54, 0.56],
+            "fred_penalty_multiplier": [0.9, 0.7],
             "fred_risk_off_score": [0.2, 0.8],
             "fred_comp_vix_z": [0.1, 1.1],
             "fred_vix_level": [15.0, 30.0],
@@ -91,6 +94,12 @@ def test_macro_bucket_attribution_fred_aggregates_from_decisions():
     row_off = table[table["bucket"] == "OFF"].iloc[0]
     row_full = table[table["bucket"] == "ON_FULL"].iloc[0]
 
+    assert abs(float(row_off["macro_score_raw_mean"]) - 0.6) < 1e-9
+    assert abs(float(row_full["macro_score_raw_mean"]) - 0.8) < 1e-9
+    assert abs(float(row_off["macro_score_after_fred_mean"]) - 0.54) < 1e-9
+    assert abs(float(row_full["macro_score_after_fred_mean"]) - 0.56) < 1e-9
+    assert abs(float(row_off["fred_penalty_multiplier_mean"]) - 0.9) < 1e-9
+    assert abs(float(row_full["fred_penalty_multiplier_mean"]) - 0.7) < 1e-9
     assert abs(float(row_off["fred_risk_off_score_mean"]) - 0.2) < 1e-9
     assert abs(float(row_full["fred_risk_off_score_mean"]) - 0.8) < 1e-9
     assert abs(float(row_off["fred_vix_level_mean"]) - 15.0) < 1e-9

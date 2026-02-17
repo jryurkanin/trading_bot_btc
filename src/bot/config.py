@@ -94,6 +94,14 @@ class FredConfig(BaseModel):
 
     # Data treatment
     realtime_mode: Literal["lagged_latest", "vintage_dates"] = "lagged_latest"
+    default_availability_lag_hours: dict[str, float] = Field(
+        default_factory=lambda: {
+            "daily": 24.0,
+            "weekly": float(7 * 24),
+            "monthly": float(35 * 24),
+        }
+    )
+    # backward-compatible flat keys
     default_availability_lag_hours_daily: int = 24
     default_availability_lag_hours_weekly: int = 7 * 24
     default_availability_lag_hours_monthly: int = 35 * 24
@@ -131,6 +139,26 @@ class FredConfig(BaseModel):
             return None
         out = str(value).strip()
         return out or None
+
+    @field_validator("default_availability_lag_hours", mode="before")
+    def _lag_map(cls, value: Any) -> dict[str, float]:
+        base = {
+            "daily": 24.0,
+            "weekly": float(7 * 24),
+            "monthly": float(35 * 24),
+        }
+        if not isinstance(value, dict):
+            return base
+        out = dict(base)
+        for key, raw in value.items():
+            k = str(key).strip().lower()
+            if k not in out:
+                continue
+            try:
+                out[k] = float(raw)
+            except Exception:
+                continue
+        return out
 
     @field_validator("cache_dir", mode="before")
     def _cache_dir(cls, value: Any) -> Path:

@@ -60,6 +60,8 @@ def _safe_optional_float(x: float | int | np.floating | None) -> float | None:
 
 
 FRED_DECISION_FIELDS = [
+    "macro_score_raw",
+    "macro_score_after_fred",
     "fred_risk_off_score",
     "fred_penalty_multiplier",
     "fred_comp_vix_z",
@@ -203,6 +205,9 @@ def _empty_bucket_row(bucket: str) -> dict[str, float | int | str | None]:
         "turnover": 0.0,
         "trade_count": 0,
         "net_return": 0.0,
+        "macro_score_raw_mean": None,
+        "macro_score_after_fred_mean": None,
+        "fred_penalty_multiplier_mean": None,
         "fred_risk_off_score_mean": None,
         "fred_risk_off_score_median": None,
         "fred_vix_level_mean": None,
@@ -296,6 +301,18 @@ def compute_macro_bucket_attribution(
         "turnover": ("turnover_bar", "sum"),
     }
 
+    if "macro_score_raw" in bars.columns:
+        bars["macro_score_raw"] = pd.to_numeric(bars["macro_score_raw"], errors="coerce")
+        agg_map["macro_score_raw_mean"] = ("macro_score_raw", "mean")
+
+    if "macro_score_after_fred" in bars.columns:
+        bars["macro_score_after_fred"] = pd.to_numeric(bars["macro_score_after_fred"], errors="coerce")
+        agg_map["macro_score_after_fred_mean"] = ("macro_score_after_fred", "mean")
+
+    if "fred_penalty_multiplier" in bars.columns:
+        bars["fred_penalty_multiplier"] = pd.to_numeric(bars["fred_penalty_multiplier"], errors="coerce")
+        agg_map["fred_penalty_multiplier_mean"] = ("fred_penalty_multiplier", "mean")
+
     if "fred_risk_off_score" in bars.columns:
         bars["fred_risk_off_score"] = pd.to_numeric(bars["fred_risk_off_score"], errors="coerce")
         agg_map["fred_risk_off_score_mean"] = ("fred_risk_off_score", "mean")
@@ -345,6 +362,9 @@ def compute_macro_bucket_attribution(
                 "turnover": _safe_float(row.get("turnover"), 0.0),
                 "trade_count": _safe_int(row.get("trade_count"), 0),
                 "net_return": _safe_float(row.get("net_return"), 0.0),
+                "macro_score_raw_mean": _safe_optional_float(row.get("macro_score_raw_mean")),
+                "macro_score_after_fred_mean": _safe_optional_float(row.get("macro_score_after_fred_mean")),
+                "fred_penalty_multiplier_mean": _safe_optional_float(row.get("fred_penalty_multiplier_mean")),
                 "fred_risk_off_score_mean": _safe_optional_float(row.get("fred_risk_off_score_mean")),
                 "fred_risk_off_score_median": _safe_optional_float(row.get("fred_risk_off_score_median")),
                 "fred_vix_level_mean": _safe_optional_float(row.get("fred_vix_level_mean")),

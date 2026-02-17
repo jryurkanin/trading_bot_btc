@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 import hashlib
 import json
 import logging
@@ -32,6 +32,10 @@ class FredCacheStats:
 
 class FredClient:
     """Thin FRED v2 client with local file cache + retry/backoff."""
+
+    # Parameters that should never be persisted in cache metadata or used for
+    # cache identity.
+    _SENSITIVE_PARAMS = {"api_key"}
 
     def __init__(
         self,
@@ -62,11 +66,38 @@ class FredClient:
     # Cache helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _cache_key(params: dict[str, Any]) -> str:
+    @classmethod
+    def _sanitize_cache_params(cls, params: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in params.items():
+            k = str(key)
+            if k in cls._SENSITIVE_PARAMS:
+                continue
+            out[k] = value
+        return out
+
+    @classmethod
+    def _cache_key(cls, params: dict[str, Any], *, include_sensitive: bool = False) -> str:
         # Stable deterministic hash over sorted JSON payload.
-        payload = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+        payload_params = dict(params)
+        if not include_sensitive:
+            payload_params = cls._sanitize_cache_params(payload_params)
+        payload = json.dumps(payload_params, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _cache_keys_for_lookup(cls, params: dict[str, Any]) -> list[str]:
+        """Return preferred cache key(s), including legacy fallback.
+
+        Older cache files used keys that included sensitive values such as
+        ``api_key``. We now omit sensitive fields but still load legacy cache
+        files to preserve continuity.
+        """
+        primary = cls._cache_key(params, include_sensitive=False)
+        legacy = cls._cache_key(params, include_sensitive=True)
+        if legacy == primary:
+            return [primary]
+        return [primary, legacy]
 
     def _cache_paths(self, series_id: str, cache_key: str) -> tuple[Path, Path]:
         safe_series = "".join(c for c in str(series_id) if c.isalnum() or c in {"_", "-"})
@@ -92,45 +123,45 @@ class FredClient:
         return age_hours <= self.cache_ttl_hours
 
     def _load_cache(self, series_id: str, params: dict[str, Any]) -> Optional[pd.DataFrame]:
-        key = self._cache_key(params)
-        csv_path, meta_path = self._cache_paths(series_id, key)
-        if not csv_path.exists() or not meta_path.exists():
-            self.stats.cache_misses += 1
-            return None
+        for key in self._cache_keys_for_lookup(params):
+            csv_path, meta_path = self._cache_paths(series_id, key)
+            if not csv_path.exists() or not meta_path.exists():
+                continue
 
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            self.stats.cache_misses += 1
-            return None
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
 
-        if not self._cache_is_fresh(meta):
-            self.stats.cache_misses += 1
-            return None
+            if not self._cache_is_fresh(meta):
+                continue
 
-        try:
-            df = pd.read_csv(csv_path)
-            if not df.empty:
-                df["observation_date"] = pd.to_datetime(df["observation_date"], utc=True, errors="coerce")
-                if "realtime_start" in df.columns:
-                    df["realtime_start"] = pd.to_datetime(df["realtime_start"], utc=True, errors="coerce")
-                if "realtime_end" in df.columns:
-                    df["realtime_end"] = pd.to_datetime(df["realtime_end"], utc=True, errors="coerce")
-                df["value"] = pd.to_numeric(df.get("value"), errors="coerce")
-                df = df.dropna(subset=["observation_date", "value"]).sort_values("observation_date")
-            self.stats.cache_hits += 1
-            return df
-        except Exception:
-            self.stats.cache_misses += 1
-            return None
+            try:
+                df = pd.read_csv(csv_path)
+                if not df.empty:
+                    df["observation_date"] = pd.to_datetime(df["observation_date"], utc=True, errors="coerce")
+                    if "realtime_start" in df.columns:
+                        df["realtime_start"] = pd.to_datetime(df["realtime_start"], utc=True, errors="coerce")
+                    if "realtime_end" in df.columns:
+                        df["realtime_end"] = pd.to_datetime(df["realtime_end"], utc=True, errors="coerce")
+                    df["value"] = pd.to_numeric(df.get("value"), errors="coerce")
+                    df = df.dropna(subset=["observation_date", "value"]).sort_values("observation_date")
+                self.stats.cache_hits += 1
+                return df
+            except Exception:
+                continue
+
+        self.stats.cache_misses += 1
+        return None
 
     def _save_cache(self, series_id: str, params: dict[str, Any], df: pd.DataFrame) -> None:
-        key = self._cache_key(params)
+        cache_params = self._sanitize_cache_params(params)
+        key = self._cache_key(cache_params, include_sensitive=False)
         csv_path, meta_path = self._cache_paths(series_id, key)
         payload = {
             "series_id": series_id,
             "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-            "params": params,
+            "params": cache_params,
             "rows": int(len(df)),
         }
         out = df.copy()
@@ -246,7 +277,18 @@ class FredClient:
         if out.empty:
             out = pd.DataFrame(columns=["observation_date", "value", "realtime_start", "realtime_end"])
         else:
-            out = out.sort_values("observation_date").drop_duplicates(subset=["observation_date"], keep="last")
+            out = out.sort_values(["observation_date", "realtime_start", "realtime_end"])
+
+            # lagged_latest mode (default) should keep latest known revisions.
+            # vintage/output modes should bias toward earliest vintages.
+            is_latest_mode = (
+                int(output_type) == 1
+                and realtime_start is None
+                and realtime_end is None
+                and vintage_dates is None
+            )
+            keep_mode = "last" if is_latest_mode else "first"
+            out = out.drop_duplicates(subset=["observation_date"], keep=keep_mode)
 
         self._save_cache(series_id, params, out)
         return out
