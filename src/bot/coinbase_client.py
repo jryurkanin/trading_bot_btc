@@ -246,6 +246,43 @@ class RESTClientWrapper:
             return dict(resp.__dict__)
         return resp
 
+    @staticmethod
+    def _sdk_public_candle_granularity(value: Any) -> Any:
+        mapping = {
+            "1h": "ONE_HOUR",
+            "hour": "ONE_HOUR",
+            "3600": "ONE_HOUR",
+            "one_hour": "ONE_HOUR",
+            "1d": "ONE_DAY",
+            "day": "ONE_DAY",
+            "86400": "ONE_DAY",
+            "one_day": "ONE_DAY",
+        }
+        raw = str(value).strip()
+        key = raw.lower()
+        if raw in {"ONE_HOUR", "ONE_DAY"}:
+            return raw
+        return mapping.get(key, value)
+
+    @staticmethod
+    def _sdk_public_candle_ts(value: Any) -> Any:
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, datetime):
+            ts = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return int(ts.timestamp())
+        if isinstance(value, str):
+            try:
+                ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                else:
+                    ts = ts.astimezone(timezone.utc)
+                return int(ts.timestamp())
+            except Exception:
+                return value
+        return value
+
     def _sdk_request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_payload: Optional[Dict[str, Any]] = None) -> Any:
         # Minimal compatibility shim. Exact method names differ across sdk versions.
         payload = json_payload or {}
@@ -264,7 +301,11 @@ class RESTClientWrapper:
                 return self._normalize_sdk_response(fn(**params))
             if hasattr(self._sdk_client, "get_public_candles"):
                 fn = getattr(self._sdk_client, "get_public_candles")
-                return self._normalize_sdk_response(fn(**params))
+                sdk_params = dict(params)
+                sdk_params["granularity"] = self._sdk_public_candle_granularity(sdk_params.get("granularity"))
+                sdk_params["start"] = self._sdk_public_candle_ts(sdk_params.get("start"))
+                sdk_params["end"] = self._sdk_public_candle_ts(sdk_params.get("end"))
+                return self._normalize_sdk_response(fn(**sdk_params))
             raise AttributeError("SDK candle endpoint missing")
 
         if method == "GET" and path == "/products/{product_id}/candles":
@@ -273,7 +314,11 @@ class RESTClientWrapper:
                 return self._normalize_sdk_response(fn(**params))
             if hasattr(self._sdk_client, "get_public_candles"):
                 fn = getattr(self._sdk_client, "get_public_candles")
-                return self._normalize_sdk_response(fn(**params))
+                sdk_params = dict(params)
+                sdk_params["granularity"] = self._sdk_public_candle_granularity(sdk_params.get("granularity"))
+                sdk_params["start"] = self._sdk_public_candle_ts(sdk_params.get("start"))
+                sdk_params["end"] = self._sdk_public_candle_ts(sdk_params.get("end"))
+                return self._normalize_sdk_response(fn(**sdk_params))
             raise AttributeError("SDK candle endpoint missing")
 
         if method == "GET" and path.startswith("/products/") and path.endswith("/book"):
