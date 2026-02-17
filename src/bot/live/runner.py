@@ -249,7 +249,18 @@ class LiveRunner:
 
     def step_once(self, cycle_index: int = 0) -> RunnerDecision:
         now = pd.Timestamp.now(tz="UTC").floor("h")
-        hourly = self._get_candles(self.cfg.data.product, "1h", lookback_hours=720)
+        # Need enough hourly history for realized vol and regime indicators,
+        # and enough daily history for SMA200 (200d), momentum (365d), and
+        # FRED z-score (252d) warmup.
+        daily_lookback_days = max(
+            400,
+            int(getattr(self.cfg.regime, "mom_12m_days", 365) or 365) + 30,
+            int(getattr(self.cfg.regime, "vol_lookback_days", 365) or 365) + 30,
+            int(getattr(self.cfg.fred, "daily_z_lookback", 252) or 252) + 30,
+        )
+        hourly_lookback_hours = max(720, daily_lookback_days * 24)
+
+        hourly = self._get_candles(self.cfg.data.product, "1h", lookback_hours=hourly_lookback_hours)
 
         if hourly.empty:
             self._alert("no_hourly_data", {"cycle": cycle_index})
@@ -260,12 +271,12 @@ class LiveRunner:
         if age_min > self.cfg.runtime.stale_feed_alert_minutes:
             self._alert("stale_hourly_feed", {"age_minutes": age_min})
 
-        # ensure latest daily data
+        # ensure latest daily data with full warmup history
         if self.last_daily_update is None or self.last_daily_update.date() != now.date():
-            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=90 * 24)
+            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
             self.last_daily_update = now
         else:
-            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=90 * 24)
+            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
 
         current_hourly = hourly.copy()
         latest_close = float(current_hourly["close"].iloc[-1])

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import sys
+
+import pandas as pd
 
 # Make local src discoverable when running directly from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
@@ -106,6 +108,18 @@ def parse_ts(raw: str) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+def _prefetch_start(start: datetime, cfg: BotConfig) -> datetime:
+    # Keep enough history for no-lookahead warmup of daily and hourly rolling
+    # features (macro momentum/SMA, vol quantiles, and optional FRED z-scores).
+    warmup_days = max(
+        400,
+        int(getattr(cfg.regime, "mom_12m_days", 365) or 365) + 30,
+        int(getattr(cfg.regime, "vol_lookback_days", 365) or 365) + 30,
+        int(getattr(cfg.fred, "daily_z_lookback", 252) or 252) + 30,
+    )
+    return start - timedelta(days=warmup_days)
 
 
 def main() -> int:
@@ -246,6 +260,7 @@ def main() -> int:
     store = CandleStore(cfg.data)
     start = parse_ts(args.start)
     end = parse_ts(args.end)
+    prefetch_start = _prefetch_start(start, cfg)
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     maker = args.maker_bps / 10000.0
@@ -264,12 +279,12 @@ def main() -> int:
     hourly_tf = args.tf if args.tf in {"1h", "1d"} else "1h"
     hourly = store.get_candles(
         client=client,
-        query=CandleQuery(product=args.product, timeframe=hourly_tf, start=start, end=end),
+        query=CandleQuery(product=args.product, timeframe=hourly_tf, start=prefetch_start, end=end),
     )
-    # keep a daily context for regime and risk overlays
+    # Keep long daily context for macro state and FRED z-score warmups.
     daily = store.get_candles(
         client=client,
-        query=CandleQuery(product=args.product, timeframe="1d", start=start, end=end),
+        query=CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end),
     )
 
     engine = BacktestEngine(
@@ -292,14 +307,34 @@ def main() -> int:
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
-    result.equity_curve.to_csv(out / "equity_curve.csv", index=True)
-    result.trades.to_csv(out / "trades.csv", index=False)
-    result.decisions.to_csv(out / "decisions.csv", index=True)
+    equity_csv = out / "equity_curve.csv"
+    trades_csv = out / "trades.csv"
+    decisions_csv = out / "decisions.csv"
+
+    result.equity_curve.to_csv(equity_csv, index=True)
+    result.trades.to_csv(trades_csv, index=False)
+    result.decisions.to_csv(decisions_csv, index=True)
+
+    # Re-load persisted artifacts for attribution to normalize dtypes across
+    # timezone/object edge cases and keep report/csv outputs consistent.
+    eq_for_attr = pd.read_csv(equity_csv, parse_dates=["timestamp"]).set_index("timestamp")
+
+    dec_for_attr = pd.read_csv(decisions_csv)
+    if "timestamp" in dec_for_attr.columns:
+        dec_for_attr["timestamp"] = pd.to_datetime(dec_for_attr["timestamp"], utc=True, errors="coerce")
+    if "decision_applies_at" in dec_for_attr.columns:
+        dec_for_attr["decision_applies_at"] = pd.to_datetime(dec_for_attr["decision_applies_at"], utc=True, errors="coerce")
+    if "timestamp" in dec_for_attr.columns:
+        dec_for_attr = dec_for_attr.set_index("timestamp")
+
+    tr_for_attr = pd.read_csv(trades_csv)
+    if "ts" in tr_for_attr.columns:
+        tr_for_attr["ts"] = pd.to_datetime(tr_for_attr["ts"], utc=True, errors="coerce")
 
     macro_bucket_report, macro_bucket_table = compute_macro_bucket_attribution(
-        result.equity_curve,
-        result.decisions,
-        result.trades,
+        eq_for_attr,
+        dec_for_attr,
+        tr_for_attr,
         initial_equity=cfg.backtest.initial_equity,
     )
     macro_bucket_csv = out / "macro_bucket_attribution.csv"

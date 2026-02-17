@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
@@ -90,12 +91,27 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
         except Exception:
             continue
 
-        # keep HMM strictly training-window only via backtest windows used
+        # Warmup: include pre-window history for feature warmup (SMA200,
+        # momentum, FRED z-scores, etc.) — mirror the _prefetch_start logic
+        # used by all script-level entrypoints.
+        warmup_days = max(
+            400,
+            int(getattr(cfg_for_param.regime, "mom_12m_days", 365) or 365) + 30,
+            int(getattr(cfg_for_param.regime, "vol_lookback_days", 365) or 365) + 30,
+            int(getattr(cfg_for_param.fred, "daily_z_lookback", 252) or 252) + 30,
+        )
+        warmup_td = timedelta(days=warmup_days)
+
         for train_start, train_end, test_start, test_end in windows:
-            hourly_train = h[(h["timestamp"] >= train_start) & (h["timestamp"] < train_end)]
-            daily_train = d[(d["timestamp"] >= train_start) & (d["timestamp"] < train_end)]
-            hourly_test = h[(h["timestamp"] >= test_start) & (h["timestamp"] < test_end)]
-            daily_test = d[(d["timestamp"] >= test_start) & (d["timestamp"] < test_end)]
+            # Include warmup history before each window start so the engine
+            # can compute rolling features without defaulting to zero/OFF.
+            train_prefetch = train_start - warmup_td
+            test_prefetch = test_start - warmup_td
+
+            hourly_train = h[(h["timestamp"] >= train_prefetch) & (h["timestamp"] < train_end)]
+            daily_train = d[(d["timestamp"] >= train_prefetch) & (d["timestamp"] < train_end)]
+            hourly_test = h[(h["timestamp"] >= test_prefetch) & (h["timestamp"] < test_end)]
+            daily_test = d[(d["timestamp"] >= test_prefetch) & (d["timestamp"] < test_end)]
 
             if hourly_train.empty or hourly_test.empty or daily_train.empty or daily_test.empty:
                 continue

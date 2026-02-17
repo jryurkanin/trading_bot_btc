@@ -92,10 +92,10 @@ class BacktestEngine:
                 return ts.tz_localize("UTC")
             return ts.tz_convert("UTC")
 
-        if self.start:
-            start_ts = _utc_ts(self.start)
-            hourly = hourly[hourly["timestamp"] >= start_ts]
-            daily = daily[daily["timestamp"] >= start_ts]
+        trade_start_ts = _utc_ts(self.start) if self.start else None
+
+        # Keep pre-start history for feature warmup (daily macro + hourly rolling
+        # indicators), but only execute trades for bars with exec_ts >= start.
         if self.end:
             end_ts = _utc_ts(self.end)
             hourly = hourly[hourly["timestamp"] <= end_ts]
@@ -135,6 +135,15 @@ class BacktestEngine:
 
         if len(hourly) < 2:
             raise ValueError("Need at least 2 hourly candles for no-lookahead fill simulation")
+
+        if trade_start_ts is not None:
+            start_i = int(hourly.index.searchsorted(trade_start_ts, side="left"))
+            start_i = max(1, start_i)
+        else:
+            start_i = 1
+
+        if start_i >= len(hourly):
+            raise ValueError("No hourly candles in backtest window")
 
         # Precompute heavy regime inputs once so the backtest loop is O(n),
         # not O(n^2) from repeatedly recomputing rolling features.
@@ -250,8 +259,9 @@ class BacktestEngine:
             except Exception:
                 return float(default)
 
-        # Iterate on signal bar t and fill on bar t+1
-        for i in range(1, len(hourly)):
+        # Iterate on signal bar t and fill on bar t+1. Use pre-start bars as
+        # feature warmup context, but only execute/evaluate bars from start_i.
+        for i in range(start_i, len(hourly)):
             signal_ts = hourly.index[i - 1]
             exec_ts = hourly.index[i]
             bar_t = hourly.iloc[i - 1]

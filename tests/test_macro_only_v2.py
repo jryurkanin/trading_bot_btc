@@ -294,4 +294,8 @@ def test_macro_only_v2_strategy_end_to_end_bundle_fields():
     assert json.loads(json.dumps(metadata))
     assert metadata["signal_mode"] == "sma200_and_mom"
     assert "macro_state" in metadata
+    assert "macro_multiplier" in metadata
+    assert "macro_score_raw" in metadata
+    assert "macro_score_after_fred" in metadata
+    assert float(metadata["macro_score_after_fred"]) <= float(metadata["macro_score_raw"]) + 1e-12
     assert "macro2_target_ann_vol" in metadata

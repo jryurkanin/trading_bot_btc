@@ -6,7 +6,7 @@ import csv
 import itertools
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 import statistics
@@ -72,6 +72,16 @@ def parse_ts(raw: str) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+def _prefetch_start(start: datetime, cfg: BotConfig) -> datetime:
+    warmup_days = max(
+        400,
+        int(getattr(cfg.regime, "mom_12m_days", 365) or 365) + 30,
+        int(getattr(cfg.regime, "vol_lookback_days", 365) or 365) + 30,
+        int(getattr(cfg.fred, "daily_z_lookback", 252) or 252) + 30,
+    )
+    return start - timedelta(days=warmup_days)
 
 
 def parse_grid_values(raw: str) -> list[Any]:
@@ -291,6 +301,7 @@ def main() -> int:
 
     start = parse_ts(args.start)
     end = parse_ts(args.end)
+    prefetch_start = _prefetch_start(start, cfg)
     test_end = parse_ts(args.test_end) if args.test_end else end
 
     windows = [
@@ -301,8 +312,8 @@ def main() -> int:
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     store = CandleStore(cfg.data)
-    hourly = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1h", start=start, end=end))
-    daily = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1d", start=start, end=end))
+    hourly = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1h", start=prefetch_start, end=end))
+    daily = store.get_candles(client=client, query=CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end))
 
     base_maker_rate = args.maker_bps / 10_000.0
     base_taker_rate = args.taker_bps / 10_000.0

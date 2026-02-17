@@ -390,11 +390,25 @@ class MacroOnlyV2Strategy:
             MacroState.ON_FULL: self.cfg.macro2_weight_full,
         }.get(macro_state, 0.0))
 
+        # Macro-only strategy is discrete-state based (OFF/HALF/FULL) rather than
+        # continuous score based. Emit a normalized score proxy for diagnostics so
+        # downstream reporting can compare pre/post-FRED overlay consistently.
+        macro_score_raw = float({
+            MacroState.OFF: 0.0,
+            MacroState.ON_HALF: 0.5,
+            MacroState.ON_FULL: 1.0,
+        }.get(macro_state, 0.0))
+        macro_score_after_fred = float(max(0.0, min(1.0, macro_score_raw * fred_penalty_multiplier)))
+
         metadata: Dict[str, float | str | int] = {
             "signal_mode": str(getattr(self.cfg, "macro2_signal_mode", "")),
             "macro_signal": daily_signal.value,
             "macro_state": macro_state.value,
             "macro_state_weight": macro_mult,
+            "macro_multiplier": macro_mult,
+            "macro_score": macro_score_after_fred,
+            "macro_score_raw": macro_score_raw,
+            "macro_score_after_fred": macro_score_after_fred,
             "macro_reason": macro_reason,
             "macro2_signal_rank": int({
                 MacroStrength.OFF: 0,

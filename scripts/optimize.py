@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from itertools import product
 from pathlib import Path
 import sys
@@ -36,6 +36,16 @@ def parse_ts(raw: str) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+def _prefetch_start(start: datetime, cfg: BotConfig) -> datetime:
+    warmup_days = max(
+        400,
+        int(getattr(cfg.regime, "mom_12m_days", 365) or 365) + 30,
+        int(getattr(cfg.regime, "vol_lookback_days", 365) or 365) + 30,
+        int(getattr(cfg.fred, "daily_z_lookback", 252) or 252) + 30,
+    )
+    return start - timedelta(days=warmup_days)
 
 
 def build_grid(items: list[str]):
@@ -89,11 +99,12 @@ def main() -> int:
     cfg.regime.trend_boost_enabled = False
     start = parse_ts(args.start)
     end = parse_ts(args.end)
+    prefetch_start = _prefetch_start(start, cfg)
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     store = CandleStore(cfg.data)
-    hourly = store.get_candles(client, CandleQuery(product=args.product, timeframe="1h", start=start, end=end))
-    daily = store.get_candles(client, CandleQuery(product=args.product, timeframe="1d", start=start, end=end))
+    hourly = store.get_candles(client, CandleQuery(product=args.product, timeframe="1h", start=prefetch_start, end=end))
+    daily = store.get_candles(client, CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end))
 
     grid = build_grid(args.grid or [])
     if not grid:
