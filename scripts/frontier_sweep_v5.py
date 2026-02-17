@@ -573,7 +573,7 @@ def main() -> int:
         )
 
         repro_cmd = (
-            f"python3 scripts/backtest.py --product {args.product} "
+            f"python3.14 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or args.end} "
             f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"

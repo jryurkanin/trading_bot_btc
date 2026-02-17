@@ -452,6 +452,14 @@ def main() -> int:
         if worst_turnover > args.turnover_max:
             continue
 
+        full_share_min = min(
+            float(bench_base.get("macro_full_time_share", 0.0) or 0.0),
+            float(bench_s1.get("macro_full_time_share", 0.0) or 0.0),
+            float(bench_s2.get("macro_full_time_share", 0.0) or 0.0),
+        )
+        if full_share_min < args.min_full_time_share:
+            continue
+
         cagr_vals = [
             float(bench_base.get("cagr", 0.0) or 0.0),
             float(bench_s1.get("cagr", 0.0) or 0.0),
@@ -481,6 +489,7 @@ def main() -> int:
                     float(bench_s1.get("max_drawdown", 0.0) or 0.0),
                     float(bench_s2.get("max_drawdown", 0.0) or 0.0),
                 ),
+                "val_full_time_share_min": full_share_min,
                 "test_cagr_stress_1": float((bench_test.get("stress_1") or {}).get("cagr", 0.0) or 0.0),
                 "test_sharpe_stress_1": float((bench_test.get("stress_1") or {}).get("sharpe", 0.0) or 0.0),
                 "test_max_drawdown_stress_1": float((bench_test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0),
@@ -529,7 +538,7 @@ def main() -> int:
         )
 
         repro_cmd = (
-            f"python3 scripts/backtest.py --product {args.product} "
+            f"python3.14 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or args.end} "
             f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"

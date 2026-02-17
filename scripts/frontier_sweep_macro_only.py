@@ -343,7 +343,7 @@ def run_window(
         config=cfg.backtest,
         fees=(maker_rate, taker_rate),
         slippage_bps=cfg.backtest.slippage_bps,
-        use_spread_slippage=cfg.backtest.use_spread_slashing if hasattr(cfg.backtest, "use_spread_slashing") else cfg.backtest.use_spread_slippage,
+        use_spread_slippage=cfg.backtest.use_spread_slippage,
         regime_config=cfg.regime,
         risk_config=cfg.risk,
         execution_config=cfg.execution,
@@ -726,7 +726,7 @@ def main() -> int:
 
         test_benchmark = grouped.get(best.get("param_id", ""), {}).get("test", {}).get("stress_1")
         test_repro = (
-            f"python3 scripts/backtest.py --product {args.product} "
+            f"python3.14 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or end.isoformat().replace('+00:00', 'Z')} "
             f"--strategy macro_only_v2 --config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )

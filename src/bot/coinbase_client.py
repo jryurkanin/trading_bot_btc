@@ -482,7 +482,10 @@ class RESTClientWrapper:
                     last_ts = int(float(last_ts))
                 except Exception:
                     last_ts = 0
-            next_candidate = datetime.fromtimestamp(last_ts) + timedelta(seconds=self._granularity_seconds(timeframe))
+            # Keep pagination in UTC regardless of host local timezone.
+            next_candidate = datetime.fromtimestamp(last_ts, tz=timezone.utc).replace(tzinfo=None) + timedelta(
+                seconds=self._granularity_seconds(timeframe)
+            )
             if prev_start is not None and next_candidate <= prev_start:
                 # no forward progress from provider payload; avoid infinite loop
                 break
