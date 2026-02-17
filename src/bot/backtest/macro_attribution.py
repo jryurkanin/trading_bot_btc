@@ -10,7 +10,30 @@ BUCKETS = ("OFF", "ON_HALF", "ON_FULL")
 
 
 def _to_utc(series_or_index: pd.Series | pd.Index) -> pd.Series:
-    return pd.to_datetime(series_or_index, utc=True)
+    """Normalize timestamps to tz-aware UTC with datetime64[ns, UTC] dtype.
+
+    Handles edge cases where in-memory DataFrames contain pd.Timestamp objects
+    as object dtype that may not convert cleanly via a single pd.to_datetime call.
+    """
+    out = pd.to_datetime(series_or_index, utc=True, errors="coerce")
+    # Force concrete datetime64[ns, UTC] dtype even when input was object-typed
+    # pd.Timestamp instances — avoids merge_key mismatches between callers
+    # that load from CSV vs pass in-memory frames.
+    if not hasattr(out.dtype, "tz") or out.dtype.tz is None:
+        out = out.dt.tz_localize("UTC")
+    return out
+
+
+def _epoch_seconds(ts_series: pd.Series) -> pd.Series:
+    """Convert a UTC-normalized timestamp series to epoch seconds (int64).
+
+    Handles both tz-aware datetime64[ns, UTC] and object-typed pd.Timestamp
+    series by going through _to_utc first for safety.
+    """
+    utc = _to_utc(ts_series)
+    # .view("int64") avoids dtype-conversion ambiguities with .astype("int64")
+    # on mixed tz-aware / tz-naive inputs.
+    return (utc.values.view("int64") // 1_000_000_000).astype("int64")
 
 
 def _bucket_from_state_and_multiplier(state: str | float | int | None, multiplier: float | int | None) -> str:
@@ -84,7 +107,7 @@ def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.D
     eq = equity_curve.copy().reset_index().rename(columns={equity_curve.index.name or "index": "timestamp"})
     eq["timestamp"] = _to_utc(eq["timestamp"])
     eq = eq.sort_values("timestamp").reset_index(drop=True)
-    eq["merge_key"] = (eq["timestamp"].astype("int64") // 1_000_000_000).astype("int64")
+    eq["merge_key"] = _epoch_seconds(eq["timestamp"])
 
     if decisions_df is not None and not decisions_df.empty:
         dec = decisions_df.copy()
@@ -103,7 +126,7 @@ def _align_bars_with_macro_bucket(equity_curve: pd.DataFrame, decisions_df: pd.D
             _bucket_from_state_and_multiplier(state, mult)
             for state, mult in zip(dec.get("macro_state", "OFF"), dec.get("macro_multiplier", 0.0), strict=False)
         ]
-        dec["merge_key"] = (dec["decision_applies_at"].astype("int64") // 1_000_000_000).astype("int64")
+        dec["merge_key"] = _epoch_seconds(dec["decision_applies_at"])
 
         keep_cols = ["merge_key", "macro_bucket"] + [c for c in FRED_DECISION_FIELDS if c in dec.columns]
         labels = dec[keep_cols].drop_duplicates(subset=["merge_key"], keep="last").sort_values("merge_key")
@@ -271,7 +294,7 @@ def compute_macro_bucket_attribution(
     # turnover from notional/equity_prev on execution bars if trade table has timestamps.
     if not trades_labeled.empty and "ts" in trades_labeled.columns:
         exec_flow = trades_labeled[["ts", "notional"]].copy()
-        exec_flow["merge_key"] = (exec_flow["ts"].astype("int64") // 1_000_000_000).astype("int64")
+        exec_flow["merge_key"] = _epoch_seconds(exec_flow["ts"])
         bar_merge = bars[["merge_key", "timestamp", "equity"]].copy()
         bar_merge = bar_merge.sort_values("merge_key")
         flow_aligned = pd.merge_asof(
