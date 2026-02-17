@@ -15,6 +15,7 @@ from ..config import BotConfig
 from ..data.candles import CandleStore, CandleQuery, align_closed_candles
 from ..execution.state_store import BotStateStore
 from ..execution.risk import RiskManager, RiskState
+from ..features.fred_features import build_fred_daily_overlay_features
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
 from ..strategy.regime_switching_orchestrator import RegimeSwitchingOrchestrator
@@ -74,6 +75,12 @@ class LiveRunner:
         self.paper_trader = PaperTrader(self.state, cfg.execution.maker_bps, cfg.execution.taker_bps, cfg.execution.max_slippage_bps, cfg.execution.spread_bps)
         self.order_router = OrderRouter(self.client, cfg.execution)
         self.last_daily_update: Optional[pd.Timestamp] = None
+        self._daily_features_cache: Optional[pd.DataFrame] = None
+        self._daily_features_day: Optional[pd.Timestamp] = None
+        self._last_fred_report: dict[str, Any] = {
+            "enabled": bool(getattr(cfg.fred, "enabled", False)),
+            "warnings": [],
+        }
 
         self.summary_path = Path(cfg.backtest.output_dir) / "daily_summary.log"
         self.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,9 +144,59 @@ class LiveRunner:
             end = now
         df = self.store.get_candles(
             self.client,
-            CandleQuery(product=product, timeframe=timeframe, start=start.to_pydatetime(), end=end.to_pydatetime(), force_refresh=False),
+            CandleQuery(
+                product=product,
+                timeframe=timeframe,
+                start=start.to_pydatetime(),
+                end=end.to_pydatetime(),
+                force_refresh=bool(getattr(self.cfg.data, "force_refresh", False)),
+            ),
         )
         return align_closed_candles(df, timeframe)
+
+    def _apply_live_fred_overlay(self, daily_df: pd.DataFrame) -> pd.DataFrame:
+        if daily_df is None or daily_df.empty or not bool(getattr(self.cfg.fred, "enabled", False)):
+            self._last_fred_report = {
+                "enabled": bool(getattr(self.cfg.fred, "enabled", False)),
+                "warnings": [],
+            }
+            return daily_df
+
+        try:
+            fred_build = build_fred_daily_overlay_features(daily_df, self.cfg.fred)
+            self._last_fred_report = dict(fred_build.report)
+            return fred_build.daily_features
+        except Exception as exc:
+            logger.warning("live FRED overlay build failed; continuing without FRED features: %s", exc)
+            self._last_fred_report = {
+                "enabled": True,
+                "series_used": [],
+                "warnings": [f"fred_overlay_failed:{exc.__class__.__name__}"],
+            }
+            return daily_df
+
+    def _get_daily_features(self, product: str, lookback_days: int, now: pd.Timestamp) -> pd.DataFrame:
+        force_refresh = bool(getattr(self.cfg.data, "force_refresh", False))
+        refresh_needed = (
+            force_refresh
+            or self._daily_features_cache is None
+            or self._daily_features_day is None
+            or self._daily_features_day.date() != now.date()
+        )
+
+        if refresh_needed:
+            daily_raw = self._get_candles(product, "1d", lookback_hours=lookback_days * 24)
+            daily_features = self._apply_live_fred_overlay(daily_raw)
+            self._daily_features_cache = daily_features
+            self._daily_features_day = now
+            self.last_daily_update = now
+
+        if self._daily_features_cache is None:
+            self._daily_features_cache = self._get_candles(product, "1d", lookback_hours=lookback_days * 24)
+            self._daily_features_day = now
+            self.last_daily_update = now
+
+        return self._daily_features_cache.copy()
 
     @staticmethod
     def _order_status(row: dict[str, Any]) -> str:
@@ -199,18 +256,45 @@ class LiveRunner:
             replace_count = int(local.get("replace_count") or 0)
             side = str(local.get("side") or "BUY")
             product = str(local.get("product") or self.cfg.data.product)
+            metadata = dict(local.get("metadata") or {})
 
             remote = remote_map.get(order_id)
             if remote is None:
-                self.state.log_order_event(order_id, "missing_on_exchange", {"action": "drop_local"}, ts=now_ts)
-                self.state.drop_open_order(order_id)
+                missing_count = int(metadata.get("missing_count") or 0) + 1
+                metadata["missing_count"] = missing_count
+                self.state.update_open_order(order_id, metadata=metadata, ts=now_ts)
+                self.state.log_order_event(
+                    order_id,
+                    "missing_on_exchange",
+                    {"missing_count": missing_count},
+                    ts=now_ts,
+                )
+
+                age_s = max(0, now_ts - created_at)
+                if missing_count >= 3 and age_s >= timeout_s:
+                    self.state.log_order_event(
+                        order_id,
+                        "drop_after_missing_threshold",
+                        {"missing_count": missing_count, "age_s": age_s},
+                        ts=now_ts,
+                    )
+                    self.state.drop_open_order(order_id)
                 continue
+
+            if "missing_count" in metadata:
+                metadata.pop("missing_count", None)
 
             status = self._order_status(remote)
             filled_size = self._order_filled_size(remote)
-            self.state.update_open_order(order_id, status=status, filled_size=filled_size, ts=now_ts)
+            self.state.update_open_order(
+                order_id,
+                status=status,
+                filled_size=filled_size,
+                metadata=metadata,
+                ts=now_ts,
+            )
 
-            terminal = status in {"FILLED", "CANCELLED", "CANCELED", "FAILED", "EXPIRED", "REJECTED"}
+            terminal = status in {"FILLED", "DONE", "COMPLETED", "CANCELLED", "CANCELED", "FAILED", "EXPIRED", "REJECTED"}
             if filled_size > 0 and filled_size < local_size:
                 self.state.log_order_event(
                     order_id,
@@ -229,7 +313,12 @@ class LiveRunner:
                 continue
 
             # deterministic cancel/replace on timeout
-            self.order_router.cancel_order(order_id)
+            cancel_ok = self.order_router.cancel_order(order_id)
+            if not cancel_ok:
+                self.state.log_order_event(order_id, "cancel_timeout_failed", {"age_s": age_s, "status": status}, ts=now_ts)
+                self.consecutive_order_failures += 1
+                continue
+
             self.state.log_order_event(order_id, "cancel_timeout", {"age_s": age_s, "status": status}, ts=now_ts)
 
             remaining = max(0.0, local_size - filled_size)
@@ -260,10 +349,11 @@ class LiveRunner:
                     metadata={"replaces": order_id},
                 )
                 self.state.log_order_event(order_id, "replaced_with_market", {"replacement_id": replace_id, "remaining": remaining}, ts=now_ts)
+                self.state.drop_open_order(order_id)
             except Exception as exc:
                 self.state.log_order_event(order_id, "replace_failed", {"error": str(exc), "remaining": remaining}, ts=now_ts)
                 self.consecutive_order_failures += 1
-            finally:
+                # Original order has already been canceled successfully.
                 self.state.drop_open_order(order_id)
 
     def step_once(self, cycle_index: int = 0) -> RunnerDecision:
@@ -290,12 +380,8 @@ class LiveRunner:
         if age_min > self.cfg.runtime.stale_feed_alert_minutes:
             self._alert("stale_hourly_feed", {"age_minutes": age_min})
 
-        # ensure latest daily data with full warmup history
-        if self.last_daily_update is None or self.last_daily_update.date() != now.date():
-            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
-            self.last_daily_update = now
-        else:
-            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
+        # Daily data (with optional FRED overlay) refreshed at daily cadence.
+        daily = self._get_daily_features(self.cfg.data.product, daily_lookback_days, now)
 
         current_hourly = hourly.copy()
         latest_close = float(current_hourly["close"].iloc[-1])
@@ -341,40 +427,82 @@ class LiveRunner:
                 filled = True
                 self.consecutive_order_failures = 0
         else:
+            best_bid = latest_close
+            best_ask = latest_close
+            try:
+                bbo = self.client.get_best_bid_ask(self.cfg.data.product)
+                bid_raw = float(getattr(bbo, "bid", 0.0) or 0.0)
+                ask_raw = float(getattr(bbo, "ask", 0.0) or 0.0)
+                if bid_raw > 0:
+                    best_bid = bid_raw
+                if ask_raw > 0:
+                    best_ask = ask_raw
+                if best_bid > 0 and best_ask > 0 and best_ask < best_bid:
+                    best_bid, best_ask = min(best_bid, best_ask), max(best_bid, best_ask)
+            except Exception as exc:
+                logger.warning("best_bid_ask fetch failed; using close fallback: %s", exc)
+
             orders = self.order_router.target_to_order(
                 product=self.cfg.data.product,
                 current_fraction=current_fraction,
                 target_fraction=target,
                 equity_usd=current_equity,
                 price=latest_close,
-                latest_bid=latest_close,
-                latest_ask=latest_close,
+                latest_bid=best_bid,
+                latest_ask=best_ask,
             )
             for o in orders:
                 try:
-                    quote = self.order_router.place_limit_with_fallback(
-                        product=o.product,
-                        side=o.side,
-                        size=o.size,
-                        bid=latest_low,
-                        ask=latest_high,
-                        now=now.to_pydatetime(),
-                        fallback_to_market=self.cfg.execution.fallback_to_market,
-                        client_order_id=o.client_order_id,
-                    )
+                    if self.cfg.execution.maker_first:
+                        quote = self.order_router.place_maker_first(
+                            product=o.product,
+                            side=o.side,
+                            size=o.size,
+                            now=now.to_pydatetime(),
+                        )
+                    else:
+                        quote = self.order_router.place_limit_with_fallback(
+                            product=o.product,
+                            side=o.side,
+                            size=o.size,
+                            bid=best_bid,
+                            ask=best_ask,
+                            now=now.to_pydatetime(),
+                            fallback_to_market=self.cfg.execution.fallback_to_market,
+                            client_order_id=o.client_order_id,
+                        )
+
+                    mode = str(quote.get("mode", "")).lower()
+                    order_id = str(quote.get("order_id") or o.client_order_id)
+                    submitted_size = float(quote.get("submitted_size", o.size) or o.size)
+
+                    if mode == "maker_unfilled":
+                        self.state.log_order_event(order_id, "maker_unfilled", {"quote": quote}, ts=int(now.timestamp()))
+                        continue
+
+                    if mode == "maker_limit":
+                        self.state.log_order_event(order_id, "maker_limit_filled", {"quote": quote}, ts=int(now.timestamp()))
+                        filled = True
+                        fills.append(quote)
+                        self.consecutive_order_failures = 0
+                        continue
+
+                    order_type = "market" if mode in {"market", "taker_market_fallback"} else o.order_type
+                    order_price = float(quote.get("limit_price", o.price)) if o.price is not None else None
+
                     self.state.put_open_order(
-                        o.client_order_id,
+                        order_id,
                         o.product,
                         o.side,
-                        quote.get("submitted_size", o.size),
-                        o.order_type,
-                        o.price,
+                        submitted_size,
+                        order_type,
+                        order_price,
                         int(now.timestamp()),
                         status="submitted",
                         filled_size=0.0,
-                        metadata={"mode": quote.get("mode", "limit")},
+                        metadata={"mode": mode or "unknown"},
                     )
-                    self.state.log_order_event(o.client_order_id, "submitted", {"quote": quote}, ts=int(now.timestamp()))
+                    self.state.log_order_event(order_id, "submitted", {"quote": quote}, ts=int(now.timestamp()))
                     filled = True
                     fills.append(quote)
                     self.consecutive_order_failures = 0
@@ -415,6 +543,10 @@ class LiveRunner:
             "metadata": bundle.metadata,
             "cycle": cycle_index,
             "kill_switch_reason": kill_reason,
+            "fred": {
+                "enabled": bool(self._last_fred_report.get("enabled", False)),
+                "warnings": list(self._last_fred_report.get("warnings", []) or [])[:3],
+            },
         }
         self.state.log_decision(int(now.timestamp()), self.cfg.data.product, decision_payload)
 
@@ -429,6 +561,9 @@ class LiveRunner:
                 "target": target,
                 "regime": bundle.micro_regime.value,
                 "kill_switch_reason": kill_reason,
+                "maker_first": bool(self.cfg.execution.maker_first),
+                "fred_enabled": bool(self._last_fred_report.get("enabled", False)),
+                "fred_warnings": list(self._last_fred_report.get("warnings", []) or [])[:3],
             },
         )
 
@@ -441,6 +576,33 @@ class LiveRunner:
             fills=fills,
             reason=bundle.macro_reason,
         )
+
+    def _wait_until_next_cycle(self, delay_seconds: float) -> None:
+        if delay_seconds <= 0:
+            return
+
+        # Test/CLI finite-cycle mode keeps short sleeps for fast feedback.
+        if self.cycles is not None:
+            time.sleep(min(delay_seconds, 1.0))
+            return
+
+        # In continuous mode, poll reconcile while waiting so timeout-based
+        # cancel/replace is enforced near configured order_timeout_s.
+        timeout_s = max(1.0, float(self.cfg.execution.order_timeout_s))
+        poll_interval = max(5.0, min(30.0, timeout_s / 4.0))
+
+        deadline = time.time() + delay_seconds
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            sleep_for = min(poll_interval, remaining)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            try:
+                self._reconcile()
+            except Exception:
+                logger.exception("reconcile polling failed during wait")
 
     def run(self):
         cycles = self.cycles
@@ -474,7 +636,4 @@ class LiveRunner:
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
             delay = (next_hour - now).total_seconds()
             if delay > 0:
-                if cycles is not None:
-                    time.sleep(min(delay, 1.0))
-                else:
-                    time.sleep(delay)
+                self._wait_until_next_cycle(delay)

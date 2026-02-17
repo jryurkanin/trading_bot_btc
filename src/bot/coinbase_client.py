@@ -382,12 +382,15 @@ class RESTClientWrapper:
             else:
                 balance_value = 0.0
 
+            total_balance = float(balance_value or 0.0)
+            available_balance = float(available_value) if available_value is not None else total_balance
+
             out.append(
                 Account(
                     uuid=str(row.get("uuid") or row.get("account_id") or ""),
                     currency=row.get("currency") or row.get("currency_symbol") or row.get("currency_code") or "",
-                    balance=float(available_value if available_value is not None else balance_value or 0.0),
-                    available_balance=float(available_value or 0.0),
+                    balance=total_balance,
+                    available_balance=available_balance,
                 )
             )
         return out

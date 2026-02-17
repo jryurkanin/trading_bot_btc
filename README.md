@@ -280,6 +280,7 @@ Live mode requires valid Coinbase credentials and careful monitoring.
 
 - Static sandbox endpoint is supported in `coinbase_client.py` (set `use_sandbox=true` in config or `COINBASE_USE_SANDBOX=true`).
 - Public data sources are optional and can be toggled in config.
+- Live deployment/monitoring checklist: `LIVE_OPS_RUNBOOK.md`.
 - Tests expect no secrets or network access and focus on determinism in pure components.
 
 ## Tests

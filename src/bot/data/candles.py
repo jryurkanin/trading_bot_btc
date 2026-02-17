@@ -84,38 +84,59 @@ class CandleStore:
 
     def get_candles(self, client: RESTClientWrapper, query: CandleQuery) -> pd.DataFrame:
         # normalize to UTC
-        start_ts = pd.Timestamp(query.start)
-        end_ts = pd.Timestamp(query.end)
-        if start_ts.tzinfo is None:
-            start_ts = start_ts.tz_localize("UTC")
+        start_utc = pd.Timestamp(query.start)
+        end_utc = pd.Timestamp(query.end)
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.tz_localize("UTC")
         else:
-            start_ts = start_ts.tz_convert("UTC")
-        if end_ts.tzinfo is None:
-            end_ts = end_ts.tz_localize("UTC")
+            start_utc = start_utc.tz_convert("UTC")
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.tz_localize("UTC")
         else:
-            end_ts = end_ts.tz_convert("UTC")
-        start = start_ts.to_pydatetime()
-        end = end_ts.to_pydatetime()
+            end_utc = end_utc.tz_convert("UTC")
 
-        if start > end:
+        if start_utc > end_utc:
             raise ValueError("start must be <= end")
 
-        start_ts = int(start.timestamp())
-        end_ts = int(end.timestamp())
+        start_epoch = int(start_utc.timestamp())
+        end_epoch = int(end_utc.timestamp())
+
+        batch_seconds = _tf_to_seconds(query.timeframe)
+        floor_tf = "1h" if query.timeframe == "1h" else "1d"
+        required_cached_end = end_utc.floor(floor_tf) - pd.Timedelta(seconds=batch_seconds)
+        if required_cached_end < start_utc:
+            required_cached_end = start_utc
 
         # first try cache
-        cached = self._fetch_cached(query.product, query.timeframe, start_ts, end_ts)
+        cached = self._fetch_cached(query.product, query.timeframe, start_epoch, end_epoch)
+        cursor = start_utc.to_pydatetime()
+        end = end_utc.to_pydatetime()
+
         if not cached.empty and not query.force_refresh:
-            # if cache has everything needed (contiguous enough) return
-            if cached["timestamp"].min() <= pd.Timestamp(start).tz_convert("UTC") and cached["timestamp"].max() >= pd.Timestamp(end).tz_convert("UTC"):
+            cache_min = pd.Timestamp(cached["timestamp"].min())
+            cache_max = pd.Timestamp(cached["timestamp"].max())
+            if cache_min.tzinfo is None:
+                cache_min = cache_min.tz_localize("UTC")
+            else:
+                cache_min = cache_min.tz_convert("UTC")
+            if cache_max.tzinfo is None:
+                cache_max = cache_max.tz_localize("UTC")
+            else:
+                cache_max = cache_max.tz_convert("UTC")
+
+            # If cache covers through the latest fully-closed bar, use it.
+            if cache_min <= start_utc and cache_max >= required_cached_end:
                 logger.info("Using cached %s candles for %s", query.timeframe, query.product)
                 return cached
 
+            # Otherwise only fetch the missing tail instead of re-fetching the full range.
+            tail_start = (cache_max + pd.Timedelta(seconds=batch_seconds)).to_pydatetime()
+            if tail_start > cursor:
+                cursor = tail_start
+
         # fetch from API with pagination
         all_frames: List[pd.DataFrame] = []
-        cursor = start
         limit = min(query.timeframe == "1h" and self.cfg.hourly_limit or self.cfg.daily_limit, 350)
-        batch_seconds = _tf_to_seconds(query.timeframe)
         while cursor < end:
             chunk_end = min(cursor + timedelta(seconds=limit * batch_seconds), end)
             logger.info("Fetching candles %s-%s", query.product, query.timeframe)

@@ -382,8 +382,9 @@ class OrderRouter:
             time.sleep(1.0)
         return False
 
-    def cancel_order(self, client_order_id: str) -> None:
+    def cancel_order(self, client_order_id: str) -> bool:
         try:
             self.client.cancel_order(client_order_id)
+            return True
         except Exception:
-            pass
+            return False
