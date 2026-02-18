@@ -265,12 +265,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--product", default="BTC-USD")
     p.add_argument("--start", default="2021-01-01T00:00:00Z")
     p.add_argument("--end", default=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
-    p.add_argument("--train-start", default="2021-01-01T00:00:00Z")
-    p.add_argument("--train-end", default="2023-12-31T23:00:00Z")
-    p.add_argument("--val-start", default="2024-01-01T00:00:00Z")
-    p.add_argument("--val-end", default="2024-12-31T23:00:00Z")
-    p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
-    p.add_argument("--test-end", default=None)
+    p.add_argument("--train-start", default=None, help="optional train window start (requires all window args)")
+    p.add_argument("--train-end", default=None, help="optional train window end (requires all window args)")
+    p.add_argument("--val-start", default=None, help="optional val window start (requires all window args)")
+    p.add_argument("--val-end", default=None, help="optional val window end (requires all window args)")
+    p.add_argument("--test-start", default=None, help="optional test window start (requires all window args)")
+    p.add_argument("--test-end", default=None, help="optional test window end (requires all window args)")
     p.add_argument(
         "--strategy",
         default="macro_gate_benchmark",
@@ -297,6 +297,75 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _build_windows(args: argparse.Namespace, start: datetime, end: datetime) -> list[Window]:
+    if end <= start:
+        raise ValueError("--end must be after --start")
+
+    explicit_window_args = [
+        args.train_start,
+        args.train_end,
+        args.val_start,
+        args.val_end,
+        args.test_start,
+        args.test_end,
+    ]
+    any_explicit = any(v is not None for v in explicit_window_args)
+    all_explicit = all(v is not None for v in explicit_window_args)
+
+    if any_explicit and not all_explicit:
+        raise ValueError(
+            "If any of --train/--val/--test window args are provided, all six are required: "
+            "--train-start --train-end --val-start --val-end --test-start --test-end"
+        )
+
+    if not any_explicit:
+        span_seconds = (end - start).total_seconds()
+        if span_seconds < 6 * 3600:
+            raise ValueError("Date span too short for automatic train/val/test split; provide explicit windows")
+
+        train_end = start + timedelta(seconds=span_seconds * 0.60)
+        val_end = start + timedelta(seconds=span_seconds * 0.80)
+
+        train_end = pd.Timestamp(train_end).floor("h").to_pydatetime().replace(tzinfo=timezone.utc)
+        val_end = pd.Timestamp(val_end).floor("h").to_pydatetime().replace(tzinfo=timezone.utc)
+
+        min_step = timedelta(hours=1)
+        if train_end <= start:
+            train_end = start + min_step
+        val_start = train_end + min_step
+        if val_end <= val_start:
+            val_end = val_start + min_step
+        test_start = val_end + min_step
+        if test_start >= end:
+            raise ValueError("Date span too short for automatic train/val/test split; provide explicit windows")
+
+        windows = [
+            Window("train", start, train_end),
+            Window("val", val_start, val_end),
+            Window("test", test_start, end),
+        ]
+    else:
+        windows = [
+            Window("train", parse_ts(args.train_start), parse_ts(args.train_end)),
+            Window("val", parse_ts(args.val_start), parse_ts(args.val_end)),
+            Window("test", parse_ts(args.test_start), parse_ts(args.test_end)),
+        ]
+
+    for w in windows:
+        if w.end <= w.start:
+            raise ValueError(f"Window '{w.name}' has end <= start")
+        if w.start < start or w.end > end:
+            raise ValueError(
+                f"Window '{w.name}' [{w.start.isoformat()}..{w.end.isoformat()}] must be within "
+                f"overall range [{start.isoformat()}..{end.isoformat()}]"
+            )
+
+    if not (windows[0].end < windows[1].start and windows[1].end < windows[2].start):
+        raise ValueError("train/val/test windows must be strictly ordered and non-overlapping")
+
+    return windows
+
+
 def main() -> int:
     args = parse_args()
     cfg = BotConfig.load(args.config)
@@ -307,13 +376,7 @@ def main() -> int:
     start = parse_ts(args.start)
     end = parse_ts(args.end)
     prefetch_start = _prefetch_start(start, cfg)
-    test_end = parse_ts(args.test_end) if args.test_end else end
-
-    windows = [
-        Window("train", parse_ts(args.train_start), parse_ts(args.train_end)),
-        Window("val", parse_ts(args.val_start), parse_ts(args.val_end)),
-        Window("test", parse_ts(args.test_start), test_end),
-    ]
+    windows = _build_windows(args, start, end)
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     store = CandleStore(cfg.data)
@@ -489,9 +552,10 @@ def main() -> int:
             best_cfg_patch["fred"] = fred_patch
         best_cfg_path = write_strict_json(out_dir / "best_config.json", best_cfg_patch)
 
+        test_window = next((w for w in windows if w.name == "test"), windows[-1])
         repro_cmd = (
             f"python3.14 scripts/backtest.py --product {args.product} "
-            f"--start {args.test_start} --end {(args.test_end or args.end)} "
+            f"--start {test_window.start.isoformat()} --end {test_window.end.isoformat()} "
             f"--strategy {args.strategy} --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )

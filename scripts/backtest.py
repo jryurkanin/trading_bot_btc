@@ -152,9 +152,6 @@ def main() -> int:
     if args.fred_realtime_mode is not None:
         cfg.fred.realtime_mode = str(args.fred_realtime_mode)
 
-    # Keep macro benchmark policy behavior only.
-    cfg.regime.trend_boost_enabled = False
-
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
     if args.rebalance_policy:

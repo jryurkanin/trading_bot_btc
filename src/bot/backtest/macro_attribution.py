@@ -27,13 +27,11 @@ def _to_utc(series_or_index: pd.Series | pd.Index) -> pd.Series:
 def _epoch_seconds(ts_series: pd.Series) -> pd.Series:
     """Convert a UTC-normalized timestamp series to epoch seconds (int64).
 
-    Handles both tz-aware datetime64[ns, UTC] and object-typed pd.Timestamp
-    series by going through _to_utc first for safety.
+    Handles tz-aware timestamps across pandas datetime units (ns/us/ms) by
+    normalizing to ns resolution first, then converting to unix seconds.
     """
-    utc = _to_utc(ts_series)
-    # .view("int64") avoids dtype-conversion ambiguities with .astype("int64")
-    # on mixed tz-aware / tz-naive inputs.
-    return (utc.values.view("int64") // 1_000_000_000).astype("int64")
+    utc = _to_utc(ts_series).astype("datetime64[ns, UTC]")
+    return (utc.astype("int64") // 1_000_000_000).astype("int64")
 
 
 def _bucket_from_state_and_multiplier(state: str | float | int | None, multiplier: float | int | None) -> str:
@@ -171,11 +169,16 @@ def _label_trades_with_bucket(trades_df: pd.DataFrame | None, decisions_df: pd.D
     if "ts" in tr.columns and tr["ts"].dtype != "datetime64[ns, UTC]":
         tr["ts"] = tr["ts"].astype("datetime64[ns, UTC]")
 
+    if "fee" not in tr.columns:
+        tr["fee"] = 0.0
+    if "notional" not in tr.columns:
+        tr["notional"] = 0.0
+    tr["fee"] = pd.to_numeric(tr["fee"], errors="coerce").fillna(0.0)
+    tr["notional"] = pd.to_numeric(tr["notional"], errors="coerce").fillna(0.0)
+
     if decisions_df is None or decisions_df.empty:
-        out = tr[["ts"]].copy()
+        out = tr[["ts", "fee", "notional"]].copy()
         out["macro_bucket"] = "OFF"
-        out["fee"] = pd.to_numeric(out.get("fee", 0.0), errors="coerce").fillna(0.0)
-        out["notional"] = pd.to_numeric(out.get("notional", 0.0), errors="coerce").fillna(0.0)
         return out
 
     dec = decisions_df.copy()
