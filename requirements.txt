@@ -7,5 +7,6 @@ pytest
 rich
 hmmlearn
 pyyaml
+cupy-cuda12x
 # optional: official SDK
 coinbase-advanced-py
