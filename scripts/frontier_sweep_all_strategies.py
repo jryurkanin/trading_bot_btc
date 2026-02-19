@@ -6,6 +6,7 @@ import csv
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from bot.config import BacktestConfig
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
+REPORTS_BASE_DIR = ROOT_DIR / "reports" / "frontier_sweep_all_strategies"
 
 StrategyRunner = tuple[str, str]
 
@@ -64,6 +66,23 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_reports_dir() -> Path:
+    REPORTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    return REPORTS_BASE_DIR / f"run_{timestamp}"
+
+
+def _write_progress(progress_file: Path, event: dict[str, Any]) -> None:
+    payload = {"timestamp": _utc_timestamp(), **event}
+    progress_file.parent.mkdir(parents=True, exist_ok=True)
+    with progress_file.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
 def _run_command(cmd: list[str], timeout_seconds: int) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -80,6 +99,13 @@ def _run_command(cmd: list[str], timeout_seconds: int) -> subprocess.CompletedPr
             stdout=(exc.stdout or "") if exc.stdout else "",
             stderr=(exc.stderr or "") + f"\nCommand timed out after {timeout_seconds}s\n",
         )
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _build_base_args(args: argparse.Namespace) -> list[str]:
@@ -142,9 +168,13 @@ def _load_best_summary(summary_path: Path, strategy_dir: Path, strategy: str) ->
 
     top = rows[0]
 
-    cagr = float(top.get("test_cagr_stress_1", top.get("val_stress1_cagr", 0.0))) or 0.0
-    sharpe = float(top.get("test_sharpe_stress_1", top.get("val_sharpe_stress_1", top.get("sharpe", 0.0)))) or 0.0
-    max_drawdown = float(top.get("test_max_drawdown_stress_1", top.get("val_max_drawdown_worst", top.get("max_drawdown", 0.0)))) or 0.0
+    cagr_source = top.get("test_cagr_stress_1", top.get("val_stress1_cagr", 0.0))
+    sharpe_source = top.get("test_sharpe_stress_1", top.get("val_sharpe_stress_1", top.get("sharpe", 0.0)))
+    max_drawdown_source = top.get("test_max_drawdown_stress_1", top.get("val_max_drawdown_worst", top.get("max_drawdown", 0.0)))
+
+    cagr = _to_float(cagr_source)
+    sharpe = _to_float(sharpe_source)
+    max_drawdown = _to_float(max_drawdown_source)
 
     # Normalize to best_summary-like structure for downstream comparisons.
     return {
@@ -155,10 +185,10 @@ def _load_best_summary(summary_path: Path, strategy_dir: Path, strategy: str) ->
             "sharpe": sharpe,
             "max_drawdown": max_drawdown,
             "trade_count": top.get("trade_count") or top.get("val_trade_count", 0),
+            "turnover": _to_float(top.get("turnover", 0.0)),
         },
         "best_config": {},
     }
-
 
 def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]:
     test = summary.get("test_window_stress_1") if isinstance(summary, dict) else None
@@ -179,19 +209,34 @@ def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]
     return (cagr, sharpe, drawdown, turnover)
 
 
-def _run_all_strategies(args: argparse.Namespace) -> list[dict[str, Any]]:
+def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]], Path, Path]:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    run_reports_dir = _run_reports_dir()
+    progress_path = run_reports_dir / "progress.jsonl"
+    run_id = run_reports_dir.name
 
     selected = [s.strip() for s in args.strategies.split(",") if s.strip()]
     unknown = [s for s in selected if s not in RUNNERS]
     if unknown:
         raise ValueError(f"Unknown strategy requested: {', '.join(unknown)}. Active options: {', '.join(ACTIVE_STRATEGIES)}")
 
+    _write_progress(
+        progress_path,
+        {
+            "event": "run_started",
+            "run_id": run_id,
+            "output_root": str(output_root),
+            "strategies": selected,
+            "args": vars(args),
+        },
+    )
+
     baseline_args = _build_base_args(args)
     results: list[dict[str, Any]] = []
 
-    for strategy in selected:
+    for index, strategy in enumerate(selected, start=1):
         script_name, default_tag = RUNNERS[strategy]
         strategy_dir = output_root / default_tag
         strategy_dir.mkdir(parents=True, exist_ok=True)
@@ -216,9 +261,25 @@ def _run_all_strategies(args: argparse.Namespace) -> list[dict[str, Any]]:
             # Fallback if future strategy runners are added.
             cmd.extend(args_for_strategy)
 
+        command = " ".join(cmd)
+        _write_progress(
+            progress_path,
+            {
+                "event": "strategy_started",
+                "run_id": run_id,
+                "strategy": strategy,
+                "strategy_index": index,
+                "command": command,
+                "output_dir": str(strategy_dir),
+            },
+        )
+
         print(f"\n=== Running frontier sweep: {strategy} ===")
-        print("Command:", " ".join(cmd))
+        print("Command:", command)
+        started_at = datetime.now(timezone.utc)
         completed = _run_command(cmd, timeout_seconds=args.timeout_seconds)
+        finished_at = datetime.now(timezone.utc)
+        elapsed_sec = (finished_at - started_at).total_seconds()
 
         summary = None
         if completed.returncode == 0:
@@ -237,13 +298,44 @@ def _run_all_strategies(args: argparse.Namespace) -> list[dict[str, Any]]:
             "summary": summary,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
+            "duration_seconds": elapsed_sec,
+            "start_time": started_at.isoformat(),
+            "end_time": finished_at.isoformat(),
         }
         results.append(result)
 
-    return results
+        _write_progress(
+            progress_path,
+            {
+                "event": "strategy_completed",
+                "run_id": run_id,
+                "strategy": strategy,
+                "strategy_index": index,
+                "return_code": completed.returncode,
+                "output_dir": str(strategy_dir),
+                "duration_seconds": elapsed_sec,
+                "summary": {"available": summary is not None},
+            },
+        )
+
+    run_complete_payload = {
+        "event": "run_completed",
+        "run_id": run_id,
+        "strategies_completed": len(results),
+        "output_root": str(output_root),
+        "reports_dir": str(run_reports_dir),
+    }
+    _write_progress(progress_path, run_complete_payload)
+
+    return results, run_reports_dir, progress_path
 
 
-def _summarize(results: list[dict[str, Any]], output_root: Path) -> dict[str, Any] | None:
+def _summarize(
+    results: list[dict[str, Any]],
+    output_root: Path,
+    run_reports_dir: Path,
+    progress_file: Path,
+) -> dict[str, Any] | None:
     print("\n=== Frontier sweep summary (all active strategies) ===")
 
     best_entry: dict[str, Any] | None = None
@@ -269,66 +361,67 @@ def _summarize(results: list[dict[str, Any]], output_root: Path) -> dict[str, An
             best_entry = result
             best_score = score
 
+    report: dict[str, Any] = {
+        "results": results,
+        "best": None,
+        "output_root": str(output_root),
+        "reports_dir": str(run_reports_dir),
+    }
+
     if best_entry is None:
         print("\nNo successful strategy run produced a best_summary result.")
-        report: dict[str, Any] = {
-            "results": results,
-            "best": None,
-            "output_root": str(output_root),
-        }
-        (output_root / "all_strategies_summary.json").write_text(
-            json.dumps(report, indent=2),
-            encoding="utf-8",
-        )
-        return report
+    else:
+        best_summary = best_entry["summary"]
+        if not isinstance(best_summary, dict):
+            print("\nCould not parse best strategy details for final report.")
+        else:
+            best_report = {
+                "strategy": best_entry["strategy"],
+                "score": {
+                    "cagr": best_score[0],
+                    "sharpe": best_score[1],
+                    "max_drawdown": best_score[2],
+                    "turnover": best_score[3],
+                },
+                "config": best_summary.get("best_config") or best_summary.get("best_cfg") or {},
+                "performance": best_summary.get("test_window_stress_1")
+                or {
+                    "cagr": best_score[0],
+                    "sharpe": best_score[1],
+                    "max_drawdown": best_score[2],
+                    "turnover": best_score[3],
+                },
+                "output_dir": best_entry["output_dir"],
+            }
 
-    best_summary = best_entry["summary"]
-    if not isinstance(best_summary, dict):
-        print("\nCould not parse best strategy details for final report.")
-        report = {
-            "results": results,
-            "best": None,
-            "output_root": str(output_root),
-        }
-        (output_root / "all_strategies_summary.json").write_text(
-            json.dumps(report, indent=2),
-            encoding="utf-8",
-        )
-        return report
+            print("\n=== Best strategy ===")
+            print(json.dumps(best_report, indent=2))
+            print("Output:", best_entry["output_dir"])
+            report["best"] = best_report
 
-    best_report = {
-        "strategy": best_entry["strategy"],
-        "score": {
-            "cagr": best_score[0],
-            "sharpe": best_score[1],
-            "max_drawdown": best_score[2],
-            "turnover": best_score[3],
-        },
-        "config": best_summary.get("best_config") or best_summary.get("best_cfg") or {},
-        "performance": best_summary.get("test_window_stress_1")
-        or {
-            "cagr": best_score[0],
-            "sharpe": best_score[1],
-            "max_drawdown": best_score[2],
-            "turnover": best_score[3],
-        },
-        "output_dir": best_entry["output_dir"],
-    }
-
-    print("\n=== Best strategy ===")
-    print(json.dumps(best_report, indent=2))
-    print("Output:", best_entry["output_dir"])
-
-    summary_report = {
-        "output_root": str(output_root),
-        "results": results,
-        "best": best_report,
-    }
-    (output_root / "all_strategies_summary.json").write_text(
-        json.dumps(summary_report, indent=2),
+    summary_path = output_root / "all_strategies_summary.json"
+    summary_path.write_text(
+        json.dumps(report, indent=2),
         encoding="utf-8",
     )
-    return summary_report
+    # Copy summary for report folder for easy discovery
+    (run_reports_dir / "final_summary.json").write_text(
+        json.dumps(report, indent=2),
+        encoding="utf-8",
+    )
+
+    _write_progress(
+        progress_file,
+        {
+            "event": "summary_written",
+            "run_id": run_reports_dir.name,
+            "summary_path": str(summary_path),
+            "report_path": str(run_reports_dir / "final_summary.json"),
+            "has_best": report["best"] is not None,
+        },
+    )
+
+    return report
 
 
 def main() -> int:
@@ -337,8 +430,13 @@ def main() -> int:
         print("No active strategies discovered in BacktestConfig.VALID_STRATEGIES")
         return 1
 
-    results = _run_all_strategies(args)
-    _summarize(results, output_root=Path(args.output_dir))
+    results, run_reports_dir, progress_path = _run_all_strategies(args)
+    _summarize(
+        results,
+        output_root=Path(args.output_dir),
+        run_reports_dir=run_reports_dir,
+        progress_file=progress_path,
+    )
 
     return 0
 
