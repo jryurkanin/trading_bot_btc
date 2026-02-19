@@ -81,6 +81,18 @@ def parse_args() -> argparse.Namespace:
         default=21600,
         help="Timeout for each strategy run in seconds (default: 6 hours)",
     )
+    p.add_argument(
+        "--max-error-rate",
+        type=float,
+        default=0.05,
+        help="Mark strategy run as failed if summary.csv error-rate exceeds this threshold",
+    )
+    p.add_argument(
+        "--ranking-mode",
+        choices=["absolute", "vs_benchmark"],
+        default="vs_benchmark",
+        help="How to choose best strategy across runs",
+    )
     return p.parse_args()
 
 
@@ -308,12 +320,38 @@ def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]
     return (cagr, sharpe, drawdown, turnover)
 
 
+def _summary_error_stats(strategy_dir: Path) -> tuple[int, int, float]:
+    summary_path = strategy_dir / "summary.csv"
+    if not summary_path.exists():
+        return (0, 0, 0.0)
+
+    try:
+        with summary_path.open("r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return (0, 0, 0.0)
+
+    total = len(rows)
+    if total <= 0:
+        return (0, 0, 0.0)
+
+    errors = 0
+    for row in rows:
+        err = row.get("error") if isinstance(row, dict) else None
+        if err is not None and str(err).strip() != "":
+            errors += 1
+
+    rate = float(errors) / float(total)
+    return (errors, total, rate)
+
+
 def _execute_strategy_job(
     strategy: str,
     script_name: str,
     strategy_dir: Path,
     cmd: list[str],
     timeout_seconds: int,
+    max_error_rate: float,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     completed = _run_command(cmd, timeout_seconds=timeout_seconds)
@@ -321,7 +359,17 @@ def _execute_strategy_job(
     elapsed_sec = (finished_at - started_at).total_seconds()
 
     summary = None
+    effective_return_code = int(completed.returncode)
+
     if completed.returncode == 0:
+        err_rows, total_rows, error_rate = _summary_error_stats(strategy_dir)
+        if total_rows > 0 and error_rate > float(max_error_rate):
+            effective_return_code = 65
+            print(
+                f"Strategy {strategy} exceeded max error rate: "
+                f"{err_rows}/{total_rows} ({error_rate:.1%}) > {max_error_rate:.1%}"
+            )
+
         summary = _load_best_summary(
             strategy_dir / "best_summary.json",
             strategy_dir=strategy_dir,
@@ -330,12 +378,14 @@ def _execute_strategy_job(
         if summary is None:
             print(f"Warning: no best_summary.json found for {strategy}. Parsing frontier.csv fallback")
     else:
+        err_rows, total_rows, error_rate = _summary_error_stats(strategy_dir)
         print(f"Strategy {strategy} failed with exit code {completed.returncode}")
 
     return {
         "strategy": strategy,
         "script": script_name,
-        "return_code": completed.returncode,
+        "return_code": effective_return_code,
+        "raw_return_code": int(completed.returncode),
         "output_dir": str(strategy_dir),
         "summary": summary,
         "stdout": completed.stdout,
@@ -343,6 +393,9 @@ def _execute_strategy_job(
         "duration_seconds": elapsed_sec,
         "start_time": started_at.isoformat(),
         "end_time": finished_at.isoformat(),
+        "error_rows": int(err_rows),
+        "total_rows": int(total_rows),
+        "error_rate": float(error_rate),
     }
 
 
@@ -442,6 +495,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 strategy_dir=job["strategy_dir"],
                 cmd=job["cmd"],
                 timeout_seconds=args.timeout_seconds,
+                max_error_rate=args.max_error_rate,
             )
             result["strategy_index"] = job["index"]
             results.append(result)
@@ -454,8 +508,12 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                     "strategy": job["strategy"],
                     "strategy_index": job["index"],
                     "return_code": result["return_code"],
+                    "raw_return_code": result.get("raw_return_code"),
                     "output_dir": str(job["strategy_dir"]),
                     "duration_seconds": result["duration_seconds"],
+                    "error_rows": result.get("error_rows", 0),
+                    "total_rows": result.get("total_rows", 0),
+                    "error_rate": result.get("error_rate", 0.0),
                     "summary": {"available": result["summary"] is not None},
                 },
             )
@@ -469,6 +527,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                     strategy_dir=job["strategy_dir"],
                     cmd=job["cmd"],
                     timeout_seconds=args.timeout_seconds,
+                    max_error_rate=args.max_error_rate,
                 ): job
                 for job in jobs
             }
@@ -487,8 +546,12 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                         "strategy": job["strategy"],
                         "strategy_index": job["index"],
                         "return_code": result["return_code"],
+                        "raw_return_code": result.get("raw_return_code"),
                         "output_dir": str(job["strategy_dir"]),
                         "duration_seconds": result["duration_seconds"],
+                        "error_rows": result.get("error_rows", 0),
+                        "total_rows": result.get("total_rows", 0),
+                        "error_rate": result.get("error_rate", 0.0),
                         "summary": {"available": result["summary"] is not None},
                     },
                 )
@@ -512,17 +575,24 @@ def _summarize(
     output_root: Path,
     run_reports_dir: Path,
     progress_file: Path,
+    ranking_mode: str,
 ) -> dict[str, Any] | None:
     print("\n=== Frontier sweep summary (all active strategies) ===")
 
-    best_entry: dict[str, Any] | None = None
-    best_score: tuple[float, float, float, float] = (-1.0, -1.0, 0.0, 0.0)
+    strategy_scores: dict[str, tuple[float, float, float, float]] = {}
+    valid_results: list[dict[str, Any]] = []
 
     for result in results:
         strategy = result["strategy"]
         summary = result["summary"]
         rc = result["return_code"]
+        err_rows = int(result.get("error_rows", 0) or 0)
+        total_rows = int(result.get("total_rows", 0) or 0)
+        err_rate = float(result.get("error_rate", 0.0) or 0.0)
         print(f"\n- {strategy}: exit={rc}, output={result['output_dir']}")
+
+        if total_rows > 0:
+            print(f"  Error rows: {err_rows}/{total_rows} ({err_rate:.1%})")
 
         if rc != 0:
             print("  Status: failed")
@@ -532,49 +602,95 @@ def _summarize(
             continue
 
         score = _extract_score(summary)
+        strategy_scores[strategy] = score
+        valid_results.append(result)
         print(f"  Status: success")
-        print(f"  Best cagr: {score[0]:.6f}, sharpe: {score[1]:.6f}, drawdown: {score[2]:.6f}, turnover: {score[3]:.6f}")
-        if score > best_score:
-            best_entry = result
-            best_score = score
+        print(
+            f"  Best cagr: {score[0]:.6f}, sharpe: {score[1]:.6f}, "
+            f"drawdown: {score[2]:.6f}, turnover: {score[3]:.6f}"
+        )
 
     report: dict[str, Any] = {
         "results": results,
         "best": None,
         "output_root": str(output_root),
         "reports_dir": str(run_reports_dir),
+        "ranking_mode": ranking_mode,
     }
 
-    if best_entry is None:
+    if not valid_results:
         print("\nNo successful strategy run produced a best_summary result.")
     else:
-        best_summary = best_entry["summary"]
-        if not isinstance(best_summary, dict):
-            print("\nCould not parse best strategy details for final report.")
-        else:
-            best_report = {
-                "strategy": best_entry["strategy"],
-                "score": {
-                    "cagr": best_score[0],
-                    "sharpe": best_score[1],
-                    "max_drawdown": best_score[2],
-                    "turnover": best_score[3],
-                },
-                "config": best_summary.get("best_config") or best_summary.get("best_cfg") or {},
-                "performance": best_summary.get("test_window_stress_1")
-                or {
-                    "cagr": best_score[0],
-                    "sharpe": best_score[1],
-                    "max_drawdown": best_score[2],
-                    "turnover": best_score[3],
-                },
-                "output_dir": best_entry["output_dir"],
-            }
+        benchmark_score = strategy_scores.get("macro_gate_benchmark")
+        best_entry: dict[str, Any] | None = None
+        best_sort_key: tuple[float, float, float, float] = (-1e18, -1e18, -1e18, -1e18)
 
-            print("\n=== Best strategy ===")
-            print(json.dumps(best_report, indent=2))
-            print("Output:", best_entry["output_dir"])
-            report["best"] = best_report
+        for result in valid_results:
+            strategy = result["strategy"]
+            score = strategy_scores.get(strategy)
+            if score is None:
+                continue
+
+            if ranking_mode == "vs_benchmark" and benchmark_score is not None:
+                sort_key = (
+                    score[0] - benchmark_score[0],
+                    score[1] - benchmark_score[1],
+                    abs(benchmark_score[2]) - abs(score[2]),
+                    benchmark_score[3] - score[3],
+                )
+                print(
+                    f"  Δ vs benchmark [{strategy}]: "
+                    f"cagr={sort_key[0]:+.6f}, sharpe={sort_key[1]:+.6f}, "
+                    f"drawdown={sort_key[2]:+.6f}, turnover={sort_key[3]:+.6f}"
+                )
+            else:
+                sort_key = score
+
+            if sort_key > best_sort_key:
+                best_sort_key = sort_key
+                best_entry = result
+
+        if best_entry is None:
+            print("\nCould not determine best strategy from successful results.")
+        else:
+            best_summary = best_entry["summary"]
+            if not isinstance(best_summary, dict):
+                print("\nCould not parse best strategy details for final report.")
+            else:
+                best_score = strategy_scores.get(best_entry["strategy"], (0.0, 0.0, 0.0, 0.0))
+                best_report: dict[str, Any] = {
+                    "strategy": best_entry["strategy"],
+                    "score": {
+                        "cagr": best_score[0],
+                        "sharpe": best_score[1],
+                        "max_drawdown": best_score[2],
+                        "turnover": best_score[3],
+                    },
+                    "score_mode": ranking_mode,
+                    "config": best_summary.get("best_config") or best_summary.get("best_cfg") or {},
+                    "performance": best_summary.get("test_window_stress_1")
+                    or {
+                        "cagr": best_score[0],
+                        "sharpe": best_score[1],
+                        "max_drawdown": best_score[2],
+                        "turnover": best_score[3],
+                    },
+                    "output_dir": best_entry["output_dir"],
+                }
+
+                benchmark_score = strategy_scores.get("macro_gate_benchmark")
+                if ranking_mode == "vs_benchmark" and benchmark_score is not None:
+                    best_report["delta_vs_benchmark"] = {
+                        "cagr": best_score[0] - benchmark_score[0],
+                        "sharpe": best_score[1] - benchmark_score[1],
+                        "max_drawdown": abs(benchmark_score[2]) - abs(best_score[2]),
+                        "turnover": benchmark_score[3] - best_score[3],
+                    }
+
+                print("\n=== Best strategy ===")
+                print(json.dumps(best_report, indent=2))
+                print("Output:", best_entry["output_dir"])
+                report["best"] = best_report
 
     summary_path = output_root / "all_strategies_summary.json"
     summary_path.write_text(
@@ -595,6 +711,7 @@ def _summarize(
             "summary_path": str(summary_path),
             "report_path": str(run_reports_dir / "final_summary.json"),
             "has_best": report["best"] is not None,
+            "ranking_mode": ranking_mode,
         },
     )
 
@@ -607,6 +724,10 @@ def main() -> int:
         print("No active strategies discovered in BacktestConfig.VALID_STRATEGIES")
         return 1
 
+    if args.max_error_rate < 0.0 or args.max_error_rate > 1.0:
+        print("ERROR: --max-error-rate must be between 0.0 and 1.0", file=sys.stderr)
+        return 2
+
     if not _validate_acceleration_backend(args.acceleration_backend):
         return 2
 
@@ -616,6 +737,7 @@ def main() -> int:
         output_root=Path(args.output_dir),
         run_reports_dir=run_reports_dir,
         progress_file=progress_path,
+        ranking_mode=args.ranking_mode,
     )
 
     return 0
