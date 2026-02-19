@@ -10,9 +10,12 @@ from ..config import RegimeConfig
 from ..features import indicators
 from ..features.macro_score import MacroGateStateMachine, MacroState, macro_result
 from ..features.regime import HMMRegimeSwitcher, RegimeState, RuleBasedRegimeSwitcher, compute_adx, compute_adx_di, compute_chop
+from ..system_log import get_system_logger
 from .sub_strategies.mean_reversion_bb import MeanReversionBBStrategy, RangeStrategyConfig
 from .sub_strategies.trend_following_breakout import TrendFollowingBreakoutStrategy, TrendStrategyConfig
 from .base import StrategyDecision
+
+logger = get_system_logger("strategy.regime_switching_orchestrator")
 
 
 @dataclass
@@ -99,6 +102,11 @@ class RegimeSwitchingOrchestrator:
         # on every hourly bar when the daily bar hasn't changed.
         self._daily_cache: dict[str, Any] = {}
 
+        self._last_logged_day: pd.Timestamp | None = None
+        self._last_logged_macro_state: str | None = None
+        self._last_logged_micro_regime: RegimeState | None = None
+        self._last_logged_strategy_name: str | None = None
+
     def reset(self):
         self.rule_switcher.reset()
         self.range_strategy.reset()
@@ -110,6 +118,11 @@ class RegimeSwitchingOrchestrator:
         self._boost_off_streak = 0
         self._boost_last_daily_ts = None
         self._daily_cache = {}
+        self._last_logged_day = None
+        self._last_logged_macro_state = None
+        self._last_logged_micro_regime = None
+        self._last_logged_strategy_name = None
+        logger.debug("orchestrator_reset")
 
     def runtime_state(self) -> dict[str, Any]:
         return {
@@ -409,6 +422,7 @@ class RegimeSwitchingOrchestrator:
         micro_precomputed: dict[str, Any] | None = None,
     ) -> RegimeDecisionBundle:
         if hourly_df.empty:
+            logger.warning("orchestrator_no_hourly_data timestamp=%s", timestamp)
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason="no_hourly_data",
@@ -536,12 +550,35 @@ class RegimeSwitchingOrchestrator:
                 "trend_boost_active": 0,
                 "boost_multiplier_applied": 1.0,
             })
+            strategy_name = "flat"
+            state_changed = (
+                self._last_logged_day != _ts_day
+                or self._last_logged_macro_state != macro_state.value
+                or self._last_logged_micro_regime != micro_regime
+                or self._last_logged_strategy_name != strategy_name
+            )
+            if state_changed:
+                logger.info(
+                    "orchestrator_decision_event ts=%s day=%s macro_state=%s micro_regime=%s strategy=%s base_target=%.4f final_target=0.0000 reason=%s",
+                    _ts_floor,
+                    _ts_day,
+                    macro_state.value,
+                    micro_regime.value,
+                    strategy_name,
+                    base_target,
+                    macro_reason,
+                )
+            self._last_logged_day = _ts_day
+            self._last_logged_macro_state = macro_state.value
+            self._last_logged_micro_regime = micro_regime
+            self._last_logged_strategy_name = strategy_name
+
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason=macro_reason,
                 micro_regime=micro_regime,
                 micro_reason="macro_off",
-                strategy_name="flat",
+                strategy_name=strategy_name,
                 base_target=base_target,
                 regime_multiplier=0.0,
                 regime_target=0.0,
@@ -697,6 +734,31 @@ class RegimeSwitchingOrchestrator:
                 "final_target": final_target,
             }
         )
+
+        state_changed = (
+            self._last_logged_day != _ts_day
+            or self._last_logged_macro_state != macro_state.value
+            or self._last_logged_micro_regime != micro_regime
+            or self._last_logged_strategy_name != strategy_name
+        )
+        if state_changed:
+            logger.info(
+                "orchestrator_decision_event ts=%s day=%s macro_state=%s micro_regime=%s strategy=%s base_target=%.4f regime_target=%.4f final_target=%.4f trend_boost_active=%s",
+                _ts_floor,
+                _ts_day,
+                macro_state.value,
+                micro_regime.value,
+                strategy_name,
+                base_target,
+                regime_target,
+                final_target,
+                bool(booster_active),
+            )
+
+        self._last_logged_day = _ts_day
+        self._last_logged_macro_state = macro_state.value
+        self._last_logged_micro_regime = micro_regime
+        self._last_logged_strategy_name = strategy_name
 
         return RegimeDecisionBundle(
             macro_risk_on=True,

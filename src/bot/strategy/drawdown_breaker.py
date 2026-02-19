@@ -6,6 +6,9 @@ from typing import Any
 import pandas as pd
 
 from ..features.macro_score import MacroState
+from ..system_log import get_system_logger
+
+logger = get_system_logger("strategy.drawdown_breaker")
 
 
 def _on_state(state: MacroState | str) -> bool:
@@ -68,6 +71,7 @@ class DrawdownBreaker:
         self._cooldown_count = 0
         self._reentry_streak = 0
         self._drawdown = 0.0
+        logger.debug("drawdown_breaker_reset")
 
     def snapshot(self) -> DrawdownBreakerSnapshot:
         return DrawdownBreakerSnapshot(
@@ -125,6 +129,8 @@ class DrawdownBreaker:
         if self.last_daily_ts is not None and ts == pd.Timestamp(self.last_daily_ts):
             return raw_target if not self.active else min(raw_target, self.safe_weight)
 
+        prev_active = self.active
+
         # new bar -> update state
         self.last_daily_ts = ts
         self.update_equity(equity, ts)
@@ -134,7 +140,22 @@ class DrawdownBreaker:
                 self.active = True
                 self._cooldown_count = 0
                 self._reentry_streak = 0
-            return min(raw_target, self.safe_weight) if self.active else raw_target
+                logger.warning(
+                    "drawdown_breaker_activated ts=%s drawdown=%.6f threshold=%.6f safe_weight=%.6f",
+                    ts,
+                    self._drawdown,
+                    -abs(self.threshold),
+                    self.safe_weight,
+                )
+            clamped = min(raw_target, self.safe_weight) if self.active else raw_target
+            if self.active and not prev_active and clamped != raw_target:
+                logger.info(
+                    "drawdown_breaker_clamp_applied ts=%s raw_target=%.6f clamped_target=%.6f",
+                    ts,
+                    raw_target,
+                    clamped,
+                )
+            return clamped
 
         # Active breaker path
         if _on_state(macro_state):
@@ -148,6 +169,22 @@ class DrawdownBreaker:
             self.active = False
             self._cooldown_count = 0
             self._reentry_streak = 0
+            logger.info(
+                "drawdown_breaker_deactivated ts=%s drawdown=%.6f macro_state=%s",
+                ts,
+                self._drawdown,
+                macro_state.value if isinstance(macro_state, MacroState) else str(macro_state),
+            )
             return raw_target
 
-        return min(raw_target, self.safe_weight)
+        clamped = min(raw_target, self.safe_weight)
+        if clamped != raw_target:
+            logger.debug(
+                "drawdown_breaker_active_clamp ts=%s raw_target=%.6f clamped_target=%.6f cooldown_count=%d reentry_streak=%d",
+                ts,
+                raw_target,
+                clamped,
+                self._cooldown_count,
+                self._reentry_streak,
+            )
+        return clamped

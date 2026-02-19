@@ -15,8 +15,11 @@ from ..config import RegimeConfig
 from ..features import indicators
 from ..features.macro_score import MacroState
 from ..features.regime import RegimeState
+from ..system_log import get_system_logger
 from .macro_gate import V4MacroGate
 from .regime_switching_orchestrator import RegimeDecisionBundle
+
+logger = get_system_logger("strategy.macro_gate_benchmark")
 
 
 class MacroGateBenchmarkStrategy:
@@ -30,6 +33,7 @@ class MacroGateBenchmarkStrategy:
         self._last_refresh_day: pd.Timestamp | None = None
         self._frozen_base_fraction: float = 0.0
         self._current_target: float = 0.0
+        self._last_logged_macro_state: str | None = None
 
         # Cache closed-daily slices once per UTC day to avoid repeated dataframe copies.
         self._daily_ts_cache: dict[int, pd.DataFrame] = {}
@@ -42,10 +46,12 @@ class MacroGateBenchmarkStrategy:
         self._last_refresh_day = None
         self._frozen_base_fraction = 0.0
         self._current_target = 0.0
+        self._last_logged_macro_state = None
         self._daily_ts_cache.clear()
         self._daily_last_ts_cache.clear()
         self._daily_index_cache_sig = None
         self._daily_index_values = None
+        logger.debug("macro_gate_benchmark_reset")
 
     # ------------------------------------------------------------------
     def runtime_state(self) -> dict:
@@ -214,6 +220,7 @@ class MacroGateBenchmarkStrategy:
         micro_precomputed: dict[str, Any] | None = None,
     ) -> RegimeDecisionBundle:
         if hourly_df.empty:
+            logger.warning("macro_gate_benchmark_no_hourly_data timestamp=%s", timestamp)
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason="no_hourly_data",
@@ -336,6 +343,22 @@ class MacroGateBenchmarkStrategy:
             "trend_boost_active": 0,
             "boost_multiplier_applied": 1.0,
         }
+
+        state_changed = at_daily_refresh or macro_state.value != self._last_logged_macro_state
+        if state_changed:
+            logger.info(
+                "macro_gate_benchmark_decision_event ts=%s refresh=%s macro_state=%s macro_mult=%.4f base=%.4f core=%.4f final=%.4f intraday_suppressed=%s",
+                ts,
+                at_daily_refresh,
+                macro_state.value,
+                macro_mult,
+                base_fraction,
+                core_target,
+                final_target,
+                intraday_suppressed,
+            )
+
+        self._last_logged_macro_state = macro_state.value
 
         return RegimeDecisionBundle(
             macro_risk_on=macro_on,

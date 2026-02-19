@@ -8,6 +8,10 @@ import json
 import sqlite3
 import time
 
+from ..system_log import get_system_logger
+
+logger = get_system_logger("execution.state_store")
+
 
 @dataclass
 class TradeState:
@@ -25,6 +29,7 @@ class BotStateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        logger.info("state_store_open path=%s", self.path)
         self._init()
 
     def _init(self):
@@ -106,6 +111,9 @@ class BotStateStore:
             self.conn.execute(stmt)
         if alter_statements:
             self.conn.commit()
+            logger.info("state_store_migrations_applied path=%s count=%d statements=%s", self.path, len(alter_statements), alter_statements)
+        else:
+            logger.debug("state_store_schema_ok path=%s", self.path)
 
     def set_kv(self, key: str, value: object) -> None:
         self.conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value)))
@@ -117,7 +125,8 @@ class BotStateStore:
             return default
         try:
             return json.loads(row[0])
-        except Exception:
+        except Exception as exc:
+            logger.warning("state_store_kv_json_decode_failed key=%s error=%s", key, exc)
             return row[0]
 
     def put_open_order(
@@ -216,7 +225,12 @@ class BotStateStore:
             item = dict(r)
             try:
                 item["metadata"] = json.loads(item.get("metadata") or "{}")
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "state_store_open_orders_metadata_decode_failed order_id=%s error=%s",
+                    item.get("client_order_id"),
+                    exc,
+                )
                 item["metadata"] = {}
             out.append(item)
         return out
@@ -231,7 +245,8 @@ class BotStateStore:
         out = dict(row)
         try:
             out["metadata"] = json.loads(out.get("metadata") or "{}")
-        except Exception:
+        except Exception as exc:
+            logger.warning("state_store_open_order_metadata_decode_failed order_id=%s error=%s", order_id, exc)
             out["metadata"] = {}
         return out
 
@@ -279,3 +294,4 @@ class BotStateStore:
 
     def close(self):
         self.conn.close()
+        logger.info("state_store_closed path=%s", self.path)
