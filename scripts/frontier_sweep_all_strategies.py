@@ -55,16 +55,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     p.add_argument("--output-dir", default="artifacts/frontier_all_strategies", help="Output root directory")
+    p.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=21600,
+        help="Timeout for each strategy run in seconds (default: 6 hours)",
+    )
     return p.parse_args()
 
 
-def _run_command(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        cwd=str(ROOT_DIR),
-        text=True,
-        check=False,
-    )
+def _run_command(cmd: list[str], timeout_seconds: int) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=124,
+            stdout=(exc.stdout or "") if exc.stdout else "",
+            stderr=(exc.stderr or "") + f"\nCommand timed out after {timeout_seconds}s\n",
+        )
 
 
 def _build_base_args(args: argparse.Namespace) -> list[str]:
@@ -189,6 +204,7 @@ def _run_all_strategies(args: argparse.Namespace) -> list[dict[str, Any]]:
         if strategy == "macro_gate_benchmark":
             cmd.extend(["--strategy", strategy])
             cmd.extend(["--end", args.end])
+            cmd.extend(["--test-end", args.test_end])
             cmd.extend(args_for_strategy)
         elif strategy == "macro_only_v2":
             cmd.extend(["--test-end", args.test_end])
@@ -202,7 +218,7 @@ def _run_all_strategies(args: argparse.Namespace) -> list[dict[str, Any]]:
 
         print(f"\n=== Running frontier sweep: {strategy} ===")
         print("Command:", " ".join(cmd))
-        completed = _run_command(cmd)
+        completed = _run_command(cmd, timeout_seconds=args.timeout_seconds)
 
         summary = None
         if completed.returncode == 0:
