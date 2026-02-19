@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable, List
 import pandas as pd
 
 from ..config import BotConfig
+from ..system_log import get_system_logger
 from .engine import BacktestEngine
+
+logger = get_system_logger("backtest.walkforward")
 
 
 @dataclass
@@ -64,6 +67,7 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
     results: List[WalkForwardResult] = []
 
     if hourly.empty or daily.empty:
+        logger.warning("walkforward_skipped reason=empty_input hourly_empty=%s daily_empty=%s", hourly.empty, daily.empty)
         return results
 
     h = hourly.copy()
@@ -75,8 +79,20 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
     overall_end = min(h["timestamp"].max(), d["timestamp"].max())
 
     windows = make_windows(overall_start, overall_end, train_years=3, test_years=1)
+    param_sets = list(param_grid)
 
-    for p in param_grid:
+    logger.info(
+        "walkforward_start product=%s params=%d windows=%d range_start=%s range_end=%s",
+        cfg.data.product,
+        len(param_sets),
+        len(windows),
+        overall_start,
+        overall_end,
+    )
+
+    skipped_windows = 0
+
+    for p_idx, p in enumerate(param_sets, start=1):
         if hasattr(cfg, "model_dump"):
             raw_cfg = cfg.model_dump()
         elif hasattr(cfg, "dict"):
@@ -89,7 +105,10 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
             for k, v in dict(p).items():
                 _set_cfg_param(cfg_for_param, str(k), v)
         except Exception:
+            logger.exception("walkforward_param_invalid index=%d params=%s", p_idx, p)
             continue
+
+        logger.info("walkforward_param_start index=%d/%d params=%s", p_idx, len(param_sets), p)
 
         # Warmup: include pre-window history for feature warmup (SMA200,
         # momentum, FRED z-scores, etc.) — mirror the _prefetch_start logic
@@ -102,7 +121,7 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
         )
         warmup_td = timedelta(days=warmup_days)
 
-        for train_start, train_end, test_start, test_end in windows:
+        for w_idx, (train_start, train_end, test_start, test_end) in enumerate(windows, start=1):
             # Include warmup history before each window start so the engine
             # can compute rolling features without defaulting to zero/OFF.
             train_prefetch = train_start - warmup_td
@@ -114,6 +133,14 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
             daily_test = d[(d["timestamp"] >= test_prefetch) & (d["timestamp"] < test_end)]
 
             if hourly_train.empty or hourly_test.empty or daily_train.empty or daily_test.empty:
+                skipped_windows += 1
+                logger.debug(
+                    "walkforward_window_skipped param_index=%d window_index=%d train_start=%s test_end=%s",
+                    p_idx,
+                    w_idx,
+                    train_start,
+                    test_end,
+                )
                 continue
 
             # train: run on training slice first, then evaluate on out-of-sample test slice.
@@ -140,6 +167,18 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 }
             )
             cfg_for_run.backtest = type(cfg_for_param.backtest)(**bt_payload)
+
+            logger.info(
+                "walkforward_window_start param_index=%d/%d window_index=%d/%d train=%s..%s test=%s..%s",
+                p_idx,
+                len(param_sets),
+                w_idx,
+                len(windows),
+                train_start.date(),
+                train_end.date(),
+                test_start.date(),
+                test_end.date(),
+            )
 
             engine_train = BacktestEngine(
                 product=cfg.data.product,
@@ -177,12 +216,27 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                     diagnostics=result.diagnostics,
                 )
             )
+            logger.info(
+                "walkforward_window_complete param_index=%d window_index=%d metric_cagr=%s metric_sharpe=%s",
+                p_idx,
+                w_idx,
+                result.metrics.get("cagr"),
+                result.metrics.get("sharpe"),
+            )
+
+    logger.info(
+        "walkforward_complete results=%d skipped_windows=%d params=%d",
+        len(results),
+        skipped_windows,
+        len(param_sets),
+    )
 
     return results
 
 
 def choose_robust_parameter_set(results: List[WalkForwardResult], metric_name: str = "cagr", penalty: float = 0.5) -> Dict:
     if not results:
+        logger.warning("walkforward_choose_best_empty_results metric=%s", metric_name)
         return {}
 
     # robust score: average metric - penalty*std
@@ -203,9 +257,18 @@ def choose_robust_parameter_set(results: List[WalkForwardResult], metric_name: s
         scores.append((score, k, arr.mean(), arr.std()))
 
     if not scores:
+        logger.warning("walkforward_choose_best_no_scores metric=%s", metric_name)
         return {}
     scores.sort(key=lambda x: x[0], reverse=True)
     best_score, best_params, avg, std = scores[0]
+    logger.info(
+        "walkforward_choose_best metric=%s candidates=%d best_score=%.6f avg=%.6f std=%.6f",
+        metric_name,
+        len(scores),
+        best_score,
+        avg,
+        std,
+    )
     return {
         "params": dict(best_params),
         "avg_metric": float(avg),
