@@ -25,6 +25,10 @@ from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.frontier_sweep_macro_only")
 
 
 DEFAULT_GRID_MACRO_ONLY: dict[str, list[Any]] = {
@@ -449,6 +453,8 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_macro_only_start log_path=%s args=%s", log_path, vars(args))
 
     if not _validate_acceleration_backend(args.acceleration_backend):
         return 2
@@ -501,6 +507,13 @@ def main() -> int:
         small=args.small,
         include_fred_grid=bool(args.include_fred_grid),
     )
+    logger.info(
+        "frontier_macro_only_config param_sets=%d workers=%s scenarios=%d skip_baseline=%s",
+        len(param_sets),
+        args.workers,
+        len(SCENARIOS),
+        bool(args.skip_benchmark_baseline),
+    )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -530,6 +543,11 @@ def main() -> int:
                     row["param_id"] = "baseline"
                     baseline_rows.append(row)
                 except Exception as exc:
+                    logger.exception(
+                        "macro_only_baseline_error window=%s scenario=%s",
+                        window.name,
+                        scenario.name,
+                    )
                     baseline_rows.append(
                         {
                             "param_id": "baseline",
@@ -572,6 +590,13 @@ def main() -> int:
                         grouped[param_id][window.name][scenario.name] = row
                         summary_rows.append(row)
                     except Exception as exc:
+                        logger.exception(
+                            "macro_only_run_error param_id=%s window=%s scenario=%s params=%s",
+                            param_id,
+                            window.name,
+                            scenario.name,
+                            params,
+                        )
                         summary_rows.append(
                             {
                                 "param_id": param_id,
@@ -636,6 +661,11 @@ def main() -> int:
                     done += 1
                     grouped[param_id] = {}
                     print(f"[{done}/{len(param_sets)}] {param_id} failed", flush=True)
+                    logger.exception(
+                        "macro_only_worker_error param_id=%s params=%s",
+                        param_id,
+                        params,
+                    )
                     summary_rows.append(
                         {
                             "param_id": param_id,
@@ -784,9 +814,22 @@ def main() -> int:
         print(f"Summary: {summary_path}")
         print(f"Frontier: {frontier_path}")
         print(f"Reproduce best: {test_repro}")
+        logger.info(
+            "frontier_macro_only_complete ranked=%d top=%d summary=%s frontier=%s best_config=%s",
+            len(ranked),
+            len(top),
+            summary_path,
+            frontier_path,
+            best_cfg_path,
+        )
     else:
         print("macro_only_v2 frontier sweep completed, but no configuration passed filters.")
         print(f"Summary: {summary_path}")
+        logger.warning(
+            "frontier_macro_only_no_winner param_sets=%d summary=%s",
+            len(param_sets),
+            summary_path,
+        )
 
     return 0
 

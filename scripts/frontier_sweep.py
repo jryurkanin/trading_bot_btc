@@ -24,6 +24,10 @@ from bot.config import BacktestConfig
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.frontier_sweep")
 
 
 DEFAULT_GRID_SPACE: dict[str, list[Any]] = {
@@ -322,6 +326,9 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_sweep_start log_path=%s args=%s", log_path, vars(args))
+
     if not _validate_acceleration_backend(args.acceleration_backend):
         return 2
 
@@ -367,6 +374,14 @@ def main() -> int:
         small=bool(args.small),
     )
 
+    logger.info(
+        "frontier_sweep_config strategy=%s param_sets=%d windows=%d scenarios=%d",
+        args.strategy,
+        len(param_sets),
+        len(windows),
+        len(SCENARIOS),
+    )
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -397,6 +412,14 @@ def main() -> int:
                     summary_rows.append(row)
                     grouped[param_id][window.name][scenario.name] = row
                 except Exception as exc:
+                    logger.exception(
+                        "frontier_run_error strategy=%s param_id=%s window=%s scenario=%s params=%s",
+                        args.strategy,
+                        param_id,
+                        window.name,
+                        scenario.name,
+                        params,
+                    )
                     summary_rows.append(
                         {
                             "param_id": param_id,
@@ -554,9 +577,24 @@ def main() -> int:
         print(dumps_strict_json(best_payload, indent=2))
         print("Reproduce best test run:")
         print(repro_cmd)
+        logger.info(
+            "frontier_sweep_complete strategy=%s ranked=%d top=%d summary=%s frontier=%s best_config=%s",
+            args.strategy,
+            len(ranked),
+            len(top),
+            summary_path,
+            frontier_path,
+            best_cfg_path,
+        )
     else:
         print("Frontier sweep completed but no config satisfied constraints.")
         print(f"Summary: {summary_path}")
+        logger.warning(
+            "frontier_sweep_no_winner strategy=%s param_sets=%d summary=%s",
+            args.strategy,
+            len(param_sets),
+            summary_path,
+        )
 
     return 0
 

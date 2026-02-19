@@ -17,6 +17,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 from bot.config import BacktestConfig
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -34,6 +35,8 @@ RUNNERS: dict[str, StrategyRunner] = {
     "regime_switching_orchestrator": ("frontier_sweep_v3.py", "regime_switching_orchestrator"),
     "macro_gate_state": ("frontier_sweep_v3.py", "macro_gate_state"),
 }
+
+logger = get_system_logger("scripts.frontier_sweep_all_strategies")
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,18 +114,31 @@ def _write_progress(progress_file: Path, event: dict[str, Any]) -> None:
     progress_file.parent.mkdir(parents=True, exist_ok=True)
     with progress_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload) + "\n")
+    logger.debug("progress_event path=%s payload=%s", progress_file, payload)
 
 
 def _run_command(cmd: list[str], timeout_seconds: int) -> subprocess.CompletedProcess:
+    logger.info("subprocess_start timeout=%ss cmd=%s", timeout_seconds, " ".join(cmd))
     try:
-        return subprocess.run(
+        completed = subprocess.run(
             cmd,
             cwd=str(ROOT_DIR),
             text=True,
             check=False,
             timeout=timeout_seconds,
         )
+        logger.info(
+            "subprocess_done rc=%s cmd=%s",
+            completed.returncode,
+            " ".join(cmd),
+        )
+        if completed.stdout:
+            logger.debug("subprocess_stdout cmd=%s stdout=%s", " ".join(cmd), completed.stdout[-4000:])
+        if completed.stderr:
+            logger.debug("subprocess_stderr cmd=%s stderr=%s", " ".join(cmd), completed.stderr[-4000:])
+        return completed
     except subprocess.TimeoutExpired as exc:
+        logger.exception("subprocess_timeout timeout=%ss cmd=%s", timeout_seconds, " ".join(cmd))
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=124,
@@ -354,6 +370,13 @@ def _execute_strategy_job(
     max_error_rate: float,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc)
+    logger.info(
+        "strategy_job_start strategy=%s runner=%s timeout=%s output_dir=%s",
+        strategy,
+        script_name,
+        timeout_seconds,
+        strategy_dir,
+    )
     completed = _run_command(cmd, timeout_seconds=timeout_seconds)
     finished_at = datetime.now(timezone.utc)
     elapsed_sec = (finished_at - started_at).total_seconds()
@@ -380,6 +403,19 @@ def _execute_strategy_job(
     else:
         err_rows, total_rows, error_rate = _summary_error_stats(strategy_dir)
         print(f"Strategy {strategy} failed with exit code {completed.returncode}")
+
+    logger.info(
+        "strategy_job_done strategy=%s runner=%s effective_rc=%s raw_rc=%s duration=%.2fs error_rows=%s total_rows=%s error_rate=%.3f summary=%s",
+        strategy,
+        script_name,
+        effective_return_code,
+        int(completed.returncode),
+        elapsed_sec,
+        err_rows,
+        total_rows,
+        error_rate,
+        summary is not None,
+    )
 
     return {
         "strategy": strategy,
@@ -720,6 +756,9 @@ def _summarize(
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_all_start log_path=%s args=%s", log_path, vars(args))
+
     if not ACTIVE_STRATEGIES:
         print("No active strategies discovered in BacktestConfig.VALID_STRATEGIES")
         return 1
@@ -732,7 +771,7 @@ def main() -> int:
         return 2
 
     results, run_reports_dir, progress_path = _run_all_strategies(args)
-    _summarize(
+    summary_report = _summarize(
         results,
         output_root=Path(args.output_dir),
         run_reports_dir=run_reports_dir,
@@ -740,6 +779,7 @@ def main() -> int:
         ranking_mode=args.ranking_mode,
     )
 
+    logger.info("frontier_all_complete summary=%s", summary_report)
     return 0
 
 

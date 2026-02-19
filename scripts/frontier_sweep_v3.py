@@ -24,6 +24,10 @@ from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.frontier_sweep_v3")
 
 
 DEFAULT_STRATEGY = "macro_gate_state"
@@ -334,6 +338,9 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_v3_start log_path=%s args=%s", log_path, vars(args))
+
     if not _validate_acceleration_backend(args.acceleration_backend):
         return 2
 
@@ -374,6 +381,12 @@ def main() -> int:
 
     grid_flags = parse_grid_flags(args.grid)
     param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
+    logger.info(
+        "frontier_v3_config strategy=%s param_sets=%d scenarios=%d",
+        args.strategy,
+        len(param_sets),
+        len(SCENARIOS),
+    )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

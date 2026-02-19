@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-import logging
 
 import pandas as pd
 
@@ -20,11 +19,12 @@ from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
 from ..strategy.regime_switching_v4_core import V4CoreStrategy
 from ..strategy.v5_adaptive import V5AdaptiveStrategy
+from ..system_log import setup_system_logger, get_system_logger
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
 
 
-logger = logging.getLogger("trading_bot.backtest.engine")
+logger = get_system_logger("backtest.engine")
 
 
 @dataclass
@@ -77,6 +77,15 @@ class BacktestEngine:
     fred_config: Optional[FredConfig] = None
 
     def run(self) -> BacktestResult:
+        log_path = setup_system_logger()
+        logger.info(
+            "engine_run_start log_path=%s product=%s start=%s end=%s",
+            log_path,
+            self.product,
+            self.start,
+            self.end,
+        )
+
         cfg = self.config or BacktestConfig()
         reg_cfg = self.regime_config or RegimeConfig()
         risk_cfg = self.risk_config or RiskConfig()
@@ -147,6 +156,15 @@ class BacktestEngine:
         if start_i >= len(hourly):
             raise ValueError("No hourly candles in backtest window")
 
+        logger.info(
+            "engine_input_ready product=%s strategy=%s hourly_rows=%d daily_rows=%d start_i=%d",
+            self.product,
+            cfg.strategy,
+            len(hourly),
+            len(daily),
+            start_i,
+        )
+
         # Precompute heavy regime inputs once so the backtest loop is O(n),
         # not O(n^2) from repeatedly recomputing rolling features.
         acc_ctx = resolve_acceleration_backend(getattr(cfg, "acceleration_backend", "auto"))
@@ -168,8 +186,20 @@ class BacktestEngine:
         )
         hourly_precomputed: dict[str, Any] = {
             "realized_vol": realized_vol,
-            "adx": compute_adx(hourly["high"], hourly["low"], hourly["close"], window=reg_cfg.adx_window),
-            "chop": compute_chop(hourly["high"], hourly["low"], hourly["close"], window=reg_cfg.chop_window),
+            "adx": compute_adx(
+                hourly["high"],
+                hourly["low"],
+                hourly["close"],
+                window=reg_cfg.adx_window,
+                backend=acc_backend,
+            ),
+            "chop": compute_chop(
+                hourly["high"],
+                hourly["low"],
+                hourly["close"],
+                window=reg_cfg.chop_window,
+                backend=acc_backend,
+            ),
             "vol_thresholds": realized_vol.rolling(vol_lookback_hours, min_periods=vol_min_periods).quantile(
                 reg_cfg.vol_high_threshold_quantile
             ),
@@ -181,13 +211,29 @@ class BacktestEngine:
         }
 
         # Precompute sub-strategy indicators for O(1) per-bar lookups.
-        _donchian_low, _donchian_high = donchian_channel(hourly["high"], hourly["low"], reg_cfg.donchian_window)
+        _donchian_low, _donchian_high = donchian_channel(
+            hourly["high"],
+            hourly["low"],
+            reg_cfg.donchian_window,
+            backend=acc_backend,
+        )
         hourly_precomputed["donchian_high"] = _donchian_high
         hourly_precomputed["donchian_low"] = _donchian_low
-        hourly_precomputed["atr"] = compute_atr(hourly["high"], hourly["low"], hourly["close"], reg_cfg.atr_window)
-        hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast)
-        hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow)
-        _bb_mid, _bb_upper, _bb_lower = bollinger_bands(hourly["close"], reg_cfg.bb_window, reg_cfg.bb_stdev)
+        hourly_precomputed["atr"] = compute_atr(
+            hourly["high"],
+            hourly["low"],
+            hourly["close"],
+            reg_cfg.atr_window,
+            backend=acc_backend,
+        )
+        hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast, backend=acc_backend)
+        hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow, backend=acc_backend)
+        _bb_mid, _bb_upper, _bb_lower = bollinger_bands(
+            hourly["close"],
+            reg_cfg.bb_window,
+            reg_cfg.bb_stdev,
+            backend=acc_backend,
+        )
         hourly_precomputed["bb_mid"] = _bb_mid
         hourly_precomputed["bb_upper"] = _bb_upper
         hourly_precomputed["bb_lower"] = _bb_lower
@@ -215,6 +261,15 @@ class BacktestEngine:
                 )
             )
 
+        logger.info(
+            "engine_acceleration requested=%s effective=%s cuda_available=%s device=%s fallback_reason=%s",
+            hourly_precomputed.get("acceleration_requested"),
+            hourly_precomputed.get("acceleration_backend"),
+            hourly_precomputed.get("acceleration_cuda_available"),
+            hourly_precomputed.get("acceleration_device"),
+            hourly_precomputed.get("acceleration_fallback_reason"),
+        )
+
         strategy_id = cfg.strategy if cfg.strategy else "macro_gate_benchmark"
         if strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
@@ -231,6 +286,9 @@ class BacktestEngine:
         else:
             valid = ", ".join(sorted(["macro_gate_benchmark", "macro_only_v2", "macro_gate_state", "regime_switching_v4_core", "regime_switching_orchestrator", "v5_adaptive"]))
             raise ValueError(f"Unsupported strategy '{strategy_id}'. Supported: [{valid}]")
+
+        logger.info("engine_strategy_selected strategy_id=%s orchestrator=%s", strategy_id, orchestrator.__class__.__name__)
+
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)
 
@@ -314,6 +372,21 @@ class BacktestEngine:
                 signal_ts,
             )
 
+            logger.debug(
+                "decision ts=%s strategy=%s micro=%s macro_state=%s risk_on=%s raw_target=%.6f capped_target=%.6f target_bucket=%.6f exposure=%.6f should_trade=%s reason=%s",
+                signal_ts,
+                bundle.strategy_name,
+                bundle.micro_regime.value,
+                bundle.metadata.get("macro_state", "OFF"),
+                bundle.macro_risk_on,
+                raw_target,
+                target,
+                target_bucket,
+                current_exposure,
+                should_trade,
+                rebalance_reason,
+            )
+
             if should_trade:
                 delta = target_bucket - current_exposure
                 side = "BUY" if delta > 0 else "SELL"
@@ -336,6 +409,17 @@ class BacktestEngine:
                     ask = mark_open * (1.0 + spread_bps / 20_000.0)
                     order_type = "limit"
                     limit_price = bid if side == "BUY" else ask
+
+                logger.debug(
+                    "trade_attempt ts=%s side=%s qty=%.8f desired_notional=%.6f delta=%.6f order_type=%s limit_price=%s",
+                    exec_ts,
+                    side,
+                    qty,
+                    desired_notional,
+                    delta,
+                    order_type,
+                    limit_price,
+                )
 
                 order = BacktestOrder(
                     side=side,
@@ -398,6 +482,20 @@ class BacktestEngine:
                                     fill_model=fill_model.name,
                                     rebalance_reason=rebalance_reason,
                                 )
+                            )
+                            logger.info(
+                                "trade_filled ts=%s strategy=%s side=%s qty=%.8f price=%.6f notional=%.6f fee=%.6f maker=%s slippage_bps=%.4f exposure_before=%.6f exposure_after=%.6f",
+                                exec_ts,
+                                bundle.strategy_name,
+                                side,
+                                qty_exec,
+                                float(fill.price),
+                                float(notional),
+                                float(fee),
+                                bool(fill.is_maker),
+                                float(slippage_bps),
+                                current_exposure,
+                                target_bucket,
                             )
                             rebalance.on_trade(signal_ts, target_bucket)
 
@@ -531,6 +629,17 @@ class BacktestEngine:
             "acceleration_fallback_reason": hourly_precomputed.get("acceleration_fallback_reason"),
             "fred": fred_report,
         }
+
+        logger.info(
+            "engine_run_complete strategy=%s bars=%d trades=%d cagr=%s sharpe=%s max_drawdown=%s turnover=%s",
+            strategy_id,
+            len(eq_df),
+            int(len(tr)),
+            metrics.get("cagr"),
+            metrics.get("sharpe"),
+            metrics.get("max_drawdown"),
+            metrics.get("turnover"),
+        )
 
         return BacktestResult(
             equity_curve=eq_df,

@@ -18,6 +18,10 @@ from bot.backtest.engine import BacktestEngine
 from bot.backtest.reporting import write_strict_json, dumps_strict_json
 from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.analysis.pnl_decomposition import run_pnl_decomposition
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.backtest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +132,9 @@ def _prefetch_start(start: datetime, cfg: BotConfig) -> datetime:
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("backtest_start log_path=%s args=%s", log_path, vars(args))
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.initial_equity = args.initial_equity
@@ -265,6 +272,14 @@ def main() -> int:
     start = parse_ts(args.start)
     end = parse_ts(args.end)
     prefetch_start = _prefetch_start(start, cfg)
+    logger.info(
+        "backtest_window product=%s strategy=%s start=%s end=%s prefetch_start=%s",
+        args.product,
+        args.strategy,
+        start.isoformat(),
+        end.isoformat(),
+        prefetch_start.isoformat(),
+    )
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     maker = args.maker_bps / 10000.0
@@ -290,6 +305,12 @@ def main() -> int:
         client=client,
         query=CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end),
     )
+    logger.info(
+        "backtest_candles_loaded product=%s hourly_rows=%d daily_rows=%d",
+        args.product,
+        len(hourly),
+        len(daily),
+    )
 
     engine = BacktestEngine(
         product=args.product,
@@ -307,6 +328,13 @@ def main() -> int:
         fred_config=cfg.fred,
     )
     result = engine.run()
+    logger.info(
+        "backtest_complete strategy=%s trade_count=%d metrics=%s diagnostics=%s",
+        args.strategy,
+        len(result.trades),
+        result.metrics,
+        result.diagnostics,
+    )
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -440,6 +468,15 @@ def main() -> int:
     print(f"Equity curve: {out / 'equity_curve.csv'}")
     print(f"Macro bucket attribution: {macro_bucket_csv}")
     print(f"Report: {report_path}")
+    logger.info(
+        "backtest_artifacts output=%s report=%s equity=%s trades=%s decisions=%s macro_bucket=%s",
+        out,
+        report_path,
+        equity_csv,
+        trades_csv,
+        decisions_csv,
+        macro_bucket_csv,
+    )
     return 0
 
 
