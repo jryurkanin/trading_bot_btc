@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from itertools import product
 from pathlib import Path
@@ -15,6 +16,9 @@ from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleStore, CandleQuery
 from bot.backtest.walkforward import walk_forward_test, choose_robust_parameter_set
+from bot.system_log import setup_system_logger, get_system_logger
+
+logger = get_system_logger("scripts.optimize")
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="reports")
     p.add_argument("--grid", action="append", help="KEY=VAL, can be repeated (e.g. bb_window=20)")
     p.add_argument("--metric", default="cagr")
+    p.add_argument(
+        "--log-path",
+        default=None,
+        help="optional system log path (default: BOT_SYSTEM_LOG_PATH or system_log.log)",
+    )
     return p.parse_args()
 
 
@@ -91,6 +100,10 @@ def build_grid(items: list[str]):
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger(args.log_path)
+    started = time.time()
+    logger.info("optimize_start log_path=%s args=%s", log_path, vars(args))
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.strategy = args.strategy
@@ -105,6 +118,14 @@ def main() -> int:
     store = CandleStore(cfg.data)
     hourly = store.get_candles(client, CandleQuery(product=args.product, timeframe="1h", start=prefetch_start, end=end))
     daily = store.get_candles(client, CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end))
+    logger.info(
+        "optimize_data_loaded product=%s prefetch_start=%s end=%s hourly_rows=%d daily_rows=%d",
+        args.product,
+        prefetch_start,
+        end,
+        len(hourly),
+        len(daily),
+    )
 
     grid = build_grid(args.grid or [])
     if not grid:
@@ -123,8 +144,15 @@ def main() -> int:
             },
         ]
 
+    logger.info("optimize_grid_ready combinations=%d metric=%s", len(grid), args.metric)
+
     results = walk_forward_test(hourly, daily, cfg, grid)
     best = choose_robust_parameter_set(results, metric_name=args.metric)
+    logger.info(
+        "optimize_walkforward_complete windows_evaluated=%d best_found=%s",
+        len(results),
+        bool(best),
+    )
 
     def _serialize_result(r):
         return {
@@ -139,6 +167,10 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     out_path = out / "optimization.json"
     out_path.write_text(json.dumps({"results": [_serialize_result(r) for r in results], "best": best}, indent=2), encoding="utf-8")
+
+    elapsed = time.time() - started
+    logger.info("optimize_complete out_path=%s elapsed_seconds=%.2f", out_path, elapsed)
+
     print("Optimization done")
     print(json.dumps(best, indent=2))
     print(f"Saved: {out_path}")
