@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 
 from ..backtest.reporting import write_strict_json, dumps_strict_json
+from ..system_log import get_system_logger
+
+logger = get_system_logger("analysis.pnl_decomposition")
 
 
 @dataclass
@@ -139,6 +142,11 @@ def compute_pnl_decomposition(
         msg = f"avg SELL slippage {avg_sell:.2f} bps > max_allowed_slippage_bps {max_allowed_slippage_bps:.2f}"
         (guardrail.errors if ci_mode else guardrail.warnings).append(msg)
 
+    if guardrail.warnings:
+        logger.warning("pnl_decomposition_guardrail_warnings warnings=%s", guardrail.warnings)
+    if guardrail.errors:
+        logger.error("pnl_decomposition_guardrail_errors errors=%s", guardrail.errors)
+
     out = {
         "net_return": float(net_return),
         "gross_return": float(gross_return),
@@ -162,7 +170,17 @@ def compute_pnl_decomposition(
         },
     }
 
+    logger.info(
+        "pnl_decomposition_complete trade_count=%d net_pnl=%.6f gross_pnl=%.6f total_fees=%.6f total_slippage_cost=%.6f",
+        int(len(tr)),
+        float(net_pnl),
+        float(gross_pnl),
+        float(total_fees),
+        float(total_slippage_cost),
+    )
+
     if ci_mode and guardrail.errors:
+        logger.error("pnl_decomposition_ci_failure errors=%s", guardrail.errors)
         raise ValueError("; ".join(guardrail.errors))
 
     return out
@@ -181,6 +199,16 @@ def run_pnl_decomposition(
     equity_curve_path = Path(equity_curve_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "pnl_decomposition_run_start trades_path=%s equity_curve_path=%s output_dir=%s ci_mode=%s min_trade_notional_usd=%.2f max_allowed_slippage_bps=%.2f",
+        trades_path,
+        equity_curve_path,
+        output_dir,
+        bool(ci_mode),
+        float(min_trade_notional_usd),
+        float(max_allowed_slippage_bps),
+    )
 
     if trades_path.exists():
         try:
@@ -201,6 +229,7 @@ def run_pnl_decomposition(
     )
 
     out_path = write_strict_json(output_dir / "execution_quality.json", result)
+    logger.info("pnl_decomposition_run_complete output_path=%s", out_path)
 
     print("Execution quality summary")
     print(dumps_strict_json({
