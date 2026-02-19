@@ -7,7 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..system_log import get_system_logger
 from . import indicators
+
+logger = get_system_logger("features.macro_score")
 
 
 DEFAULT_COMPONENTS = [
@@ -102,7 +105,8 @@ class MacroGateStateMachine:
             return
         try:
             self.state = MacroState(str(payload.get("state", self.state.value)))
-        except Exception:
+        except Exception as exc:
+            logger.warning("macro_gate_restore_invalid_state value=%s error=%s", payload.get("state"), exc)
             self.state = MacroState.OFF
         self.state_age_days = int(payload.get("state_age_days", self.state_age_days) or 0)
         ts_raw = payload.get("last_daily_ts")
@@ -137,6 +141,7 @@ class MacroGateStateMachine:
         if self._same_bar(daily_ts):
             return self.state
 
+        prev_state = self.state
         self.last_daily_ts = pd.Timestamp(daily_ts)
         self.state_age_days += 1
         self._update_streaks(score)
@@ -147,21 +152,32 @@ class MacroGateStateMachine:
                     self._set_state(MacroState.ON_FULL)
                 elif self._enter_half_streak >= self.confirm_days:
                     self._set_state(MacroState.ON_HALF)
-            return self.state
-
-        if self.state == MacroState.ON_HALF:
+        elif self.state == MacroState.ON_HALF:
             if self._enter_full_streak >= self.confirm_days:
                 self._set_state(MacroState.ON_FULL)
-                return self.state
+            elif self.state_age_days >= self.min_on_days and self._exit_streak >= self.confirm_days:
+                self._set_state(MacroState.OFF)
+        else:
+            # ON_FULL
             if self.state_age_days >= self.min_on_days and self._exit_streak >= self.confirm_days:
                 self._set_state(MacroState.OFF)
-            return self.state
+            elif self._deescalate_streak >= self.confirm_days:
+                self._set_state(MacroState.ON_HALF)
 
-        # ON_FULL
-        if self.state_age_days >= self.min_on_days and self._exit_streak >= self.confirm_days:
-            self._set_state(MacroState.OFF)
-        elif self._deescalate_streak >= self.confirm_days:
-            self._set_state(MacroState.ON_HALF)
+        if self.state != prev_state:
+            logger.info(
+                "macro_gate_transition ts=%s prev=%s next=%s score=%.4f age_days=%d enter_half_streak=%d enter_full_streak=%d exit_streak=%d deescalate_streak=%d",
+                self.last_daily_ts,
+                prev_state.value,
+                self.state.value,
+                score,
+                self.state_age_days,
+                self._enter_half_streak,
+                self._enter_full_streak,
+                self._exit_streak,
+                self._deescalate_streak,
+            )
+
         return self.state
 
     @staticmethod

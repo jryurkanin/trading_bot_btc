@@ -11,9 +11,12 @@ from ..features.regime import RegimeState
 from ..features.macro_signals import macro_signal_strength, MacroStrength
 from ..features.vol_sizing import realized_ann_vol_from_daily, sized_weight
 from ..features.indicators import realized_vol
+from ..system_log import get_system_logger
 from .macro_gate_state import MacroGateV2
 from .drawdown_breaker import DrawdownBreaker
 from .regime_switching_orchestrator import RegimeDecisionBundle
+
+logger = get_system_logger("strategy.macro_only_v2")
 
 
 class MacroOnlyV2Strategy:
@@ -46,6 +49,8 @@ class MacroOnlyV2Strategy:
         self._daily_realized_cache: dict[int, float] = {}
         self._daily_last_ts_cache: dict[int, pd.Timestamp | None] = {}
         self._acceleration_backend: str = "cpu"
+        self._last_logged_macro_state: str | None = None
+        self._last_logged_breaker_active: bool | None = None
 
     def reset(self) -> None:
         self._gate.reset()
@@ -62,6 +67,9 @@ class MacroOnlyV2Strategy:
         self._daily_realized_cache.clear()
         self._daily_last_ts_cache.clear()
         self._acceleration_backend = "cpu"
+        self._last_logged_macro_state = None
+        self._last_logged_breaker_active = None
+        logger.debug("macro_only_v2_reset")
 
     @staticmethod
     def _to_timestamp_col(df: pd.DataFrame) -> pd.Series:
@@ -289,6 +297,7 @@ class MacroOnlyV2Strategy:
         micro_precomputed: dict[str, Any] | None = None,
     ) -> RegimeDecisionBundle:
         if hourly_df.empty:
+            logger.warning("macro_only_v2_no_hourly_data timestamp=%s", timestamp)
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason="no_hourly_data",
@@ -458,6 +467,31 @@ class MacroOnlyV2Strategy:
             "trend_boost_active": 0,
             "boost_multiplier_applied": 1.0,
         }
+
+        state_changed = (
+            at_daily_refresh
+            or macro_state.value != self._last_logged_macro_state
+            or bool(self._breaker.active) != bool(self._last_logged_breaker_active)
+        )
+        if state_changed:
+            logger.info(
+                "macro_only_v2_decision_event ts=%s refresh=%s signal=%s macro_state=%s breaker_active=%s realized_ann_vol=%.6f base=%.4f pre_breaker=%.4f post_breaker=%.4f fred_penalty=%.4f final=%.4f intraday_suppressed=%s",
+                ts,
+                at_daily_refresh,
+                daily_signal.value,
+                macro_state.value,
+                bool(self._breaker.active),
+                float(realized_ann_vol),
+                float(base_fraction),
+                float(target_pre_breaker),
+                float(target_after_breaker),
+                float(fred_penalty_multiplier),
+                float(final_target),
+                intraday_suppressed,
+            )
+
+        self._last_logged_macro_state = macro_state.value
+        self._last_logged_breaker_active = bool(self._breaker.active)
 
         return RegimeDecisionBundle(
             macro_risk_on=bool(final_target > 0.0),

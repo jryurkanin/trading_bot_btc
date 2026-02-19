@@ -7,6 +7,9 @@ import pandas as pd
 
 from ..features.macro_signals import MacroStrength
 from ..features.macro_score import MacroState
+from ..system_log import get_system_logger
+
+logger = get_system_logger("strategy.macro_gate_state")
 
 
 @dataclass(frozen=True)
@@ -74,7 +77,8 @@ class MacroGateV2:
         raw_state = payload.get("state", self.state.value)
         try:
             self.state = MacroState(str(raw_state))
-        except Exception:
+        except Exception as exc:
+            logger.warning("macro_gate_v2_restore_invalid_state value=%s error=%s", raw_state, exc)
             self.state = MacroState.OFF
 
         self.state_age_days = int(payload.get("state_age_days", 0) or 0)
@@ -132,6 +136,7 @@ class MacroGateV2:
         if self._same_bar(daily_ts):
             return self.state
 
+        prev_state = self.state
         self.last_daily_ts = pd.Timestamp(daily_ts)
         self.state_age_days += 1
 
@@ -145,19 +150,30 @@ class MacroGateV2:
                     self._set_state(MacroState.ON_FULL)
                 elif self._on_half_streak >= self.confirm_days:
                     self._set_state(MacroState.ON_HALF)
-            return self.state
-
-        if self.state == MacroState.ON_HALF:
+        elif self.state == MacroState.ON_HALF:
             if self._on_full_streak >= self.confirm_days:
                 self._set_state(MacroState.ON_FULL)
             elif self._state_allows_exit() and self._off_streak >= self.confirm_days:
                 self._set_state(MacroState.OFF)
-            return self.state
+        else:
+            # ON_FULL
+            if self._state_allows_exit() and self._off_streak >= self.confirm_days:
+                self._set_state(MacroState.OFF)
+            elif self._deescalate_streak >= self.confirm_days and rank <= 1:
+                self._set_state(MacroState.ON_HALF)
 
-        # ON_FULL
-        if self._state_allows_exit() and self._off_streak >= self.confirm_days:
-            self._set_state(MacroState.OFF)
-        elif self._deescalate_streak >= self.confirm_days and rank <= 1:
-            self._set_state(MacroState.ON_HALF)
+        if self.state != prev_state:
+            logger.info(
+                "macro_gate_v2_transition ts=%s prev=%s next=%s signal=%s age_days=%d on_half_streak=%d on_full_streak=%d off_streak=%d deescalate_streak=%d",
+                self.last_daily_ts,
+                prev_state.value,
+                self.state.value,
+                signal.value,
+                self.state_age_days,
+                self._on_half_streak,
+                self._on_full_streak,
+                self._off_streak,
+                self._deescalate_streak,
+            )
 
         return self.state

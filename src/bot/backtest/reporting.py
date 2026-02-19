@@ -8,6 +8,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..system_log import get_system_logger
+
+logger = get_system_logger("backtest.reporting")
+
 
 def sanitize_for_json(value: Any) -> Any:
     if isinstance(value, dict):
@@ -50,4 +54,5 @@ def write_strict_json(path: str | Path, payload: Any, *, indent: int = 2) -> Pat
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(dumps_strict_json(payload, indent=indent), encoding="utf-8")
+    logger.info("reporting_write_json path=%s", out)
     return out

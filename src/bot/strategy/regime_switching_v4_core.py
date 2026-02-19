@@ -11,8 +11,11 @@ from ..config import RegimeConfig
 from ..features import indicators
 from ..features.macro_score import MacroState
 from ..features.regime import RegimeState, RuleBasedRegimeSwitcher, compute_adx, compute_chop
+from ..system_log import get_system_logger
 from .macro_gate import V4MacroGate
 from .regime_switching_orchestrator import RegimeDecisionBundle
+
+logger = get_system_logger("strategy.v4_core")
 
 
 class V4CoreStrategy:
@@ -43,6 +46,8 @@ class V4CoreStrategy:
         self._last_refresh_day: pd.Timestamp | None = None
         self._frozen_base_fraction: float = 0.0
         self._current_target: float = 0.0
+        self._last_logged_micro_regime: RegimeState | None = None
+        self._last_logged_macro_state: str | None = None
 
     def reset(self) -> None:
         self._gate.reset()
@@ -50,6 +55,9 @@ class V4CoreStrategy:
         self._last_refresh_day = None
         self._frozen_base_fraction = 0.0
         self._current_target = 0.0
+        self._last_logged_micro_regime = None
+        self._last_logged_macro_state = None
+        logger.debug("v4_state_reset")
 
     # ------------------------------------------------------------------
     # Helpers — mirror orchestrator's daily-bar logic
@@ -180,6 +188,7 @@ class V4CoreStrategy:
         micro_precomputed: dict[str, Any] | None = None,
     ) -> RegimeDecisionBundle:
         if hourly_df.empty:
+            logger.warning("v4_no_hourly_data timestamp=%s", timestamp)
             return RegimeDecisionBundle(
                 macro_risk_on=False,
                 macro_reason="no_hourly_data",
@@ -298,6 +307,29 @@ class V4CoreStrategy:
             "trend_boost_active": 0,
             "boost_multiplier_applied": 1.0,
         }
+
+        state_changed = (
+            at_daily_refresh
+            or micro_regime != self._last_logged_micro_regime
+            or macro_state.value != self._last_logged_macro_state
+        )
+        if state_changed:
+            logger.info(
+                "v4_decision_event ts=%s refresh=%s macro_state=%s macro_mult=%.4f micro_regime=%s micro_mult=%.4f base=%.4f core=%.4f final=%.4f intraday_suppressed=%s",
+                ts,
+                at_daily_refresh,
+                macro_state.value,
+                macro_mult,
+                micro_regime.value,
+                micro_mult,
+                base_fraction,
+                core_target,
+                final_target,
+                intraday_suppressed,
+            )
+
+        self._last_logged_micro_regime = micro_regime
+        self._last_logged_macro_state = macro_state.value
 
         return RegimeDecisionBundle(
             macro_risk_on=macro_on,

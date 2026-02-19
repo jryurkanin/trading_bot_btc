@@ -8,6 +8,9 @@ import pandas as pd
 
 from ..execution.order_router import SimulatedFill
 from ..execution.state_store import BotStateStore
+from ..system_log import get_system_logger
+
+logger = get_system_logger("live.paper")
 
 
 @dataclass
@@ -29,6 +32,13 @@ class PaperTrader:
         self.slippage_bps = slippage_bps
         self.spread_bps = spread_bps
         self.portfolio = PaperPortfolio(usd=10_000.0, btc=0.0)
+        logger.info(
+            "paper_trader_init maker_fee_bps=%.4f taker_fee_bps=%.4f slippage_bps=%.4f spread_bps=%.4f",
+            maker_fee_bps,
+            taker_fee_bps,
+            slippage_bps,
+            spread_bps,
+        )
 
     def get_portfolio(self) -> PaperPortfolio:
         return self.portfolio
@@ -45,6 +55,12 @@ class PaperTrader:
         equity = self.portfolio.equity(latest_close)
         current_fraction = max(0.0, min(1.0, self.portfolio.btc * latest_close / max(equity, 1e-12)))
         if abs(target_fraction - current_fraction) < 1e-9:
+            logger.debug(
+                "paper_trade_skip reason=no_delta ts=%s target_fraction=%.6f current_fraction=%.6f",
+                now,
+                target_fraction,
+                current_fraction,
+            )
             return []
 
         side = "BUY" if target_fraction > current_fraction else "SELL"
@@ -71,6 +87,15 @@ class PaperTrader:
             self.portfolio.usd += max(0.0, usd_notional - fee)
 
         if qty <= 0 or usd_notional <= 0:
+            logger.debug(
+                "paper_trade_skip reason=zero_after_constraints ts=%s side=%s qty=%.10f usd_notional=%.10f target_fraction=%.6f current_fraction=%.6f",
+                now,
+                side,
+                qty,
+                usd_notional,
+                target_fraction,
+                current_fraction,
+            )
             return []
 
         fill = SimulatedFill(
@@ -82,6 +107,19 @@ class PaperTrader:
             is_taker=True,
             fee=fee,
             ts=now,
+        )
+
+        logger.info(
+            "paper_trade_fill ts=%s side=%s qty=%.8f price=%.6f notional=%.6f fee=%.6f target_fraction=%.6f current_fraction_before=%.6f equity=%.6f",
+            now,
+            side,
+            qty,
+            px,
+            usd_notional,
+            fee,
+            target_fraction,
+            current_fraction,
+            equity,
         )
 
         self.state.log_decision(
