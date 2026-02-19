@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strategy-workers",
         type=int,
-        default=1,
-        help="How many strategies to run concurrently (default: 1)",
+        default=0,
+        help="How many strategies to run concurrently (0=auto, default)",
     )
     p.add_argument("--top-n", type=int, default=5)
     p.add_argument("--turnover-max", type=float, default=700.0)
@@ -182,8 +183,16 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 
 def _resolve_strategy_workers(args: argparse.Namespace, selected_count: int) -> int:
-    requested = max(1, int(args.strategy_workers))
-    workers = min(requested, max(1, selected_count))
+    selected_count = max(1, int(selected_count))
+    requested = int(args.strategy_workers)
+
+    if requested <= 0:
+        cpu = max(1, int(os.cpu_count() or 1))
+        # Keep strategy fan-out conservative by default; each strategy may also parallelize internally.
+        auto_workers = max(1, min(selected_count, max(1, cpu // 2)))
+        workers = auto_workers
+    else:
+        workers = min(max(1, requested), selected_count)
 
     ctx = resolve_acceleration_backend(args.acceleration_backend)
     if ctx.backend == "cuda" and workers > 1:

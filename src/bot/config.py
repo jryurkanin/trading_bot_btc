@@ -419,6 +419,10 @@ class BacktestConfig(BaseModel):
     VALID_STRATEGIES: ClassVar[Set[str]] = {
         "macro_gate_benchmark",
         "macro_only_v2",
+        "v5_adaptive",
+        "regime_switching_v4_core",
+        "regime_switching_orchestrator",
+        "macro_gate_state",
     }
 
     @field_validator("strategy", mode="after")

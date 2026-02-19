@@ -11,7 +11,7 @@ import pandas as pd
 # Make local src discoverable when running directly from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
-from bot.config import BotConfig
+from bot.config import BotConfig, BacktestConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.backtest.engine import BacktestEngine
@@ -26,7 +26,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=sorted(BacktestConfig.VALID_STRATEGIES),
+    )
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default=None)
     p.add_argument("--fred-enabled", action=argparse.BooleanOptionalAction, default=None)
