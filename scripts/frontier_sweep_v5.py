@@ -23,6 +23,7 @@ from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
 
 
 DEFAULT_GRID_SPACE_V5: dict[str, list[Any]] = {
@@ -48,6 +49,9 @@ DEFAULT_GRID_SPACE_V5: dict[str, list[Any]] = {
 }
 
 # Small grid for quick smoke tests
+TARGET_STRATEGY = "v5_adaptive"
+
+
 SMALL_GRID_SPACE_V5: dict[str, list[Any]] = {
     "v5_micro_trend_mult": [1.0, 1.15],
     "v5_micro_range_mult": [0.85, 1.0],
@@ -205,8 +209,7 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
 
 
 def configure_strategy(cfg: BotConfig, strategy: str) -> None:
-    # Frontier workflow uses benchmark strategy only.
-    cfg.backtest.strategy = "macro_gate_benchmark"
+    cfg.backtest.strategy = strategy
     cfg.regime.trend_boost_enabled = False
 
 
@@ -347,8 +350,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
 def main() -> int:
     args = parse_args()
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
@@ -401,7 +421,7 @@ def main() -> int:
     summary_rows: list[dict[str, Any]] = []
     grouped: dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]] = {}
 
-    strategies = ["macro_gate_benchmark"]
+    strategies = [TARGET_STRATEGY]
 
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
@@ -457,8 +477,8 @@ def main() -> int:
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
 
-        bench_val = grouped.get(param_id, {}).get("macro_gate_benchmark", {}).get("val", {})
-        bench_test = grouped.get(param_id, {}).get("macro_gate_benchmark", {}).get("test", {})
+        bench_val = grouped.get(param_id, {}).get(TARGET_STRATEGY, {}).get("val", {})
+        bench_test = grouped.get(param_id, {}).get(TARGET_STRATEGY, {}).get("test", {})
 
         bench_base = bench_val.get("baseline")
         bench_s1 = bench_val.get("stress_1")
@@ -566,7 +586,7 @@ def main() -> int:
                 **best["params"],
             },
             "execution": {"fill_model": args.fill_model},
-            "backtest": {"strategy": "macro_gate_benchmark"},
+            "backtest": {"strategy": TARGET_STRATEGY},
         }
         best_cfg_path = write_strict_json(
             out_dir / "best_config.json", best_cfg_patch
@@ -575,7 +595,7 @@ def main() -> int:
         repro_cmd = (
             f"python3.14 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or args.end} "
-            f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
+            f"--strategy {TARGET_STRATEGY} --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
@@ -599,13 +619,13 @@ def main() -> int:
             {**best_cfg_patch, "frontier": best_payload},
         )
 
-        print("Macro benchmark frontier sweep completed — winning configs found!")
+        print("V5 adaptive frontier sweep completed — winning configs found!")
         print(dumps_strict_json(best_payload, indent=2))
         print("Reproduce best test run:")
         print(repro_cmd)
     else:
         print(
-            "Macro benchmark frontier sweep completed but no config satisfied constraints."
+            "V5 adaptive frontier sweep completed but no config satisfied constraints."
         )
         print(f"Summary: {summary_path}")
 

@@ -24,6 +24,7 @@ from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
 
 
 DEFAULT_GRID_MACRO_ONLY: dict[str, list[Any]] = {
@@ -418,6 +419,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--small", action="store_true", help="smaller walk-forward grid for quick checks")
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay parameters in sweep grid")
     p.add_argument("--workers", type=int, default=1, help="parallel worker processes for parameter sets")
+    p.add_argument(
+        "--skip-benchmark-baseline",
+        action="store_true",
+        help="Skip benchmark baseline comparator rows to reduce runtime when orchestrated",
+    )
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--top-n", type=int, default=5)
@@ -427,8 +433,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
 def main() -> int:
     args = parse_args()
+
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
 
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
@@ -483,38 +506,41 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_rows: list[dict[str, Any]] = []
 
-    # Baseline benchmark rows for comparison (same windows/scenarios).
+    # Optional baseline benchmark rows for comparison (same windows/scenarios).
     baseline_rows: list[dict[str, Any]] = []
-    print("Running baseline macro_gate_benchmark comparator")
-    for window in windows:
-        for scenario in SCENARIOS:
-            try:
-                row = run_window(
-                    base_cfg=cfg,
-                    product=args.product,
-                    hourly=hourly,
-                    daily=daily,
-                    window=window,
-                    params={},
-                    scenario=scenario,
-                    base_maker=base_maker_rate,
-                    base_taker=base_taker_rate,
-                    strategy="macro_gate_benchmark",
-                )
-                row["param_id"] = "baseline"
-                baseline_rows.append(row)
-            except Exception as exc:
-                baseline_rows.append(
-                    {
-                        "param_id": "baseline",
-                        "strategy": "macro_gate_benchmark",
-                        "window": window.name,
-                        "scenario": scenario.name,
-                        "start": window.start.isoformat(),
-                        "end": window.end.isoformat(),
-                        "error": str(exc),
-                    }
-                )
+    if args.skip_benchmark_baseline:
+        print("Skipping baseline macro_gate_benchmark comparator")
+    else:
+        print("Running baseline macro_gate_benchmark comparator")
+        for window in windows:
+            for scenario in SCENARIOS:
+                try:
+                    row = run_window(
+                        base_cfg=cfg,
+                        product=args.product,
+                        hourly=hourly,
+                        daily=daily,
+                        window=window,
+                        params={},
+                        scenario=scenario,
+                        base_maker=base_maker_rate,
+                        base_taker=base_taker_rate,
+                        strategy="macro_gate_benchmark",
+                    )
+                    row["param_id"] = "baseline"
+                    baseline_rows.append(row)
+                except Exception as exc:
+                    baseline_rows.append(
+                        {
+                            "param_id": "baseline",
+                            "strategy": "macro_gate_benchmark",
+                            "window": window.name,
+                            "scenario": scenario.name,
+                            "start": window.start.isoformat(),
+                            "end": window.end.isoformat(),
+                            "error": str(exc),
+                        }
+                    )
 
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
 

@@ -20,8 +20,10 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 from bot.backtest.engine import BacktestEngine
 from bot.backtest.reporting import dumps_strict_json, write_strict_json
 from bot.coinbase_client import RESTClientWrapper
+from bot.config import BacktestConfig
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
 
 
 DEFAULT_GRID_SPACE: dict[str, list[Any]] = {
@@ -32,6 +34,17 @@ DEFAULT_GRID_SPACE: dict[str, list[Any]] = {
     "trend_boost_enabled": [True],
     "trend_boost_multiplier": [1.0, 1.1, 1.25, 1.5],
     "trend_boost_adx_threshold": [20.0, 25.0, 30.0],
+}
+
+
+SMALL_GRID_SPACE: dict[str, list[Any]] = {
+    "target_ann_vol": [0.30, 0.50],
+    "macro_mode": ["score"],
+    "macro_score_floor": [0.0],
+    "macro_score_min_to_trade": [0.25],
+    "trend_boost_enabled": [True],
+    "trend_boost_multiplier": [1.1],
+    "trend_boost_adx_threshold": [25.0],
 }
 
 
@@ -126,6 +139,7 @@ def load_grid(
     grid_flags: dict[str, list[Any]],
     *,
     include_fred_grid: bool = False,
+    small: bool = False,
 ) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -147,7 +161,7 @@ def load_grid(
             return product_grid(space)
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
-    space = dict(DEFAULT_GRID_SPACE)
+    space = dict(SMALL_GRID_SPACE if small else DEFAULT_GRID_SPACE)
     if include_fred_grid:
         space.update(DEFAULT_FRED_SWEEP_SPACE)
     space.update(grid_flags)
@@ -271,13 +285,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-end", default="2024-12-31T23:00:00Z")
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=sorted(BacktestConfig.VALID_STRATEGIES),
+    )
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
     p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay parameters in sweep grid")
+    p.add_argument("--small", action="store_true", help="Use reduced parameter grid for smoke tests")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.25)
     p.add_argument("--top-n", type=int, default=10)
@@ -287,8 +306,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
 def main() -> int:
     args = parse_args()
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
@@ -328,6 +364,7 @@ def main() -> int:
         args.grid_config,
         grid_flags,
         include_fred_grid=bool(args.include_fred_grid),
+        small=bool(args.small),
     )
 
     out_dir = Path(args.output_dir)
@@ -486,7 +523,9 @@ def main() -> int:
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
+        test_stress_1 = grouped.get(best["param_id"], {}).get("test", {}).get("stress_1", {})
         best_payload = {
+            "strategy": args.strategy,
             "best": best,
             "constraints": {
                 "turnover_max": args.turnover_max,
@@ -494,12 +533,21 @@ def main() -> int:
                 "validation_profit_required": "stress_1 net_pnl > 0",
             },
             "reproduce_test_command": repro_cmd,
-            "paths": {
+            "best_config": best_cfg_patch,
+            "files": {
                 "summary_csv": str(summary_path),
                 "frontier_csv": str(frontier_path),
-                "best_config": str(best_cfg_path),
+                "best_config_json": str(best_cfg_path),
+            },
+            "test_window_stress_1": {
+                "cagr": float((test_stress_1 or {}).get("cagr", 0.0) or 0.0),
+                "sharpe": float((test_stress_1 or {}).get("sharpe", 0.0) or 0.0),
+                "max_drawdown": float((test_stress_1 or {}).get("max_drawdown", 0.0) or 0.0),
+                "turnover": float((test_stress_1 or {}).get("turnover", 0.0) or 0.0),
+                "trade_count": (test_stress_1 or {}).get("trade_count", 0),
             },
         }
+        write_strict_json(out_dir / "best_summary.json", best_payload)
         write_strict_json(out_dir / "best_config.json", {**best_cfg_patch, "frontier": best_payload})
 
         print("Frontier sweep completed")

@@ -23,6 +23,10 @@ from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
+
+
+DEFAULT_STRATEGY = "macro_gate_state"
 
 
 DEFAULT_GRID_SPACE_V3: dict[str, list[Any]] = {
@@ -42,6 +46,26 @@ DEFAULT_GRID_SPACE_V3: dict[str, list[Any]] = {
     "trend_boost_min_on_days": [1, 2],
     "trend_boost_min_off_days": [1],
     "trend_boost_sma50_slope_lookback_days": [5, 10],
+}
+
+
+SMALL_GRID_SPACE_V3: dict[str, list[Any]] = {
+    "target_ann_vol": [0.30],
+    "macro_enter_threshold": [0.75],
+    "macro_exit_threshold": [0.25],
+    "macro_full_threshold": [1.0],
+    "macro_half_threshold": [0.75],
+    "macro_confirm_days": [2],
+    "macro_min_on_days": [2],
+    "macro_min_off_days": [1],
+    "macro_half_multiplier": [0.50],
+    "macro_full_multiplier": [1.0],
+    "trend_boost_multiplier": [1.05],
+    "trend_boost_adx_threshold": [25.0],
+    "trend_boost_confirm_days": [2],
+    "trend_boost_min_on_days": [2],
+    "trend_boost_min_off_days": [1],
+    "trend_boost_sma50_slope_lookback_days": [10],
 }
 
 
@@ -122,7 +146,7 @@ def product_grid(space: dict[str, list[Any]]) -> list[dict[str, Any]]:
     return combos
 
 
-def load_grid(path: str | None, grid_flags: dict[str, list[Any]]) -> list[dict[str, Any]]:
+def load_grid(path: str | None, grid_flags: dict[str, list[Any]], small: bool = False) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(payload, list):
@@ -143,7 +167,7 @@ def load_grid(path: str | None, grid_flags: dict[str, list[Any]]) -> list[dict[s
             return product_grid(space)
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
-    space = dict(DEFAULT_GRID_SPACE_V3)
+    space = dict(SMALL_GRID_SPACE_V3 if small else DEFAULT_GRID_SPACE_V3)
     space.update(grid_flags)
     return product_grid(space)
 
@@ -181,9 +205,8 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
     raise KeyError(f"Unknown parameter key: {key}")
 
 
-def configure_v3(cfg: BotConfig) -> None:
-    # Use benchmark-only strategy for v3 frontier workflow.
-    cfg.backtest.strategy = "macro_gate_benchmark"
+def configure_v3(cfg: BotConfig, strategy: str) -> None:
+    cfg.backtest.strategy = strategy
     cfg.regime.trend_boost_enabled = False
 
 
@@ -197,10 +220,11 @@ def run_window(
     scenario: CostScenario,
     base_maker_rate: float,
     base_taker_rate: float,
+    strategy: str,
 ) -> dict[str, Any]:
     cfg = clone_cfg(base_cfg)
     cfg.data.product = product
-    configure_v3(cfg)
+    configure_v3(cfg, strategy)
 
     for k, v in params.items():
         set_param(cfg, k, v)
@@ -243,6 +267,7 @@ def run_window(
     full_time_share = float((buckets.get("ON_FULL") or {}).get("time_share", 0.0) or 0.0)
 
     return {
+        "strategy": strategy,
         "window": window.name,
         "scenario": scenario.name,
         "start": window.start.isoformat(),
@@ -267,6 +292,7 @@ def run_window(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run v3 frontier sweep with walk-forward windows and conservative cost stress tests.")
+    p.add_argument("--strategy", choices=["macro_gate_state", "regime_switching_orchestrator"], default=DEFAULT_STRATEGY)
     p.add_argument("--product", default="BTC-USD")
     p.add_argument("--start", default="2021-01-01T00:00:00Z")
     p.add_argument("--end", default=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
@@ -281,6 +307,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
     p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
+    p.add_argument("--small", action="store_true", help="Use reduced grid for quick smoke tests")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--min-full-time-share", type=float, default=0.05)
@@ -291,13 +318,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
 def main() -> int:
     args = parse_args()
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
     cfg.backtest.acceleration_backend = args.acceleration_backend
-    configure_v3(cfg)
+    configure_v3(cfg, args.strategy)
 
     start = parse_ts(args.start)
     end = parse_ts(args.end)
@@ -329,7 +373,7 @@ def main() -> int:
         pass
 
     grid_flags = parse_grid_flags(args.grid)
-    param_sets = load_grid(args.grid_config, grid_flags)
+    param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -354,6 +398,7 @@ def main() -> int:
                         scenario=scenario,
                         base_maker_rate=base_maker_rate,
                         base_taker_rate=base_taker_rate,
+                        strategy=args.strategy,
                     )
                     row["param_id"] = param_id
                     row["params"] = json.dumps(params, sort_keys=True)
@@ -497,14 +542,14 @@ def main() -> int:
                 **best["params"],
             },
             "execution": {"fill_model": args.fill_model},
-            "backtest": {"strategy": "macro_gate_benchmark"},
+            "backtest": {"strategy": args.strategy},
         }
         best_cfg_path = write_strict_json(out_dir / "best_config.json", best_cfg_patch)
 
         repro_cmd = (
             f"python3.14 scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {(args.test_end or args.end)} "
-            f"--strategy macro_gate_benchmark --fill-model {args.fill_model} "
+            f"--strategy {args.strategy} --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 

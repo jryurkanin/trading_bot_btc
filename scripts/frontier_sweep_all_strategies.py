@@ -6,6 +6,7 @@ import csv
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
 from bot.config import BacktestConfig
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -26,6 +28,10 @@ ACTIVE_STRATEGIES: list[str] = sorted(BacktestConfig.VALID_STRATEGIES)
 RUNNERS: dict[str, StrategyRunner] = {
     "macro_gate_benchmark": ("frontier_sweep.py", "macro_gate_benchmark"),
     "macro_only_v2": ("frontier_sweep_macro_only.py", "macro_only_v2"),
+    "v5_adaptive": ("frontier_sweep_v5.py", "v5_adaptive"),
+    "regime_switching_v4_core": ("frontier_sweep_core.py", "regime_switching_v4_core"),
+    "regime_switching_orchestrator": ("frontier_sweep_v3.py", "regime_switching_orchestrator"),
+    "macro_gate_state": ("frontier_sweep_v3.py", "macro_gate_state"),
 }
 
 
@@ -48,12 +54,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
     p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay dimensions in sweep grid")
-    p.add_argument("--small", action="store_true", help="Use reduced macro-only sweep grid for quick checks")
+    p.add_argument("--small", action="store_true", help="Use reduced sweep grids for quick checks (where supported)")
     p.add_argument("--workers", type=int, default=20, help="Workers for macro-only frontier sweep")
+    p.add_argument(
+        "--strategy-workers",
+        type=int,
+        default=1,
+        help="How many strategies to run concurrently (default: 1)",
+    )
     p.add_argument("--top-n", type=int, default=5)
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--strategies", default=",".join(ACTIVE_STRATEGIES), help="Comma-separated strategies to run")
+    p.add_argument(
+        "--include-macro-only-baseline",
+        action="store_true",
+        help="Include benchmark baseline rows inside macro_only_v2 sweep (disabled by default when orchestrated)",
+    )
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     p.add_argument("--output-dir", default="artifacts/frontier_all_strategies", help="Output root directory")
@@ -147,9 +164,82 @@ def _build_base_args(args: argparse.Namespace) -> list[str]:
     if args.grid:
         for raw in args.grid:
             base_args.extend(["--grid", raw])
-    if args.include_fred_grid:
-        base_args.append("--include-fred-grid")
     return base_args
+
+
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
+def _resolve_strategy_workers(args: argparse.Namespace, selected_count: int) -> int:
+    requested = max(1, int(args.strategy_workers))
+    workers = min(requested, max(1, selected_count))
+
+    ctx = resolve_acceleration_backend(args.acceleration_backend)
+    if ctx.backend == "cuda" and workers > 1:
+        print("CUDA backend detected; forcing --strategy-workers=1 to avoid GPU contention.")
+        return 1
+    return workers
+
+
+def _build_strategy_command(
+    args: argparse.Namespace,
+    strategy: str,
+    baseline_args: list[str],
+    strategy_dir: Path,
+) -> tuple[list[str], str]:
+    script_name, _default_tag = RUNNERS[strategy]
+    args_for_strategy = baseline_args.copy()
+    args_for_strategy.extend(["--output-dir", str(strategy_dir)])
+
+    cmd = [sys.executable, str(SCRIPTS_DIR / script_name)]
+
+    if script_name == "frontier_sweep.py":
+        cmd.extend(["--strategy", strategy])
+        cmd.extend(["--end", args.end])
+        cmd.extend(["--test-end", args.test_end])
+        if args.small:
+            cmd.append("--small")
+        if args.include_fred_grid:
+            cmd.append("--include-fred-grid")
+        cmd.extend(args_for_strategy)
+        return cmd, script_name
+
+    if script_name == "frontier_sweep_macro_only.py":
+        cmd.extend(["--test-end", args.test_end])
+        cmd.extend(["--workers", str(args.workers)])
+        if args.small:
+            cmd.append("--small")
+        if args.include_fred_grid:
+            cmd.append("--include-fred-grid")
+        if not args.include_macro_only_baseline:
+            cmd.append("--skip-benchmark-baseline")
+        cmd.extend(args_for_strategy)
+        return cmd, script_name
+
+    if script_name in {"frontier_sweep_v3.py", "frontier_sweep_core.py", "frontier_sweep_v5.py"}:
+        cmd.extend(["--end", args.end])
+        cmd.extend(["--test-end", args.test_end])
+        if script_name == "frontier_sweep_v3.py":
+            cmd.extend(["--strategy", strategy])
+        if args.small:
+            cmd.append("--small")
+        cmd.extend(args_for_strategy)
+        return cmd, script_name
+
+    # Fallback for future runners.
+    cmd.extend(args_for_strategy)
+    return cmd, script_name
 
 
 def _load_best_summary(summary_path: Path, strategy_dir: Path, strategy: str) -> dict[str, Any] | None:
@@ -209,6 +299,45 @@ def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]
     return (cagr, sharpe, drawdown, turnover)
 
 
+def _execute_strategy_job(
+    strategy: str,
+    script_name: str,
+    strategy_dir: Path,
+    cmd: list[str],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    completed = _run_command(cmd, timeout_seconds=timeout_seconds)
+    finished_at = datetime.now(timezone.utc)
+    elapsed_sec = (finished_at - started_at).total_seconds()
+
+    summary = None
+    if completed.returncode == 0:
+        summary = _load_best_summary(
+            strategy_dir / "best_summary.json",
+            strategy_dir=strategy_dir,
+            strategy=strategy,
+        )
+        if summary is None:
+            print(f"Warning: no best_summary.json found for {strategy}. Parsing frontier.csv fallback")
+    else:
+        print(f"Strategy {strategy} failed with exit code {completed.returncode}")
+
+    return {
+        "strategy": strategy,
+        "script": script_name,
+        "return_code": completed.returncode,
+        "output_dir": str(strategy_dir),
+        "summary": summary,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "duration_seconds": elapsed_sec,
+        "start_time": started_at.isoformat(),
+        "end_time": finished_at.isoformat(),
+    }
+
+
+
 def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]], Path, Path]:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -220,7 +349,26 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     selected = [s.strip() for s in args.strategies.split(",") if s.strip()]
     unknown = [s for s in selected if s not in RUNNERS]
     if unknown:
-        raise ValueError(f"Unknown strategy requested: {', '.join(unknown)}. Active options: {', '.join(ACTIVE_STRATEGIES)}")
+        raise ValueError(
+            f"Unknown strategy requested: {', '.join(unknown)}. Active options: {', '.join(ACTIVE_STRATEGIES)}"
+        )
+
+    equivalence_key = {
+        "macro_gate_state": "regime_switching_orchestrator",
+        "regime_switching_orchestrator": "regime_switching_orchestrator",
+    }
+    deduped: list[str] = []
+    seen_keys: set[str] = set()
+    for strategy in selected:
+        key = equivalence_key.get(strategy, strategy)
+        if key in seen_keys:
+            print(f"Skipping duplicate-equivalent strategy: {strategy} (equivalent to {key})")
+            continue
+        seen_keys.add(key)
+        deduped.append(strategy)
+    selected = deduped
+
+    strategy_workers = _resolve_strategy_workers(args, len(selected))
 
     _write_progress(
         progress_path,
@@ -230,38 +378,37 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
             "output_root": str(output_root),
             "strategies": selected,
             "args": vars(args),
+            "strategy_workers": strategy_workers,
         },
     )
 
     baseline_args = _build_base_args(args)
-    results: list[dict[str, Any]] = []
 
+    jobs: list[dict[str, Any]] = []
     for index, strategy in enumerate(selected, start=1):
-        script_name, default_tag = RUNNERS[strategy]
+        _script, default_tag = RUNNERS[strategy]
         strategy_dir = output_root / default_tag
         strategy_dir.mkdir(parents=True, exist_ok=True)
 
-        args_for_strategy = baseline_args.copy()
-        args_for_strategy.extend(["--output-dir", str(strategy_dir)])
-
-        cmd = [sys.executable, str(SCRIPTS_DIR / script_name)]
-
-        if strategy == "macro_gate_benchmark":
-            cmd.extend(["--strategy", strategy])
-            cmd.extend(["--end", args.end])
-            cmd.extend(["--test-end", args.test_end])
-            cmd.extend(args_for_strategy)
-        elif strategy == "macro_only_v2":
-            cmd.extend(["--test-end", args.test_end])
-            cmd.extend(["--workers", str(args.workers)])
-            if args.small:
-                cmd.append("--small")
-            cmd.extend(args_for_strategy)
-        else:
-            # Fallback if future strategy runners are added.
-            cmd.extend(args_for_strategy)
-
+        cmd, script_name = _build_strategy_command(
+            args=args,
+            strategy=strategy,
+            baseline_args=baseline_args,
+            strategy_dir=strategy_dir,
+        )
         command = " ".join(cmd)
+
+        jobs.append(
+            {
+                "index": index,
+                "strategy": strategy,
+                "script_name": script_name,
+                "strategy_dir": strategy_dir,
+                "cmd": cmd,
+                "command": command,
+            }
+        )
+
         _write_progress(
             progress_path,
             {
@@ -274,49 +421,70 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
             },
         )
 
-        print(f"\n=== Running frontier sweep: {strategy} ===")
-        print("Command:", command)
-        started_at = datetime.now(timezone.utc)
-        completed = _run_command(cmd, timeout_seconds=args.timeout_seconds)
-        finished_at = datetime.now(timezone.utc)
-        elapsed_sec = (finished_at - started_at).total_seconds()
+    results: list[dict[str, Any]] = []
 
-        summary = None
-        if completed.returncode == 0:
-            summary = _load_best_summary(strategy_dir / "best_summary.json", strategy_dir=strategy_dir, strategy=strategy)
-            if summary is None:
-                # If a future workflow doesn't emit best_summary, try to use frontier.csv as fallback.
-                print(f"Warning: no best_summary.json found for {strategy}. Parsing frontier.csv fallback")
-        else:
-            print(f"Strategy {strategy} failed with exit code {completed.returncode}")
+    if strategy_workers <= 1:
+        for job in jobs:
+            print(f"\n=== Running frontier sweep: {job['strategy']} ===")
+            print("Command:", job["command"])
+            result = _execute_strategy_job(
+                strategy=job["strategy"],
+                script_name=job["script_name"],
+                strategy_dir=job["strategy_dir"],
+                cmd=job["cmd"],
+                timeout_seconds=args.timeout_seconds,
+            )
+            result["strategy_index"] = job["index"]
+            results.append(result)
 
-        result: dict[str, Any] = {
-            "strategy": strategy,
-            "script": script_name,
-            "return_code": completed.returncode,
-            "output_dir": str(strategy_dir),
-            "summary": summary,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "duration_seconds": elapsed_sec,
-            "start_time": started_at.isoformat(),
-            "end_time": finished_at.isoformat(),
-        }
-        results.append(result)
+            _write_progress(
+                progress_path,
+                {
+                    "event": "strategy_completed",
+                    "run_id": run_id,
+                    "strategy": job["strategy"],
+                    "strategy_index": job["index"],
+                    "return_code": result["return_code"],
+                    "output_dir": str(job["strategy_dir"]),
+                    "duration_seconds": result["duration_seconds"],
+                    "summary": {"available": result["summary"] is not None},
+                },
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=strategy_workers) as pool:
+            fut_to_job = {
+                pool.submit(
+                    _execute_strategy_job,
+                    strategy=job["strategy"],
+                    script_name=job["script_name"],
+                    strategy_dir=job["strategy_dir"],
+                    cmd=job["cmd"],
+                    timeout_seconds=args.timeout_seconds,
+                ): job
+                for job in jobs
+            }
 
-        _write_progress(
-            progress_path,
-            {
-                "event": "strategy_completed",
-                "run_id": run_id,
-                "strategy": strategy,
-                "strategy_index": index,
-                "return_code": completed.returncode,
-                "output_dir": str(strategy_dir),
-                "duration_seconds": elapsed_sec,
-                "summary": {"available": summary is not None},
-            },
-        )
+            for fut in as_completed(fut_to_job):
+                job = fut_to_job[fut]
+                result = fut.result()
+                result["strategy_index"] = job["index"]
+                results.append(result)
+
+                _write_progress(
+                    progress_path,
+                    {
+                        "event": "strategy_completed",
+                        "run_id": run_id,
+                        "strategy": job["strategy"],
+                        "strategy_index": job["index"],
+                        "return_code": result["return_code"],
+                        "output_dir": str(job["strategy_dir"]),
+                        "duration_seconds": result["duration_seconds"],
+                        "summary": {"available": result["summary"] is not None},
+                    },
+                )
+
+    results.sort(key=lambda r: int(r.get("strategy_index", 0)))
 
     run_complete_payload = {
         "event": "run_completed",
@@ -429,6 +597,9 @@ def main() -> int:
     if not ACTIVE_STRATEGIES:
         print("No active strategies discovered in BacktestConfig.VALID_STRATEGIES")
         return 1
+
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
 
     results, run_reports_dir, progress_path = _run_all_strategies(args)
     _summarize(
