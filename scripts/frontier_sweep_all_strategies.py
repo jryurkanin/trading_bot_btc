@@ -690,6 +690,11 @@ def _summarize(
             print("  Status: completed (no best summary detected)")
             continue
 
+        best_row = summary.get("best") if isinstance(summary, dict) else None
+        if best_row in (None, {}, []):
+            print("  Status: completed (no winning config)")
+            continue
+
         score = _extract_score(summary)
         strategy_scores[strategy] = score
         valid_results.append(result)

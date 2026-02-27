@@ -747,6 +747,36 @@ def main() -> int:
         print("Reproduce best test run:")
         print(repro_cmd)
     else:
+        no_best_files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(out_dir / "best_config.json"),
+            "filter_rejections_json": str(out_dir / "filter_rejections.json"),
+            "checkpoint_json": str(checkpoint_path),
+        }
+        no_best_payload = {
+            "strategy": TARGET_STRATEGY,
+            "run_id": run_token,
+            "best": None,
+            "constraints": {
+                "turnover_max": args.turnover_max,
+                "max_drawdown_max": args.max_drawdown_max,
+                "min_full_time_share": args.min_full_time_share,
+                "benchmark_positive": True,
+            },
+            "reproduce_test_command": None,
+            "best_config": {},
+            "files": no_best_files_payload,
+            "paths": dict(no_best_files_payload),
+            "test_window_stress_1": {
+                "cagr": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "turnover": 0.0,
+                "trade_count": 0,
+            },
+        }
+        write_strict_json(out_dir / "best_summary.json", no_best_payload)
         print(
             "V4 core frontier sweep completed but no config satisfied constraints "
             "(benchmark-positive under constraints)."
