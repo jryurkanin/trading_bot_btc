@@ -207,6 +207,23 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
 
     raise KeyError(f"Unknown parameter key: {key}")
 
+def validate_grid_keys(base_cfg: BotConfig, param_sets: list[dict[str, Any]]) -> list[str]:
+    sample_by_key: dict[str, Any] = {}
+    for params in param_sets:
+        for key, value in params.items():
+            sample_by_key.setdefault(str(key), value)
+
+    invalid: list[str] = []
+    for key in sorted(sample_by_key):
+        probe_cfg = clone_cfg(base_cfg)
+        try:
+            set_param(probe_cfg, key, sample_by_key[key])
+        except Exception:
+            invalid.append(key)
+
+    return invalid
+
+
 
 def configure_strategy(cfg: BotConfig, strategy: str) -> None:
     cfg.backtest.strategy = strategy
@@ -411,7 +428,26 @@ def main() -> int:
 
     grid_flags = parse_grid_flags(args.grid)
     param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
+    invalid_grid_keys = validate_grid_keys(cfg, param_sets)
+    if invalid_grid_keys:
+        logger.error(
+            "frontier_grid_validation_failed strategy=%s keys=%s",
+            TARGET_STRATEGY,
+            invalid_grid_keys,
+        )
+        print(
+            f"ERROR: Unknown/invalid grid parameter key(s): {', '.join(invalid_grid_keys)}",
+            file=sys.stderr,
+        )
+        return 2
     total_runs = len(param_sets) * 1 * len(windows) * len(SCENARIOS)
+    logger.info(
+        "Benchmark frontier sweep: %s param sets × 1 strategy × %s windows × %s scenarios = %s runs",
+        len(param_sets),
+        len(windows),
+        len(SCENARIOS),
+        total_runs,
+    )
     print(f"Benchmark frontier sweep: {len(param_sets)} param sets × 1 strategy × "
           f"{len(windows)} windows × {len(SCENARIOS)} scenarios = {total_runs} runs")
 

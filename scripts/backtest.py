@@ -153,8 +153,10 @@ def main() -> int:
     if args.fred_realtime_mode is not None:
         cfg.fred.realtime_mode = str(args.fred_realtime_mode)
 
-    # Keep macro benchmark policy behavior only.
-    cfg.regime.trend_boost_enabled = False
+    # Keep macro benchmark policy behavior only, but do not force-disable
+    # trend boost for non-benchmark strategies.
+    if args.strategy == "macro_gate_benchmark" and args.trend_boost_enabled is None:
+        cfg.regime.trend_boost_enabled = False
 
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
