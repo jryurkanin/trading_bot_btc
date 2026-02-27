@@ -28,9 +28,20 @@ from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
+from bot.backtest.frontier_runtime import (
+    resolve_run_dir,
+    load_summary_rows,
+    write_summary_rows,
+    load_checkpoint,
+    save_checkpoint,
+    derive_processed_param_ids,
+)
 
 
 TARGET_STRATEGY = "regime_switching_v4_core"
+
+logger = get_system_logger("scripts.frontier_sweep_core")
 
 
 DEFAULT_GRID_SPACE_V4: dict[str, list[Any]] = {
@@ -307,6 +318,7 @@ def run_window(
     }
 
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run V4 core frontier sweep with benchmark comparison."
@@ -347,10 +359,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-full-time-share", type=float, default=0.05)
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--output-dir", default="artifacts/frontier_v4_core")
+    p.add_argument("--run-id", default=None, help="Optional run id; defaults to current UTC timestamp")
+    p.add_argument("--resume", action="store_true", help="Resume from an existing run/checkpoint")
+    p.add_argument("--checkpoint-every", type=int, default=10, help="Persist checkpoint every N parameter sets")
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     return p.parse_args()
-
 
 def _validate_acceleration_backend(requested: str) -> bool:
     ctx = resolve_acceleration_backend(requested)
@@ -366,8 +380,12 @@ def _validate_acceleration_backend(requested: str) -> bool:
     return True
 
 
+
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_v4_core_start log_path=%s args=%s", log_path, vars(args))
+
     if not _validate_acceleration_backend(args.acceleration_backend):
         return 2
 
@@ -426,22 +444,74 @@ def main() -> int:
         )
         return 2
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir, run_token = resolve_run_dir(args.output_dir, args.run_id, args.resume)
+    summary_path = out_dir / "summary.csv"
+    checkpoint_path = out_dir / "checkpoint.json"
+    checkpoint_every = max(1, int(args.checkpoint_every))
 
-    summary_rows: list[dict[str, Any]] = []
-    # grouped[param_id][strategy][window_name][scenario_name] = row
+    summary_rows: list[dict[str, Any]] = load_summary_rows(summary_path) if args.resume else []
     grouped: dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]] = {}
+    for row in summary_rows:
+        pid = str(row.get("param_id", "") or "").strip()
+        strategy = str(row.get("strategy", TARGET_STRATEGY) or TARGET_STRATEGY).strip() or TARGET_STRATEGY
+        window = str(row.get("window", "") or "").strip()
+        scenario = str(row.get("scenario", "") or "").strip()
+        err = str(row.get("error", "") or "").strip()
+        if not pid or not window or not scenario or err:
+            continue
+        grouped.setdefault(pid, {}).setdefault(strategy, {}).setdefault(window, {})[scenario] = row
+
+    processed_param_ids: set[str] = set()
+    if args.resume:
+        checkpoint = load_checkpoint(checkpoint_path)
+        processed_param_ids = {
+            str(pid).strip()
+            for pid in checkpoint.get("processed_param_ids", [])
+            if str(pid).strip()
+        }
+        if not processed_param_ids:
+            processed_param_ids = derive_processed_param_ids(
+                summary_rows,
+                expected_rows_per_param=len(windows) * len(SCENARIOS),
+            )
+
+    if args.resume and processed_param_ids:
+        print(
+            f"Resuming {run_token}: {len(processed_param_ids)}/{len(param_sets)} parameter sets already complete"
+        )
+    else:
+        print(f"Starting {run_token}: {len(param_sets)} parameter sets")
+
+    def persist_checkpoint(*, completed: bool) -> None:
+        write_summary_rows(summary_path, summary_rows)
+        save_checkpoint(
+            checkpoint_path,
+            {
+                "version": 1,
+                "run_id": run_token,
+                "strategy": TARGET_STRATEGY,
+                "completed": bool(completed),
+                "processed_count": len(processed_param_ids),
+                "total_param_sets": len(param_sets),
+                "processed_param_ids": sorted(processed_param_ids),
+                "checkpoint_every": checkpoint_every,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "summary_csv": str(summary_path),
+            },
+        )
 
     strategies = [TARGET_STRATEGY]
-
+    processed_since_checkpoint = 0
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
-        grouped[param_id] = {}
+        if param_id in processed_param_ids:
+            continue
+
+        grouped.setdefault(param_id, {})
         for strategy in strategies:
-            grouped[param_id][strategy] = {}
+            grouped[param_id].setdefault(strategy, {})
             for window in windows:
-                grouped[param_id][strategy][window.name] = {}
+                grouped[param_id][strategy].setdefault(window.name, {})
                 for scenario in SCENARIOS:
                     try:
                         row = run_window(
@@ -474,16 +544,19 @@ def main() -> int:
                             }
                         )
 
-    summary_path = out_dir / "summary.csv"
-    if summary_rows:
-        cols = sorted({k for row in summary_rows for k in row.keys()})
-        with summary_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            for row in summary_rows:
-                w.writerow(row)
+        processed_param_ids.add(param_id)
+        processed_since_checkpoint += 1
+        if processed_since_checkpoint >= checkpoint_every:
+            persist_checkpoint(completed=False)
+            processed_since_checkpoint = 0
 
-    # --- Ranking benchmark config sweep ---
+    persist_checkpoint(completed=False)
+
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+
     ranked: list[dict[str, Any]] = []
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
@@ -496,12 +569,14 @@ def main() -> int:
         bench_s2 = bench_val.get("stress_2")
 
         if not bench_base or not bench_s1 or not bench_s2:
+            reject("missing_val_scenarios")
             continue
 
-        # benchmark-only validation constraints
         if float(bench_base.get("net_pnl", 0.0) or 0.0) <= 0.0:
+            reject("baseline_net_pnl_non_positive")
             continue
         if float(bench_s1.get("net_pnl", 0.0) or 0.0) <= 0.0:
+            reject("stress1_net_pnl_non_positive")
             continue
 
         max_dd_ok = (
@@ -510,6 +585,7 @@ def main() -> int:
             and abs(float(bench_s2.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
         )
         if not max_dd_ok:
+            reject("drawdown_limit")
             continue
 
         worst_turnover = max(
@@ -518,6 +594,7 @@ def main() -> int:
             float(bench_s2.get("turnover", 0.0) or 0.0),
         )
         if worst_turnover > args.turnover_max:
+            reject("turnover_limit")
             continue
 
         full_share_min = min(
@@ -526,6 +603,7 @@ def main() -> int:
             float(bench_s2.get("macro_full_time_share", 0.0) or 0.0),
         )
         if full_share_min < args.min_full_time_share:
+            reject("min_full_time_share")
             continue
 
         cagr_vals = [
@@ -541,6 +619,7 @@ def main() -> int:
         val_score = float(statistics.median(cagr_vals))
         val_sharpe_med = float(statistics.median(sharpe_vals))
 
+        rejection_counts["accepted"] = rejection_counts.get("accepted", 0) + 1
         ranked.append(
             {
                 "param_id": param_id,
@@ -563,6 +642,21 @@ def main() -> int:
                 "test_max_drawdown_stress_1": float((bench_test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0),
             }
         )
+
+    write_strict_json(
+        out_dir / "filter_rejections.json",
+        {
+            "run_id": run_token,
+            "strategy": TARGET_STRATEGY,
+            "total_param_sets": len(param_sets),
+            "accepted_param_sets": int(rejection_counts.get("accepted", 0)),
+            "rejections": {
+                key: value
+                for key, value in sorted(rejection_counts.items())
+                if key != "accepted"
+            },
+        },
+    )
 
     ranked.sort(
         key=lambda r: (
@@ -613,6 +707,7 @@ def main() -> int:
         )
 
         best_payload = {
+            "run_id": run_token,
             "best": best,
             "constraints": {
                 "turnover_max": args.turnover_max,
@@ -625,6 +720,8 @@ def main() -> int:
                 "summary_csv": str(summary_path),
                 "frontier_csv": str(frontier_path),
                 "best_config": str(best_cfg_path),
+                "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+                "checkpoint_json": str(checkpoint_path),
             },
         }
         write_strict_json(
@@ -643,6 +740,7 @@ def main() -> int:
         )
         print(f"Summary: {summary_path}")
 
+    persist_checkpoint(completed=True)
     return 0
 
 

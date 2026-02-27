@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay dimensions in sweep grid")
     p.add_argument("--small", action="store_true", help="Use reduced sweep grids for quick checks (where supported)")
     p.add_argument("--workers", type=int, default=20, help="Workers for macro-only frontier sweep")
+    p.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint interval for strategy sweeps")
     p.add_argument(
         "--strategy-workers",
         type=int,
@@ -234,10 +235,18 @@ def _build_strategy_command(
     strategy: str,
     baseline_args: list[str],
     strategy_dir: Path,
+    run_id: str,
 ) -> tuple[list[str], str]:
     script_name, _default_tag = RUNNERS[strategy]
     args_for_strategy = baseline_args.copy()
-    args_for_strategy.extend(["--output-dir", str(strategy_dir)])
+    args_for_strategy.extend([
+        "--output-dir",
+        str(strategy_dir),
+        "--run-id",
+        run_id,
+        "--checkpoint-every",
+        str(args.checkpoint_every),
+    ])
 
     cmd = [sys.executable, str(SCRIPTS_DIR / script_name)]
 
@@ -485,14 +494,16 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     jobs: list[dict[str, Any]] = []
     for index, strategy in enumerate(selected, start=1):
         _script, default_tag = RUNNERS[strategy]
-        strategy_dir = output_root / default_tag
-        strategy_dir.mkdir(parents=True, exist_ok=True)
+        strategy_base_dir = output_root / default_tag
+        strategy_base_dir.mkdir(parents=True, exist_ok=True)
+        strategy_run_dir = strategy_base_dir / run_id
 
         cmd, script_name = _build_strategy_command(
             args=args,
             strategy=strategy,
             baseline_args=baseline_args,
-            strategy_dir=strategy_dir,
+            strategy_dir=strategy_base_dir,
+            run_id=run_id,
         )
         command = " ".join(cmd)
 
@@ -501,7 +512,8 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 "index": index,
                 "strategy": strategy,
                 "script_name": script_name,
-                "strategy_dir": strategy_dir,
+                "strategy_dir": strategy_run_dir,
+                "strategy_base_dir": strategy_base_dir,
                 "cmd": cmd,
                 "command": command,
             }
@@ -515,7 +527,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 "strategy": strategy,
                 "strategy_index": index,
                 "command": command,
-                "output_dir": str(strategy_dir),
+                "output_dir": str(strategy_run_dir),
             },
         )
 
