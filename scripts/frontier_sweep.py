@@ -674,6 +674,13 @@ def main() -> int:
         )
 
         test_stress_1 = grouped.get(best["param_id"], {}).get("test", {}).get("stress_1", {})
+        files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(best_cfg_path),
+            "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+            "checkpoint_json": str(checkpoint_path),
+        }
         best_payload = {
             "strategy": args.strategy,
             "run_id": run_token,
@@ -685,13 +692,8 @@ def main() -> int:
             },
             "reproduce_test_command": repro_cmd,
             "best_config": best_cfg_patch,
-            "files": {
-                "summary_csv": str(summary_path),
-                "frontier_csv": str(frontier_path),
-                "best_config_json": str(best_cfg_path),
-                "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
-                "checkpoint_json": str(checkpoint_path),
-            },
+            "files": files_payload,
+            "paths": dict(files_payload),
             "test_window_stress_1": {
                 "cagr": float((test_stress_1 or {}).get("cagr", 0.0) or 0.0),
                 "sharpe": float((test_stress_1 or {}).get("sharpe", 0.0) or 0.0),

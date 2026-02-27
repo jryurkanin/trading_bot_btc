@@ -929,7 +929,15 @@ def main() -> int:
             f"--strategy macro_only_v2 --config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
+        files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(best_cfg_path),
+            "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+            "checkpoint_json": str(checkpoint_path),
+        }
         report = {
+            "strategy": "macro_only_v2",
             "run_id": run_token,
             "best": best,
             "constraints": {
@@ -938,17 +946,14 @@ def main() -> int:
             },
             "reproduce_test_command": test_repro,
             "best_config": best_cfg,
-            "files": {
-                "summary_csv": str(summary_path),
-                "frontier_csv": str(frontier_path),
-                "best_config_json": str(best_cfg_path),
-                "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
-                "checkpoint_json": str(checkpoint_path),
-            },
+            "files": files_payload,
+            "paths": dict(files_payload),
             "test_window_stress_1": {
                 "cagr": float(test_benchmark.get("cagr", 0.0) if isinstance(test_benchmark, dict) else 0.0),
                 "sharpe": float(test_benchmark.get("sharpe", 0.0) if isinstance(test_benchmark, dict) else 0.0),
                 "max_drawdown": float(test_benchmark.get("max_drawdown", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "turnover": float(test_benchmark.get("turnover", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "trade_count": int(test_benchmark.get("trade_count", 0) if isinstance(test_benchmark, dict) else 0),
             },
             "benchmark_summary": baseline_rows,
         }
