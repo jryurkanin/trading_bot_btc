@@ -124,8 +124,8 @@ def parse_grid_values(raw: str) -> list[Any]:
     vals: list[Any] = []
     for chunk in [x.strip() for x in raw.split(",") if x.strip()]:
         low = chunk.lower()
-        if low in {"true", "false", "1", "0", "yes", "no"}:
-            vals.append(low in {"true", "1", "yes"})
+        if low in {"true", "false", "yes", "no", "on", "off"}:
+            vals.append(low in {"true", "yes", "on"})
             continue
         try:
             if "." in low or "e" in low:
@@ -687,7 +687,16 @@ def main() -> int:
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
+        test_stress_1 = grouped.get(best["param_id"], {}).get("test", {}).get("stress_1", {})
+        files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(best_cfg_path),
+            "filter_rejections_json": str(out_dir / "filter_rejections.json"),
+            "checkpoint_json": str(checkpoint_path),
+        }
         best_payload = {
+            "strategy": args.strategy,
             "run_id": run_token,
             "best": best,
             "constraints": {
@@ -697,14 +706,18 @@ def main() -> int:
                 "validation_profit_required": "stress_1 net_pnl > 0",
             },
             "reproduce_test_command": repro_cmd,
-            "paths": {
-                "summary_csv": str(summary_path),
-                "frontier_csv": str(frontier_path),
-                "best_config": str(best_cfg_path),
-                "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
-                "checkpoint_json": str(checkpoint_path),
+            "best_config": best_cfg_patch,
+            "files": files_payload,
+            "paths": dict(files_payload),
+            "test_window_stress_1": {
+                "cagr": float((test_stress_1 or {}).get("cagr", 0.0) or 0.0),
+                "sharpe": float((test_stress_1 or {}).get("sharpe", 0.0) or 0.0),
+                "max_drawdown": float((test_stress_1 or {}).get("max_drawdown", 0.0) or 0.0),
+                "turnover": float((test_stress_1 or {}).get("turnover", 0.0) or 0.0),
+                "trade_count": (test_stress_1 or {}).get("trade_count", 0),
             },
         }
+        write_strict_json(out_dir / "best_summary.json", best_payload)
         write_strict_json(out_dir / "best_config.json", {**best_cfg_patch, "frontier": best_payload})
 
         print("V3 frontier sweep completed")

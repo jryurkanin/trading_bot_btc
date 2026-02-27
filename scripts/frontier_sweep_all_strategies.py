@@ -312,13 +312,27 @@ def _load_best_summary(summary_path: Path, strategy_dir: Path, strategy: str) ->
 
     top = rows[0]
 
-    cagr_source = top.get("test_cagr_stress_1", top.get("val_stress1_cagr", 0.0))
-    sharpe_source = top.get("test_sharpe_stress_1", top.get("val_sharpe_stress_1", top.get("sharpe", 0.0)))
-    max_drawdown_source = top.get("test_max_drawdown_stress_1", top.get("val_max_drawdown_worst", top.get("max_drawdown", 0.0)))
+    cagr_source = top.get(
+        "test_cagr_stress_1",
+        top.get("val_stress1_cagr", top.get("val_score", top.get("cagr", 0.0))),
+    )
+    sharpe_source = top.get(
+        "test_sharpe_stress_1",
+        top.get("val_sharpe_stress_1", top.get("val_stress1_sharpe", top.get("sharpe", 0.0))),
+    )
+    max_drawdown_source = top.get(
+        "test_max_drawdown_stress_1",
+        top.get("val_max_drawdown_worst", top.get("val_stress1_max_drawdown", top.get("max_drawdown", 0.0))),
+    )
+    turnover_source = top.get(
+        "test_turnover_stress_1",
+        top.get("val_turnover_worst", top.get("val_stress1_turnover", top.get("turnover", 0.0))),
+    )
 
     cagr = _to_float(cagr_source)
     sharpe = _to_float(sharpe_source)
     max_drawdown = _to_float(max_drawdown_source)
+    turnover = _to_float(turnover_source)
 
     # Normalize to best_summary-like structure for downstream comparisons.
     return {
@@ -329,7 +343,7 @@ def _load_best_summary(summary_path: Path, strategy_dir: Path, strategy: str) ->
             "sharpe": sharpe,
             "max_drawdown": max_drawdown,
             "trade_count": top.get("trade_count") or top.get("val_trade_count", 0),
-            "turnover": _to_float(top.get("turnover", 0.0)),
+            "turnover": turnover,
         },
         "best_config": {},
     }
@@ -345,11 +359,29 @@ def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]
 
     best = summary.get("best", {}) if isinstance(summary, dict) else {}
     cagr = float(
-        best.get("test_cagr_stress_1", best.get("val_stress1_cagr", 0.0)) or 0.0
+        best.get("test_cagr_stress_1", best.get("val_stress1_cagr", best.get("val_score", 0.0))) or 0.0
     )
-    sharpe = float(best.get("val_sharpe_stress_1", 0.0) or best.get("sharpe", 0.0) or 0.0)
-    drawdown = float(best.get("val_max_drawdown_worst", 0.0) or 0.0)
-    turnover = float(best.get("val_turnover", 0.0) or best.get("turnover", 0.0) or 0.0)
+    sharpe = float(
+        best.get(
+            "test_sharpe_stress_1",
+            best.get("val_sharpe_stress_1", best.get("val_stress1_sharpe", best.get("sharpe", 0.0))),
+        )
+        or 0.0
+    )
+    drawdown = float(
+        best.get(
+            "test_max_drawdown_stress_1",
+            best.get("val_max_drawdown_worst", best.get("val_stress1_max_drawdown", best.get("max_drawdown", 0.0))),
+        )
+        or 0.0
+    )
+    turnover = float(
+        best.get(
+            "test_turnover_stress_1",
+            best.get("val_turnover_worst", best.get("val_stress1_turnover", best.get("val_turnover", best.get("turnover", 0.0)))),
+        )
+        or 0.0
+    )
     return (cagr, sharpe, drawdown, turnover)
 
 
@@ -682,7 +714,15 @@ def _summarize(
         best_entry: dict[str, Any] | None = None
         best_sort_key: tuple[float, float, float, float] = (-1e18, -1e18, -1e18, -1e18)
 
-        for result in valid_results:
+        candidate_results = list(valid_results)
+        if ranking_mode == "vs_benchmark" and benchmark_score is not None:
+            candidate_results = [
+                r for r in valid_results if str(r.get("strategy")) != "macro_gate_benchmark"
+            ]
+            if not candidate_results:
+                print("\nNo non-benchmark strategy produced a comparable best summary.")
+
+        for result in candidate_results:
             strategy = result["strategy"]
             score = strategy_scores.get(strategy)
             if score is None:
@@ -700,6 +740,11 @@ def _summarize(
                     f"cagr={sort_key[0]:+.6f}, sharpe={sort_key[1]:+.6f}, "
                     f"drawdown={sort_key[2]:+.6f}, turnover={sort_key[3]:+.6f}"
                 )
+                if sort_key[0] <= 0.0:
+                    print(
+                        f"  Skipping [{strategy}] due to non-positive Δcagr vs benchmark ({sort_key[0]:+.6f})"
+                    )
+                    continue
             else:
                 sort_key = score
 

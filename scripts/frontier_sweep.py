@@ -112,8 +112,8 @@ def parse_grid_values(raw: str) -> list[Any]:
     vals: list[Any] = []
     for chunk in [x.strip() for x in raw.split(",") if x.strip()]:
         low = chunk.lower()
-        if low in {"true", "false", "1", "0", "yes", "no"}:
-            vals.append(low in {"true", "1", "yes"})
+        if low in {"true", "false", "yes", "no", "on", "off"}:
+            vals.append(low in {"true", "yes", "on"})
             continue
         try:
             if "." in low or "e" in low:
