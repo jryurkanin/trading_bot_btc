@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--small", action="store_true", help="Use reduced sweep grids for quick checks (where supported)")
     p.add_argument("--workers", type=int, default=20, help="Workers for macro-only frontier sweep")
     p.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint interval for strategy sweeps")
+    p.add_argument("--run-id", default=None, help="Optional shared run id for per-strategy output directories")
+    p.add_argument("--resume", action="store_true", help="Resume an existing run-id across all strategies")
     p.add_argument(
         "--strategy-workers",
         type=int,
@@ -104,8 +106,12 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _run_reports_dir() -> Path:
+def _run_reports_dir(run_id: str | None = None) -> Path:
     REPORTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    raw = (run_id or "").strip()
+    if raw:
+        token = raw if raw.startswith("run_") else f"run_{raw}"
+        return REPORTS_BASE_DIR / token
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     return REPORTS_BASE_DIR / f"run_{timestamp}"
 
@@ -247,6 +253,8 @@ def _build_strategy_command(
         "--checkpoint-every",
         str(args.checkpoint_every),
     ])
+    if args.resume:
+        args_for_strategy.append("--resume")
 
     cmd = [sys.executable, str(SCRIPTS_DIR / script_name)]
 
@@ -449,7 +457,8 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    run_reports_dir = _run_reports_dir()
+    run_reports_dir = _run_reports_dir(args.run_id)
+    run_reports_dir.mkdir(parents=True, exist_ok=True)
     progress_path = run_reports_dir / "progress.jsonl"
     run_id = run_reports_dir.name
 
@@ -777,6 +786,10 @@ def main() -> int:
 
     if args.max_error_rate < 0.0 or args.max_error_rate > 1.0:
         print("ERROR: --max-error-rate must be between 0.0 and 1.0", file=sys.stderr)
+        return 2
+
+    if args.resume and not args.run_id:
+        print("ERROR: --resume requires --run-id so the existing run can be located", file=sys.stderr)
         return 2
 
     if not _validate_acceleration_backend(args.acceleration_backend):
