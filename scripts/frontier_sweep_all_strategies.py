@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import statistics
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -385,6 +386,153 @@ def _extract_score(summary: dict[str, Any]) -> tuple[float, float, float, float]
     return (cagr, sharpe, drawdown, turnover)
 
 
+def _extract_validation_score(summary: dict[str, Any]) -> tuple[float, float, float, float]:
+    best = summary.get("best", {}) if isinstance(summary, dict) else {}
+    cagr = float(best.get("val_cagr_stress_1", best.get("val_stress1_cagr", best.get("val_score", 0.0))) or 0.0)
+    sharpe = float(
+        best.get(
+            "val_sharpe_stress_1",
+            best.get("val_stress1_sharpe", best.get("val_sharpe_med", best.get("sharpe", 0.0))),
+        )
+        or 0.0
+    )
+    drawdown = float(
+        best.get(
+            "val_max_drawdown_worst",
+            best.get("val_stress1_max_drawdown", best.get("max_drawdown", 0.0)),
+        )
+        or 0.0
+    )
+    turnover = float(
+        best.get(
+            "val_turnover_worst",
+            best.get("val_stress1_turnover", best.get("val_turnover", best.get("turnover", 0.0))),
+        )
+        or 0.0
+    )
+    return (cagr, sharpe, drawdown, turnover)
+
+
+def _absolute_sort_key(score: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    return (score[0], score[1], score[2], -score[3])
+
+
+def _multifold_robust_score(strategy_dir: Path, summary: dict[str, Any]) -> dict[str, Any] | None:
+    best = summary.get("best") if isinstance(summary, dict) else None
+    if not isinstance(best, dict):
+        return None
+
+    param_id = str(best.get("param_id", "") or "").strip()
+    if not param_id:
+        return None
+
+    summary_csv = strategy_dir / "summary.csv"
+    if not summary_csv.exists():
+        return None
+
+    try:
+        with summary_csv.open("r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return None
+
+    filtered = []
+    for row in rows:
+        if str(row.get("param_id", "") or "").strip() != param_id:
+            continue
+        if str(row.get("error", "") or "").strip():
+            continue
+        filtered.append(row)
+
+    if not filtered:
+        return None
+
+    by_window: dict[str, list[dict[str, Any]]] = {}
+    for row in filtered:
+        window = str(row.get("window", "") or "").strip() or "unknown"
+        by_window.setdefault(window, []).append(row)
+
+    fold_cagr: list[float] = []
+    fold_sharpe: list[float] = []
+    scenario_spreads: list[float] = []
+    all_drawdown: list[float] = []
+    all_turnover: list[float] = []
+
+    for _window, entries in sorted(by_window.items()):
+        cagr_vals = [_to_float(r.get("cagr", 0.0)) for r in entries]
+        sharpe_vals = [_to_float(r.get("sharpe", 0.0)) for r in entries]
+        draw_vals = [_to_float(r.get("max_drawdown", 0.0)) for r in entries]
+        turnover_vals = [_to_float(r.get("turnover", 0.0)) for r in entries]
+
+        if not cagr_vals:
+            continue
+
+        fold_cagr.append(float(statistics.mean(cagr_vals)))
+        fold_sharpe.append(float(statistics.mean(sharpe_vals)))
+        scenario_spreads.append(float(statistics.pstdev(cagr_vals)) if len(cagr_vals) > 1 else 0.0)
+
+        all_drawdown.extend(draw_vals)
+        all_turnover.extend(turnover_vals)
+
+    if not fold_cagr:
+        return None
+
+    fold_mean_cagr = float(statistics.mean(fold_cagr))
+    fold_std_cagr = float(statistics.pstdev(fold_cagr)) if len(fold_cagr) > 1 else 0.0
+    fold_mean_sharpe = float(statistics.mean(fold_sharpe))
+    fold_std_sharpe = float(statistics.pstdev(fold_sharpe)) if len(fold_sharpe) > 1 else 0.0
+    scenario_penalty = float(statistics.mean(scenario_spreads)) if scenario_spreads else 0.0
+
+    robust_cagr = fold_mean_cagr - fold_std_cagr - scenario_penalty
+    robust_sharpe = fold_mean_sharpe - fold_std_sharpe
+    worst_drawdown = float(min(all_drawdown)) if all_drawdown else 0.0
+    avg_turnover = float(statistics.mean(all_turnover)) if all_turnover else 0.0
+
+    return {
+        "score": (robust_cagr, robust_sharpe, worst_drawdown, avg_turnover),
+        "fold_count": len(fold_cagr),
+        "scenario_count": len(filtered),
+        "fold_cagr_mean": fold_mean_cagr,
+        "fold_cagr_std": fold_std_cagr,
+        "scenario_cagr_penalty": scenario_penalty,
+    }
+
+
+def _score_payload(score: tuple[float, float, float, float]) -> dict[str, float]:
+    return {
+        "cagr": float(score[0]),
+        "sharpe": float(score[1]),
+        "max_drawdown": float(score[2]),
+        "turnover": float(score[3]),
+    }
+
+
+def _write_latest_successful_pointer(
+    *,
+    run_reports_dir: Path,
+    summary_path: Path,
+    final_report_path: Path,
+    report: dict[str, Any],
+) -> None:
+    REPORTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    pointer_payload = {
+        "run_id": run_reports_dir.name,
+        "updated_at": _utc_timestamp(),
+        "report_path": str(final_report_path),
+        "summary_path": str(summary_path),
+        "validation_winner": (report.get("validation_winner") or {}).get("strategy"),
+        "oos_winner": (report.get("oos_winner") or {}).get("strategy"),
+    }
+    (REPORTS_BASE_DIR / "latest_successful_run.json").write_text(
+        json.dumps(pointer_payload, indent=2),
+        encoding="utf-8",
+    )
+    (REPORTS_BASE_DIR / "latest_successful_run.txt").write_text(
+        str(final_report_path) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _summary_error_stats(strategy_dir: Path) -> tuple[int, int, float]:
     summary_path = strategy_dir / "summary.csv"
     if not summary_path.exists():
@@ -668,7 +816,11 @@ def _summarize(
 ) -> dict[str, Any] | None:
     print("\n=== Frontier sweep summary (all active strategies) ===")
 
-    strategy_scores: dict[str, tuple[float, float, float, float]] = {}
+    oos_scores: dict[str, tuple[float, float, float, float]] = {}
+    validation_scores: dict[str, tuple[float, float, float, float]] = {}
+    ranking_scores: dict[str, tuple[float, float, float, float]] = {}
+    ranking_basis: dict[str, str] = {}
+    multifold_details: dict[str, dict[str, Any]] = {}
     valid_results: list[dict[str, Any]] = []
 
     for result in results:
@@ -695,27 +847,72 @@ def _summarize(
             print("  Status: completed (no winning config)")
             continue
 
-        score = _extract_score(summary)
-        strategy_scores[strategy] = score
+        oos_score = _extract_score(summary)
+        val_score = _extract_validation_score(summary)
+        robust = _multifold_robust_score(Path(result["output_dir"]), summary)
+
+        rank_score = oos_score
+        basis = "oos_stress1"
+        if robust and isinstance(robust.get("score"), tuple):
+            rank_score = robust["score"]
+            basis = "multifold_robust"
+            multifold_details[strategy] = robust
+
+        oos_scores[strategy] = oos_score
+        validation_scores[strategy] = val_score
+        ranking_scores[strategy] = rank_score
+        ranking_basis[strategy] = basis
         valid_results.append(result)
-        print(f"  Status: success")
+
+        print("  Status: success")
         print(
-            f"  Best cagr: {score[0]:.6f}, sharpe: {score[1]:.6f}, "
-            f"drawdown: {score[2]:.6f}, turnover: {score[3]:.6f}"
+            f"  Validation score => cagr: {val_score[0]:.6f}, sharpe: {val_score[1]:.6f}, "
+            f"drawdown: {val_score[2]:.6f}, turnover: {val_score[3]:.6f}"
         )
+        print(
+            f"  OOS score => cagr: {oos_score[0]:.6f}, sharpe: {oos_score[1]:.6f}, "
+            f"drawdown: {oos_score[2]:.6f}, turnover: {oos_score[3]:.6f}"
+        )
+        if robust:
+            print(
+                f"  Multifold robust score => cagr: {rank_score[0]:.6f}, sharpe: {rank_score[1]:.6f}, "
+                f"drawdown: {rank_score[2]:.6f}, turnover: {rank_score[3]:.6f} "
+                f"(folds={robust.get('fold_count', 0)}, scenario_rows={robust.get('scenario_count', 0)})"
+            )
 
     report: dict[str, Any] = {
         "results": results,
         "best": None,
+        "validation_winner": None,
+        "oos_winner": None,
         "output_root": str(output_root),
         "reports_dir": str(run_reports_dir),
         "ranking_mode": ranking_mode,
+        "ranking_basis": ranking_basis,
     }
 
     if not valid_results:
         print("\nNo successful strategy run produced a best_summary result.")
     else:
-        benchmark_score = strategy_scores.get("macro_gate_benchmark")
+        # Validation winner (absolute, independent of benchmark-relative ranking).
+        validation_entry = max(
+            valid_results,
+            key=lambda r: _absolute_sort_key(validation_scores.get(r["strategy"], (0.0, 0.0, 0.0, 0.0))),
+        )
+        validation_strategy = validation_entry["strategy"]
+        validation_summary = validation_entry["summary"] if isinstance(validation_entry.get("summary"), dict) else {}
+        validation_report = {
+            "strategy": validation_strategy,
+            "score": _score_payload(validation_scores[validation_strategy]),
+            "config": validation_summary.get("best_config") or validation_summary.get("best_cfg") or {},
+            "output_dir": validation_entry["output_dir"],
+        }
+        report["validation_winner"] = validation_report
+
+        print("\n=== Validation winner ===")
+        print(json.dumps(validation_report, indent=2))
+
+        benchmark_score = ranking_scores.get("macro_gate_benchmark")
         best_entry: dict[str, Any] | None = None
         best_sort_key: tuple[float, float, float, float] = (-1e18, -1e18, -1e18, -1e18)
 
@@ -729,7 +926,7 @@ def _summarize(
 
         for result in candidate_results:
             strategy = result["strategy"]
-            score = strategy_scores.get(strategy)
+            score = ranking_scores.get(strategy)
             if score is None:
                 continue
 
@@ -751,7 +948,7 @@ def _summarize(
                     )
                     continue
             else:
-                sort_key = score
+                sort_key = _absolute_sort_key(score)
 
             if sort_key > best_sort_key:
                 best_sort_key = sort_key
@@ -764,51 +961,63 @@ def _summarize(
             if not isinstance(best_summary, dict):
                 print("\nCould not parse best strategy details for final report.")
             else:
-                best_score = strategy_scores.get(best_entry["strategy"], (0.0, 0.0, 0.0, 0.0))
-                best_report: dict[str, Any] = {
-                    "strategy": best_entry["strategy"],
-                    "score": {
-                        "cagr": best_score[0],
-                        "sharpe": best_score[1],
-                        "max_drawdown": best_score[2],
-                        "turnover": best_score[3],
-                    },
+                strategy = best_entry["strategy"]
+                selected_score = ranking_scores.get(strategy, (0.0, 0.0, 0.0, 0.0))
+                oos_score = oos_scores.get(strategy, (0.0, 0.0, 0.0, 0.0))
+                oos_report: dict[str, Any] = {
+                    "strategy": strategy,
+                    "selection_score": _score_payload(selected_score),
+                    "selection_basis": ranking_basis.get(strategy, "oos_stress1"),
+                    "oos_score": _score_payload(oos_score),
                     "score_mode": ranking_mode,
                     "config": best_summary.get("best_config") or best_summary.get("best_cfg") or {},
                     "performance": best_summary.get("test_window_stress_1")
-                    or {
-                        "cagr": best_score[0],
-                        "sharpe": best_score[1],
-                        "max_drawdown": best_score[2],
-                        "turnover": best_score[3],
-                    },
+                    or _score_payload(oos_score),
                     "output_dir": best_entry["output_dir"],
                 }
 
-                benchmark_score = strategy_scores.get("macro_gate_benchmark")
-                if ranking_mode == "vs_benchmark" and benchmark_score is not None:
-                    best_report["delta_vs_benchmark"] = {
-                        "cagr": best_score[0] - benchmark_score[0],
-                        "sharpe": best_score[1] - benchmark_score[1],
-                        "max_drawdown": abs(benchmark_score[2]) - abs(best_score[2]),
-                        "turnover": benchmark_score[3] - best_score[3],
+                if strategy in multifold_details:
+                    oos_report["multifold"] = {
+                        k: v
+                        for k, v in multifold_details[strategy].items()
+                        if k != "score"
                     }
 
-                print("\n=== Best strategy ===")
-                print(json.dumps(best_report, indent=2))
+                if ranking_mode == "vs_benchmark" and benchmark_score is not None:
+                    oos_report["delta_vs_benchmark"] = {
+                        "cagr": selected_score[0] - benchmark_score[0],
+                        "sharpe": selected_score[1] - benchmark_score[1],
+                        "max_drawdown": abs(benchmark_score[2]) - abs(selected_score[2]),
+                        "turnover": benchmark_score[3] - selected_score[3],
+                    }
+
+                print("\n=== OOS winner ===")
+                print(json.dumps(oos_report, indent=2))
                 print("Output:", best_entry["output_dir"])
-                report["best"] = best_report
+
+                report["oos_winner"] = oos_report
+                report["best"] = oos_report
 
     summary_path = output_root / "all_strategies_summary.json"
     summary_path.write_text(
         json.dumps(report, indent=2),
         encoding="utf-8",
     )
-    # Copy summary for report folder for easy discovery
-    (run_reports_dir / "final_summary.json").write_text(
+
+    final_report_path = run_reports_dir / "final_summary.json"
+    final_report_path.write_text(
         json.dumps(report, indent=2),
         encoding="utf-8",
     )
+
+    # Latest successful pointer for operator visibility.
+    if any(int(r.get("return_code", 1)) == 0 for r in results):
+        _write_latest_successful_pointer(
+            run_reports_dir=run_reports_dir,
+            summary_path=summary_path,
+            final_report_path=final_report_path,
+            report=report,
+        )
 
     _write_progress(
         progress_file,
@@ -816,7 +1025,7 @@ def _summarize(
             "event": "summary_written",
             "run_id": run_reports_dir.name,
             "summary_path": str(summary_path),
-            "report_path": str(run_reports_dir / "final_summary.json"),
+            "report_path": str(final_report_path),
             "has_best": report["best"] is not None,
             "ranking_mode": ranking_mode,
         },

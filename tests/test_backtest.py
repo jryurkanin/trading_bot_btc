@@ -69,7 +69,7 @@ def test_backtest_runs_and_outputs_metrics():
     assert res.metrics["max_drawdown"] <= 0.0
 
 
-def test_unsupported_strategy_rejected_by_engine():
+def test_supported_strategy_variants_run_in_engine():
     hourly, daily = make_oscillating_candles()
     cfg = BotConfig()
     cfg.backtest.initial_equity = 10000
@@ -103,8 +103,8 @@ def test_unsupported_strategy_rejected_by_engine():
         slippage_bps=1.0,
     )
 
-    with pytest.raises(ValueError):
-        eng.run()
+    res = eng.run()
+    assert not res.decisions.empty
 
 
 def test_backtest_uses_prestart_daily_history_for_macro_warmup():

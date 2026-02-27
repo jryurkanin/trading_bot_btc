@@ -31,6 +31,9 @@ from bot.backtest.frontier_runtime import (
     load_checkpoint,
     save_checkpoint,
     derive_processed_param_ids,
+    build_checkpoint_fingerprint,
+    checkpoint_fingerprint_mismatches,
+    build_filter_rejections_payload,
 )
 from bot.system_log import setup_system_logger, get_system_logger
 
@@ -425,6 +428,24 @@ def main() -> int:
     summary_path = out_dir / "summary.csv"
     checkpoint_path = out_dir / "checkpoint.json"
     checkpoint_every = max(1, int(args.checkpoint_every))
+    checkpoint_fingerprint = build_checkpoint_fingerprint(args.strategy, param_sets, windows)
+
+    checkpoint: dict[str, Any] = load_checkpoint(checkpoint_path) if args.resume else {}
+    if args.resume and checkpoint:
+        mismatch = checkpoint_fingerprint_mismatches(checkpoint, checkpoint_fingerprint)
+        if mismatch:
+            mismatch_keys = ", ".join(sorted(mismatch.keys()))
+            logger.error(
+                "frontier_resume_checkpoint_mismatch strategy=%s run_id=%s mismatch=%s",
+                args.strategy,
+                run_token,
+                mismatch,
+            )
+            print(
+                f"ERROR: Resume checkpoint metadata mismatch ({mismatch_keys}); refusing unsafe resume.",
+                file=sys.stderr,
+            )
+            return 2
 
     summary_rows: list[dict[str, Any]] = load_summary_rows(summary_path) if args.resume else []
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
@@ -439,7 +460,6 @@ def main() -> int:
 
     processed_param_ids: set[str] = set()
     if args.resume:
-        checkpoint = load_checkpoint(checkpoint_path)
         processed_param_ids = {
             str(pid).strip()
             for pid in checkpoint.get("processed_param_ids", [])
@@ -466,6 +486,8 @@ def main() -> int:
                 "version": 1,
                 "run_id": run_token,
                 "strategy": args.strategy,
+                "grid_hash": checkpoint_fingerprint["grid_hash"],
+                "window_hash": checkpoint_fingerprint["window_hash"],
                 "completed": bool(completed),
                 "processed_count": len(processed_param_ids),
                 "total_param_sets": len(param_sets),
@@ -601,17 +623,12 @@ def main() -> int:
 
     write_strict_json(
         out_dir / "filter_rejections.json",
-        {
-            "run_id": run_token,
-            "strategy": args.strategy,
-            "total_param_sets": len(param_sets),
-            "accepted_param_sets": int(rejection_counts.get("accepted", 0)),
-            "rejections": {
-                key: value
-                for key, value in sorted(rejection_counts.items())
-                if key != "accepted"
-            },
-        },
+        build_filter_rejections_payload(
+            run_id=run_token,
+            strategy=args.strategy,
+            total_param_sets=len(param_sets),
+            rejection_counts=rejection_counts,
+        ),
     )
 
     ranked.sort(
