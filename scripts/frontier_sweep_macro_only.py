@@ -6,6 +6,7 @@ import argparse
 import csv
 import itertools
 import json
+import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -485,7 +486,7 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
-    log_path = setup_system_logger()
+    log_path = setup_system_logger(level=logging.INFO)
     logger.info("frontier_macro_only_start log_path=%s args=%s", log_path, vars(args))
 
     if not _validate_acceleration_backend(args.acceleration_backend):

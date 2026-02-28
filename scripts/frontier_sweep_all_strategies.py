@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import statistics
 import subprocess
@@ -1036,7 +1037,7 @@ def _summarize(
 
 def main() -> int:
     args = parse_args()
-    log_path = setup_system_logger()
+    log_path = setup_system_logger(level=logging.INFO)
     logger.info("frontier_all_start log_path=%s args=%s", log_path, vars(args))
 
     if not ACTIVE_STRATEGIES:
