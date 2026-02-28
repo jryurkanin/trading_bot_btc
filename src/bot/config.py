@@ -414,11 +414,15 @@ class BacktestConfig(BaseModel):
 
     # compute acceleration backend for backtests (falls back to CPU if CUDA unavailable)
     acceleration_backend: Literal["auto", "cpu", "cuda"] = "auto"
-    acceleration_min_bars: int = 2048
+    acceleration_min_bars: int = 256
 
     VALID_STRATEGIES: ClassVar[Set[str]] = {
         "macro_gate_benchmark",
         "macro_only_v2",
+        "v5_adaptive",
+        "regime_switching_v4_core",
+        "regime_switching_orchestrator",
+        "macro_gate_state",
     }
 
     @field_validator("strategy", mode="after")

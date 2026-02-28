@@ -44,6 +44,60 @@ def _rolling_std_xp(arr, window: int, min_periods: int, xp, ddof: int = 1):
     return std
 
 
+def _rolling_max_xp(arr, window: int, min_periods: int, xp):
+    window = max(1, int(window))
+    min_periods = max(1, int(min_periods))
+    n = int(arr.shape[0])
+    out = xp.full(n, xp.nan, dtype=arr.dtype)
+    if n == 0:
+        return out
+
+    try:
+        sw = xp.lib.stride_tricks.sliding_window_view(arr, window_shape=window)
+        full = xp.nanmax(sw, axis=1)
+        out[window - 1 :] = full
+    except Exception:
+        # Fallback path for array modules without sliding_window_view support.
+        for i in range(window - 1, n):
+            out[i] = xp.nanmax(arr[i - window + 1 : i + 1])
+
+    head = min(window - 1, n)
+    for i in range(head):
+        if i + 1 >= min_periods:
+            out[i] = xp.nanmax(arr[: i + 1])
+
+    if min_periods > 1:
+        out[: min(min_periods - 1, n)] = xp.nan
+    return out
+
+
+def _rolling_min_xp(arr, window: int, min_periods: int, xp):
+    window = max(1, int(window))
+    min_periods = max(1, int(min_periods))
+    n = int(arr.shape[0])
+    out = xp.full(n, xp.nan, dtype=arr.dtype)
+    if n == 0:
+        return out
+
+    try:
+        sw = xp.lib.stride_tricks.sliding_window_view(arr, window_shape=window)
+        full = xp.nanmin(sw, axis=1)
+        out[window - 1 :] = full
+    except Exception:
+        # Fallback path for array modules without sliding_window_view support.
+        for i in range(window - 1, n):
+            out[i] = xp.nanmin(arr[i - window + 1 : i + 1])
+
+    head = min(window - 1, n)
+    for i in range(head):
+        if i + 1 >= min_periods:
+            out[i] = xp.nanmin(arr[: i + 1])
+
+    if min_periods > 1:
+        out[: min(min_periods - 1, n)] = xp.nan
+    return out
+
+
 def sma(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
     if backend == "cpu":
         return series.rolling(window=window, min_periods=1).mean()
@@ -58,16 +112,68 @@ def sma(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
     return pd.Series(to_numpy(out, xp), index=series.index)
 
 
-def ema(series: pd.Series, window: int) -> pd.Series:
-    return series.ewm(span=window, adjust=False, min_periods=1).mean()
+def ema(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
+    if backend == "cpu":
+        return series.ewm(span=window, adjust=False, min_periods=1).mean()
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        return series.ewm(span=window, adjust=False, min_periods=1).mean()
+
+    xp = get_array_module(ctx)
+    arr = xp.asarray(series.to_numpy(dtype=float))
+    out = xp.empty_like(arr)
+    alpha = float(2.0 / (float(window) + 1.0))
+
+    if arr.shape[0] == 0:
+        return pd.Series([], dtype=float, index=series.index)
+
+    first = arr[0]
+    if not xp.isfinite(first):
+        first = 0.0
+    out[0] = first
+    for i in range(1, int(arr.shape[0])):
+        x = arr[i]
+        if not xp.isfinite(x):
+            x = out[i - 1]
+        out[i] = alpha * x + (1.0 - alpha) * out[i - 1]
+
+    return pd.Series(to_numpy(out, xp), index=series.index)
 
 
-def bollinger_bands(series: pd.Series, window: int = 20, stdev: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
-    mid = sma(series, window)
-    std = series.rolling(window=window, min_periods=1).std(ddof=0)
-    upper = mid + stdev * std
-    lower = mid - stdev * std
-    return mid, upper, lower
+def bollinger_bands(
+    series: pd.Series,
+    window: int = 20,
+    stdev: float = 2.0,
+    *,
+    backend: str = "cpu",
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    if backend == "cpu":
+        mid = sma(series, window)
+        std = series.rolling(window=window, min_periods=1).std(ddof=0)
+        upper = mid + stdev * std
+        lower = mid - stdev * std
+        return mid, upper, lower
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        mid = sma(series, window)
+        std = series.rolling(window=window, min_periods=1).std(ddof=0)
+        upper = mid + stdev * std
+        lower = mid - stdev * std
+        return mid, upper, lower
+
+    xp = get_array_module(ctx)
+    arr = xp.asarray(series.to_numpy(dtype=float))
+    mean = _rolling_mean_xp(arr, int(window), min_periods=1, xp=xp)
+    std = _rolling_std_xp(arr, int(window), min_periods=1, xp=xp, ddof=0)
+    upper = mean + float(stdev) * std
+    lower = mean - float(stdev) * std
+    return (
+        pd.Series(to_numpy(mean, xp), index=series.index),
+        pd.Series(to_numpy(upper, xp), index=series.index),
+        pd.Series(to_numpy(lower, xp), index=series.index),
+    )
 
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
@@ -79,16 +185,63 @@ def rsi(series: pd.Series, window: int = 14) -> pd.Series:
     return out.fillna(50.0)
 
 
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+def true_range(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    *,
+    backend: str = "cpu",
+) -> pd.Series:
+    if backend == "cpu":
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    xp = get_array_module(ctx)
+    high_arr = xp.asarray(high.to_numpy(dtype=float))
+    low_arr = xp.asarray(low.to_numpy(dtype=float))
+    close_arr = xp.asarray(close.to_numpy(dtype=float))
+
+    prev_close = xp.empty_like(close_arr)
+    prev_close[0] = close_arr[0]
+    prev_close[1:] = close_arr[:-1]
+
+    tr1 = high_arr - low_arr
+    tr2 = xp.abs(high_arr - prev_close)
+    tr3 = xp.abs(low_arr - prev_close)
+    tr = xp.maximum(xp.maximum(tr1, tr2), tr3)
+    return pd.Series(to_numpy(tr, xp), index=high.index)
 
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    return true_range(high, low, close).rolling(window=window, min_periods=1).mean()
+def atr(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int = 14,
+    *,
+    backend: str = "cpu",
+) -> pd.Series:
+    if backend == "cpu":
+        return true_range(high, low, close).rolling(window=window, min_periods=1).mean()
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        return true_range(high, low, close).rolling(window=window, min_periods=1).mean()
+
+    xp = get_array_module(ctx)
+    tr = xp.asarray(true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+    out = _rolling_mean_xp(tr, int(window), min_periods=1, xp=xp)
+    return pd.Series(to_numpy(out, xp), index=high.index)
 
 
 def realized_vol(returns: pd.Series, window: int = 24, *, backend: str = "cpu") -> pd.Series:
@@ -111,8 +264,30 @@ def realized_vol(returns: pd.Series, window: int = 24, *, backend: str = "cpu") 
     return pd.Series(to_numpy(rv, xp), index=returns.index)
 
 
-def donchian_channel(high: pd.Series, low: pd.Series, window: int = 55) -> tuple[pd.Series, pd.Series]:
-    return low.rolling(window=window, min_periods=1).min(), high.rolling(window=window, min_periods=1).max()
+def donchian_channel(
+    high: pd.Series,
+    low: pd.Series,
+    window: int = 55,
+    *,
+    backend: str = "cpu",
+) -> tuple[pd.Series, pd.Series]:
+    if backend == "cpu":
+        return low.rolling(window=window, min_periods=1).min(), high.rolling(window=window, min_periods=1).max()
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        return low.rolling(window=window, min_periods=1).min(), high.rolling(window=window, min_periods=1).max()
+
+    xp = get_array_module(ctx)
+    high_arr = xp.asarray(high.to_numpy(dtype=float))
+    low_arr = xp.asarray(low.to_numpy(dtype=float))
+
+    low_ch = _rolling_min_xp(low_arr, int(window), min_periods=1, xp=xp)
+    high_ch = _rolling_max_xp(high_arr, int(window), min_periods=1, xp=xp)
+    return (
+        pd.Series(to_numpy(low_ch, xp), index=low.index),
+        pd.Series(to_numpy(high_ch, xp), index=high.index),
+    )
 
 
 def returns(close: pd.Series) -> pd.Series:

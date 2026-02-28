@@ -11,13 +11,17 @@ import pandas as pd
 # Make local src discoverable when running directly from the repository root
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 
-from bot.config import BotConfig
+from bot.config import BotConfig, BacktestConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
 from bot.backtest.engine import BacktestEngine
 from bot.backtest.reporting import write_strict_json, dumps_strict_json
 from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.analysis.pnl_decomposition import run_pnl_decomposition
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.backtest")
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +30,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
     p.add_argument("--tf", default="1h", choices=["1h", "1d"])
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark", "macro_only_v2"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=sorted(BacktestConfig.VALID_STRATEGIES),
+    )
     p.add_argument("--config", default=None, help="Path to JSON/TOML/YAML config")
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default=None)
     p.add_argument("--fred-enabled", action=argparse.BooleanOptionalAction, default=None)
@@ -124,6 +132,9 @@ def _prefetch_start(start: datetime, cfg: BotConfig) -> datetime:
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("backtest_start log_path=%s args=%s", log_path, vars(args))
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.backtest.initial_equity = args.initial_equity
@@ -142,8 +153,10 @@ def main() -> int:
     if args.fred_realtime_mode is not None:
         cfg.fred.realtime_mode = str(args.fred_realtime_mode)
 
-    # Keep macro benchmark policy behavior only.
-    cfg.regime.trend_boost_enabled = False
+    # Keep macro benchmark policy behavior only, but do not force-disable
+    # trend boost for non-benchmark strategies.
+    if args.strategy == "macro_gate_benchmark" and args.trend_boost_enabled is None:
+        cfg.regime.trend_boost_enabled = False
 
     if args.fill_model:
         cfg.execution.fill_model = args.fill_model
@@ -261,6 +274,14 @@ def main() -> int:
     start = parse_ts(args.start)
     end = parse_ts(args.end)
     prefetch_start = _prefetch_start(start, cfg)
+    logger.info(
+        "backtest_window product=%s strategy=%s start=%s end=%s prefetch_start=%s",
+        args.product,
+        args.strategy,
+        start.isoformat(),
+        end.isoformat(),
+        prefetch_start.isoformat(),
+    )
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     maker = args.maker_bps / 10000.0
@@ -286,6 +307,12 @@ def main() -> int:
         client=client,
         query=CandleQuery(product=args.product, timeframe="1d", start=prefetch_start, end=end),
     )
+    logger.info(
+        "backtest_candles_loaded product=%s hourly_rows=%d daily_rows=%d",
+        args.product,
+        len(hourly),
+        len(daily),
+    )
 
     engine = BacktestEngine(
         product=args.product,
@@ -303,6 +330,13 @@ def main() -> int:
         fred_config=cfg.fred,
     )
     result = engine.run()
+    logger.info(
+        "backtest_complete strategy=%s trade_count=%d metrics=%s diagnostics=%s",
+        args.strategy,
+        len(result.trades),
+        result.metrics,
+        result.diagnostics,
+    )
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -436,6 +470,15 @@ def main() -> int:
     print(f"Equity curve: {out / 'equity_curve.csv'}")
     print(f"Macro bucket attribution: {macro_bucket_csv}")
     print(f"Report: {report_path}")
+    logger.info(
+        "backtest_artifacts output=%s report=%s equity=%s trades=%s decisions=%s macro_bucket=%s",
+        out,
+        report_path,
+        equity_csv,
+        trades_csv,
+        decisions_csv,
+        macro_bucket_csv,
+    )
     return 0
 
 

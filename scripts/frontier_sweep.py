@@ -20,8 +20,25 @@ sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 from bot.backtest.engine import BacktestEngine
 from bot.backtest.reporting import dumps_strict_json, write_strict_json
 from bot.coinbase_client import RESTClientWrapper
+from bot.config import BacktestConfig
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.backtest.frontier_runtime import (
+    resolve_run_dir,
+    load_summary_rows,
+    write_summary_rows,
+    load_checkpoint,
+    save_checkpoint,
+    derive_processed_param_ids,
+    build_checkpoint_fingerprint,
+    checkpoint_fingerprint_mismatches,
+    build_filter_rejections_payload,
+)
+from bot.system_log import setup_system_logger, get_system_logger
+
+
+logger = get_system_logger("scripts.frontier_sweep")
 
 
 DEFAULT_GRID_SPACE: dict[str, list[Any]] = {
@@ -32,6 +49,17 @@ DEFAULT_GRID_SPACE: dict[str, list[Any]] = {
     "trend_boost_enabled": [True],
     "trend_boost_multiplier": [1.0, 1.1, 1.25, 1.5],
     "trend_boost_adx_threshold": [20.0, 25.0, 30.0],
+}
+
+
+SMALL_GRID_SPACE: dict[str, list[Any]] = {
+    "target_ann_vol": [0.30, 0.50],
+    "macro_mode": ["score"],
+    "macro_score_floor": [0.0],
+    "macro_score_min_to_trade": [0.25],
+    "trend_boost_enabled": [True],
+    "trend_boost_multiplier": [1.1],
+    "trend_boost_adx_threshold": [25.0],
 }
 
 
@@ -87,8 +115,8 @@ def parse_grid_values(raw: str) -> list[Any]:
     vals: list[Any] = []
     for chunk in [x.strip() for x in raw.split(",") if x.strip()]:
         low = chunk.lower()
-        if low in {"true", "false", "1", "0", "yes", "no"}:
-            vals.append(low in {"true", "1", "yes"})
+        if low in {"true", "false", "yes", "no", "on", "off"}:
+            vals.append(low in {"true", "yes", "on"})
             continue
         try:
             if "." in low or "e" in low:
@@ -126,6 +154,7 @@ def load_grid(
     grid_flags: dict[str, list[Any]],
     *,
     include_fred_grid: bool = False,
+    small: bool = False,
 ) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -147,7 +176,7 @@ def load_grid(
             return product_grid(space)
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
-    space = dict(DEFAULT_GRID_SPACE)
+    space = dict(SMALL_GRID_SPACE if small else DEFAULT_GRID_SPACE)
     if include_fred_grid:
         space.update(DEFAULT_FRED_SWEEP_SPACE)
     space.update(grid_flags)
@@ -186,6 +215,23 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
             return
 
     raise KeyError(f"Unknown parameter key: {key}")
+
+def validate_grid_keys(base_cfg: BotConfig, param_sets: list[dict[str, Any]]) -> list[str]:
+    sample_by_key: dict[str, Any] = {}
+    for params in param_sets:
+        for key, value in params.items():
+            sample_by_key.setdefault(str(key), value)
+
+    invalid: list[str] = []
+    for key in sorted(sample_by_key):
+        probe_cfg = clone_cfg(base_cfg)
+        try:
+            set_param(probe_cfg, key, sample_by_key[key])
+        except Exception:
+            invalid.append(key)
+
+    return invalid
+
 
 
 def run_window(
@@ -271,24 +317,51 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-end", default="2024-12-31T23:00:00Z")
     p.add_argument("--test-start", default="2025-01-01T00:00:00Z")
     p.add_argument("--test-end", default=None)
-    p.add_argument("--strategy", default="macro_gate_benchmark", choices=["macro_gate_benchmark"])
+    p.add_argument(
+        "--strategy",
+        default="macro_gate_benchmark",
+        choices=sorted(BacktestConfig.VALID_STRATEGIES),
+    )
     p.add_argument("--fill-model", default="bid_ask", choices=["next_open", "bid_ask", "worst_case_bar"])
     p.add_argument("--acceleration-backend", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--config", default=None)
     p.add_argument("--grid-config", default=None, help="JSON file: either {param:[...]} or [{...}, ...]")
     p.add_argument("--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override")
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay parameters in sweep grid")
+    p.add_argument("--small", action="store_true", help="Use reduced parameter grid for smoke tests")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.25)
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--output-dir", default="artifacts/frontier")
+    p.add_argument("--run-id", default=None, help="Optional run id; defaults to current UTC timestamp")
+    p.add_argument("--resume", action="store_true", help="Resume from an existing run/checkpoint")
+    p.add_argument("--checkpoint-every", type=int, default=10, help="Persist checkpoint every N parameter sets")
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     return p.parse_args()
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_sweep_start log_path=%s args=%s", log_path, vars(args))
+
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
+
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
     cfg.execution.fill_model = args.fill_model
@@ -328,19 +401,112 @@ def main() -> int:
         args.grid_config,
         grid_flags,
         include_fred_grid=bool(args.include_fred_grid),
+        small=bool(args.small),
+    )
+    invalid_grid_keys = validate_grid_keys(cfg, param_sets)
+    if invalid_grid_keys:
+        logger.error(
+            "frontier_grid_validation_failed strategy=%s keys=%s",
+            args.strategy,
+            invalid_grid_keys,
+        )
+        print(
+            f"ERROR: Unknown/invalid grid parameter key(s): {', '.join(invalid_grid_keys)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    logger.info(
+        "frontier_sweep_config strategy=%s param_sets=%d windows=%d scenarios=%d",
+        args.strategy,
+        len(param_sets),
+        len(windows),
+        len(SCENARIOS),
     )
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir, run_token = resolve_run_dir(args.output_dir, args.run_id, args.resume)
+    summary_path = out_dir / "summary.csv"
+    checkpoint_path = out_dir / "checkpoint.json"
+    checkpoint_every = max(1, int(args.checkpoint_every))
+    checkpoint_fingerprint = build_checkpoint_fingerprint(args.strategy, param_sets, windows)
 
-    summary_rows: list[dict[str, Any]] = []
+    checkpoint: dict[str, Any] = load_checkpoint(checkpoint_path) if args.resume else {}
+    if args.resume and checkpoint:
+        mismatch = checkpoint_fingerprint_mismatches(checkpoint, checkpoint_fingerprint)
+        if mismatch:
+            mismatch_keys = ", ".join(sorted(mismatch.keys()))
+            logger.error(
+                "frontier_resume_checkpoint_mismatch strategy=%s run_id=%s mismatch=%s",
+                args.strategy,
+                run_token,
+                mismatch,
+            )
+            print(
+                f"ERROR: Resume checkpoint metadata mismatch ({mismatch_keys}); refusing unsafe resume.",
+                file=sys.stderr,
+            )
+            return 2
+
+    summary_rows: list[dict[str, Any]] = load_summary_rows(summary_path) if args.resume else []
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for row in summary_rows:
+        pid = str(row.get("param_id", "") or "").strip()
+        window = str(row.get("window", "") or "").strip()
+        scenario = str(row.get("scenario", "") or "").strip()
+        err = str(row.get("error", "") or "").strip()
+        if not pid or not window or not scenario or err:
+            continue
+        grouped.setdefault(pid, {}).setdefault(window, {})[scenario] = row
 
+    processed_param_ids: set[str] = set()
+    if args.resume:
+        processed_param_ids = {
+            str(pid).strip()
+            for pid in checkpoint.get("processed_param_ids", [])
+            if str(pid).strip()
+        }
+        if not processed_param_ids:
+            processed_param_ids = derive_processed_param_ids(
+                summary_rows,
+                expected_rows_per_param=len(windows) * len(SCENARIOS),
+            )
+
+    if args.resume and processed_param_ids:
+        print(
+            f"Resuming {run_token}: {len(processed_param_ids)}/{len(param_sets)} parameter sets already complete"
+        )
+    else:
+        print(f"Starting {run_token}: {len(param_sets)} parameter sets")
+
+    def persist_checkpoint(*, completed: bool) -> None:
+        write_summary_rows(summary_path, summary_rows)
+        save_checkpoint(
+            checkpoint_path,
+            {
+                "version": 1,
+                "run_id": run_token,
+                "strategy": args.strategy,
+                "grid_hash": checkpoint_fingerprint["grid_hash"],
+                "window_hash": checkpoint_fingerprint["window_hash"],
+                "completed": bool(completed),
+                "processed_count": len(processed_param_ids),
+                "total_param_sets": len(param_sets),
+                "processed_param_ids": sorted(processed_param_ids),
+                "checkpoint_every": checkpoint_every,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "summary_csv": str(summary_path),
+            },
+        )
+
+    processed_since_checkpoint = 0
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
-        grouped[param_id] = {}
+        if param_id in processed_param_ids:
+            continue
+
+        grouped.setdefault(param_id, {})
         for window in windows:
-            grouped[param_id][window.name] = {}
+            grouped[param_id].setdefault(window.name, {})
             for scenario in SCENARIOS:
                 try:
                     row = run_window(
@@ -360,6 +526,14 @@ def main() -> int:
                     summary_rows.append(row)
                     grouped[param_id][window.name][scenario.name] = row
                 except Exception as exc:
+                    logger.exception(
+                        "frontier_run_error strategy=%s param_id=%s window=%s scenario=%s params=%s",
+                        args.strategy,
+                        param_id,
+                        window.name,
+                        scenario.name,
+                        params,
+                    )
                     summary_rows.append(
                         {
                             "param_id": param_id,
@@ -372,14 +546,18 @@ def main() -> int:
                         }
                     )
 
-    summary_path = out_dir / "summary.csv"
-    if summary_rows:
-        cols = sorted({k for row in summary_rows for k in row.keys()})
-        with summary_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            for row in summary_rows:
-                w.writerow(row)
+        processed_param_ids.add(param_id)
+        processed_since_checkpoint += 1
+        if processed_since_checkpoint >= checkpoint_every:
+            persist_checkpoint(completed=False)
+            processed_since_checkpoint = 0
+
+    persist_checkpoint(completed=False)
+
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
     # rank params using validation robustness under cost stress
     ranked: list[dict[str, Any]] = []
@@ -392,24 +570,37 @@ def main() -> int:
         s2 = val.get("stress_2")
 
         if not base or not s1 or not s2:
+            reject("missing_val_scenarios")
             continue
-        if s1.get("net_pnl", 0.0) <= 0:
+        if float(s1.get("net_pnl", 0.0) or 0.0) <= 0.0:
+            reject("stress1_net_pnl_non_positive")
             continue
 
         max_dd_ok = (
-            abs(float(base.get("max_drawdown", 0.0))) <= args.max_drawdown_max
-            and abs(float(s1.get("max_drawdown", 0.0))) <= args.max_drawdown_max
+            abs(float(base.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
+            and abs(float(s1.get("max_drawdown", 0.0) or 0.0)) <= args.max_drawdown_max
         )
         if not max_dd_ok:
+            reject("drawdown_limit")
             continue
 
-        worst_turnover = max(float(base.get("turnover", 0.0)), float(s1.get("turnover", 0.0)), float(s2.get("turnover", 0.0)))
+        worst_turnover = max(
+            float(base.get("turnover", 0.0) or 0.0),
+            float(s1.get("turnover", 0.0) or 0.0),
+            float(s2.get("turnover", 0.0) or 0.0),
+        )
         if worst_turnover > args.turnover_max:
+            reject("turnover_limit")
             continue
 
-        cagr_vals = [float(base.get("cagr", 0.0) or 0.0), float(s1.get("cagr", 0.0) or 0.0), float(s2.get("cagr", 0.0) or 0.0)]
+        cagr_vals = [
+            float(base.get("cagr", 0.0) or 0.0),
+            float(s1.get("cagr", 0.0) or 0.0),
+            float(s2.get("cagr", 0.0) or 0.0),
+        ]
         val_score = float(statistics.median(cagr_vals))
 
+        rejection_counts["accepted"] = rejection_counts.get("accepted", 0) + 1
         ranked.append(
             {
                 "param_id": param_id,
@@ -417,7 +608,10 @@ def main() -> int:
                 "val_score": val_score,
                 "val_cagr_stress_1": float(s1.get("cagr", 0.0) or 0.0),
                 "val_cagr_baseline": float(base.get("cagr", 0.0) or 0.0),
-                "val_max_drawdown_worst": min(float(base.get("max_drawdown", 0.0)), float(s1.get("max_drawdown", 0.0))),
+                "val_max_drawdown_worst": min(
+                    float(base.get("max_drawdown", 0.0) or 0.0),
+                    float(s1.get("max_drawdown", 0.0) or 0.0),
+                ),
                 "val_turnover_worst": worst_turnover,
                 "val_sharpe_stress_1": float(s1.get("sharpe", 0.0) or 0.0),
                 "test_cagr_stress_1": float((test.get("stress_1") or {}).get("cagr", 0.0) or 0.0),
@@ -426,6 +620,16 @@ def main() -> int:
                 "test_turnover_stress_1": float((test.get("stress_1") or {}).get("turnover", 0.0) or 0.0),
             }
         )
+
+    write_strict_json(
+        out_dir / "filter_rejections.json",
+        build_filter_rejections_payload(
+            run_id=run_token,
+            strategy=args.strategy,
+            total_param_sets=len(param_sets),
+            rejection_counts=rejection_counts,
+        ),
+    )
 
     ranked.sort(
         key=lambda r: (
@@ -486,7 +690,17 @@ def main() -> int:
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
+        test_stress_1 = grouped.get(best["param_id"], {}).get("test", {}).get("stress_1", {})
+        files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(best_cfg_path),
+            "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+            "checkpoint_json": str(checkpoint_path),
+        }
         best_payload = {
+            "strategy": args.strategy,
+            "run_id": run_token,
             "best": best,
             "constraints": {
                 "turnover_max": args.turnover_max,
@@ -494,22 +708,75 @@ def main() -> int:
                 "validation_profit_required": "stress_1 net_pnl > 0",
             },
             "reproduce_test_command": repro_cmd,
-            "paths": {
-                "summary_csv": str(summary_path),
-                "frontier_csv": str(frontier_path),
-                "best_config": str(best_cfg_path),
+            "best_config": best_cfg_patch,
+            "files": files_payload,
+            "paths": dict(files_payload),
+            "test_window_stress_1": {
+                "cagr": float((test_stress_1 or {}).get("cagr", 0.0) or 0.0),
+                "sharpe": float((test_stress_1 or {}).get("sharpe", 0.0) or 0.0),
+                "max_drawdown": float((test_stress_1 or {}).get("max_drawdown", 0.0) or 0.0),
+                "turnover": float((test_stress_1 or {}).get("turnover", 0.0) or 0.0),
+                "trade_count": (test_stress_1 or {}).get("trade_count", 0),
             },
         }
+        write_strict_json(out_dir / "best_summary.json", best_payload)
         write_strict_json(out_dir / "best_config.json", {**best_cfg_patch, "frontier": best_payload})
 
         print("Frontier sweep completed")
         print(dumps_strict_json(best_payload, indent=2))
         print("Reproduce best test run:")
         print(repro_cmd)
+        logger.info(
+            "frontier_sweep_complete strategy=%s run_id=%s ranked=%d top=%d summary=%s frontier=%s best_config=%s",
+            args.strategy,
+            run_token,
+            len(ranked),
+            len(top),
+            summary_path,
+            frontier_path,
+            best_cfg_path,
+        )
     else:
+        no_best_files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(out_dir / "best_config.json"),
+            "filter_rejections_json": str(out_dir / "filter_rejections.json"),
+            "checkpoint_json": str(checkpoint_path),
+        }
+        no_best_payload = {
+            "strategy": args.strategy,
+            "run_id": run_token,
+            "best": None,
+            "constraints": {
+                "turnover_max": args.turnover_max,
+                "max_drawdown_max": args.max_drawdown_max,
+                "validation_profit_required": "stress_1 net_pnl > 0",
+            },
+            "reproduce_test_command": None,
+            "best_config": {},
+            "files": no_best_files_payload,
+            "paths": dict(no_best_files_payload),
+            "test_window_stress_1": {
+                "cagr": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "turnover": 0.0,
+                "trade_count": 0,
+            },
+        }
+        write_strict_json(out_dir / "best_summary.json", no_best_payload)
         print("Frontier sweep completed but no config satisfied constraints.")
         print(f"Summary: {summary_path}")
+        logger.warning(
+            "frontier_sweep_no_winner strategy=%s run_id=%s param_sets=%d summary=%s",
+            args.strategy,
+            run_token,
+            len(param_sets),
+            summary_path,
+        )
 
+    persist_checkpoint(completed=True)
     return 0
 
 

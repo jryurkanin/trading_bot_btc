@@ -33,6 +33,17 @@ def _probe_cuda() -> tuple[bool, str | None, str | None]:
         name = cp.cuda.runtime.getDeviceProperties(dev.id)["name"]
         if isinstance(name, bytes):
             name = name.decode("utf-8", errors="ignore")
+
+        # Real compute preflight (catches missing NVRTC/toolchain issues that
+        # getDeviceCount alone does not detect).
+        try:
+            x = cp.asarray([1.0, 2.0, 3.0], dtype=cp.float32)
+            y = (x * 2.0).sum()
+            _ = float(y.get())
+        except Exception as exc:
+            msg = str(exc).replace("\n", " ")[:180]
+            return False, str(name), f"cuda_compute_error:{exc.__class__.__name__}:{msg}"
+
         return True, str(name), None
     except Exception as exc:
         return False, None, f"cuda_probe_error:{exc.__class__.__name__}"

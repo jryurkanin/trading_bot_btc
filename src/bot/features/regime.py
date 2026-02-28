@@ -7,6 +7,7 @@ from typing import Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from ..acceleration.cuda_backend import get_array_module, resolve_acceleration_backend, to_numpy
 from . import indicators
 
 
@@ -17,41 +18,130 @@ class RegimeState(str, Enum):
     HIGH_VOL = "HIGH_VOL"
 
 
-def compute_adx_di(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> tuple[pd.Series, pd.Series, pd.Series]:
-    prev_high = high.shift(1)
-    prev_low = low.shift(1)
+def compute_adx_di(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int = 14,
+    *,
+    backend: str = "cpu",
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    if backend == "cpu":
+        prev_high = high.shift(1)
+        prev_low = low.shift(1)
 
-    up_move = high - prev_high
-    down_move = prev_low - low
+        up_move = high - prev_high
+        down_move = prev_low - low
 
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
 
-    tr = indicators.true_range(high, low, close)
-    atr = tr.rolling(window=window, min_periods=window).mean()
+        tr = indicators.true_range(high, low, close, backend=backend)
+        atr = tr.rolling(window=window, min_periods=window).mean()
 
-    plus_di = 100 * (plus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
-    minus_di = 100 * (minus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
+        plus_di = 100 * (plus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
+        minus_di = 100 * (minus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
 
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.rolling(window=window, min_periods=window).mean()
-    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.rolling(window=window, min_periods=window).mean()
+        return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        return compute_adx_di(high, low, close, window=window, backend="cpu")
+
+    xp = get_array_module(ctx)
+    high_arr = xp.asarray(high.to_numpy(dtype=float))
+    low_arr = xp.asarray(low.to_numpy(dtype=float))
+
+    prev_high = xp.empty_like(high_arr)
+    prev_low = xp.empty_like(low_arr)
+    prev_high[0] = high_arr[0]
+    prev_low[0] = low_arr[0]
+    prev_high[1:] = high_arr[:-1]
+    prev_low[1:] = low_arr[:-1]
+
+    up_move = high_arr - prev_high
+    down_move = prev_low - low_arr
+
+    plus_dm = xp.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = xp.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = xp.asarray(indicators.true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+    atr = indicators._rolling_mean_xp(tr, int(window), min_periods=int(window), xp=xp)
+
+    valid_count = indicators._rolling_sum_xp(xp.isfinite(tr).astype(np.float64), int(window), xp)
+    plus_dm_sum = indicators._rolling_sum_xp(plus_dm, int(window), xp)
+    minus_dm_sum = indicators._rolling_sum_xp(minus_dm, int(window), xp)
+
+    plus_dm_sum = xp.where(valid_count >= float(window), plus_dm_sum, xp.nan)
+    minus_dm_sum = xp.where(valid_count >= float(window), minus_dm_sum, xp.nan)
+
+    plus_di = 100.0 * (plus_dm_sum / xp.where(atr != 0, atr, xp.nan))
+    minus_di = 100.0 * (minus_dm_sum / xp.where(atr != 0, atr, xp.nan))
+
+    di_sum = plus_di + minus_di
+    dx = 100.0 * xp.abs(plus_di - minus_di) / xp.where(di_sum != 0, di_sum, xp.nan)
+    adx = indicators._rolling_mean_xp(dx, int(window), min_periods=int(window), xp=xp)
+
+    return (
+        pd.Series(to_numpy(adx, xp), index=high.index).fillna(0.0),
+        pd.Series(to_numpy(plus_di, xp), index=high.index).fillna(0.0),
+        pd.Series(to_numpy(minus_di, xp), index=high.index).fillna(0.0),
+    )
 
 
-def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    adx, _, _ = compute_adx_di(high, low, close, window=window)
+def compute_adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int = 14,
+    *,
+    backend: str = "cpu",
+) -> pd.Series:
+    adx, _, _ = compute_adx_di(high, low, close, window=window, backend=backend)
     return adx
 
 
-def compute_chop(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    high_window = high.rolling(window=window, min_periods=window)
-    low_window = low.rolling(window=window, min_periods=window)
-    tr_sum = indicators.true_range(high, low, close).rolling(window=window, min_periods=window).sum()
-    numerator = tr_sum
-    denominator = (high_window.max() - low_window.min()).replace(0, pd.NA)
+def compute_chop(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    window: int = 14,
+    *,
+    backend: str = "cpu",
+) -> pd.Series:
+    if backend == "cpu":
+        high_window = high.rolling(window=window, min_periods=window)
+        low_window = low.rolling(window=window, min_periods=window)
+        tr_sum = indicators.true_range(high, low, close, backend=backend).rolling(window=window, min_periods=window).sum()
+        numerator = tr_sum
+        denominator = (high_window.max() - low_window.min()).replace(0, pd.NA)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            chop = 100 * np.log10(numerator / denominator) / np.log10(window)
+        return chop.fillna(0.0)
+
+    ctx = resolve_acceleration_backend(backend)
+    if ctx.backend != "cuda":
+        return compute_chop(high, low, close, window=window, backend="cpu")
+
+    xp = get_array_module(ctx)
+    high_arr = xp.asarray(high.to_numpy(dtype=float))
+    low_arr = xp.asarray(low.to_numpy(dtype=float))
+    tr_arr = xp.asarray(indicators.true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+
+    tr_sum = indicators._rolling_sum_xp(tr_arr, int(window), xp)
+    valid_count = indicators._rolling_sum_xp(xp.isfinite(tr_arr).astype(np.float64), int(window), xp)
+    tr_sum = xp.where(valid_count >= float(window), tr_sum, xp.nan)
+
+    high_max = indicators._rolling_max_xp(high_arr, int(window), min_periods=int(window), xp=xp)
+    low_min = indicators._rolling_min_xp(low_arr, int(window), min_periods=int(window), xp=xp)
+
+    denominator = high_max - low_min
     with np.errstate(invalid="ignore", divide="ignore"):
-        chop = 100 * np.log10(numerator / denominator) / np.log10(window)
-    return chop.fillna(0.0)
+        chop = 100.0 * xp.log10(tr_sum / xp.where(denominator != 0, denominator, xp.nan)) / xp.log10(float(window))
+
+    return pd.Series(to_numpy(chop, xp), index=high.index).fillna(0.0)
 
 
 def compute_volatility_state(realized_vol: pd.Series, rolling_window: int = 365 * 24, quantile: float = 0.90) -> pd.Series:

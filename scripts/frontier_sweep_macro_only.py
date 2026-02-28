@@ -24,6 +24,22 @@ from bot.backtest.macro_attribution import compute_macro_bucket_attribution
 from bot.config import BotConfig
 from bot.coinbase_client import RESTClientWrapper
 from bot.data.candles import CandleQuery, CandleStore
+from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.system_log import setup_system_logger, get_system_logger
+from bot.backtest.frontier_runtime import (
+    resolve_run_dir,
+    load_summary_rows,
+    write_summary_rows,
+    load_checkpoint,
+    save_checkpoint,
+    derive_processed_param_ids,
+    build_checkpoint_fingerprint,
+    checkpoint_fingerprint_mismatches,
+    build_filter_rejections_payload,
+)
+
+
+logger = get_system_logger("scripts.frontier_sweep_macro_only")
 
 
 DEFAULT_GRID_MACRO_ONLY: dict[str, list[Any]] = {
@@ -186,8 +202,8 @@ def parse_grid_values(raw: str) -> list[Any]:
     out: list[Any] = []
     for chunk in [x.strip() for x in raw.split(",") if x.strip()]:
         low = chunk.lower()
-        if low in {"true", "false", "1", "0", "yes", "no"}:
-            out.append(low in {"true", "1", "yes"})
+        if low in {"true", "false", "yes", "no", "on", "off"}:
+            out.append(low in {"true", "yes", "on"})
             continue
         try:
             if "." in low or "e" in low:
@@ -285,6 +301,23 @@ def set_param(cfg: BotConfig, key: str, value: Any) -> None:
             return
 
     raise KeyError(f"Unknown parameter key: {key}")
+
+def validate_grid_keys(base_cfg: BotConfig, param_sets: list[dict[str, Any]]) -> list[str]:
+    sample_by_key: dict[str, Any] = {}
+    for params in param_sets:
+        for key, value in params.items():
+            sample_by_key.setdefault(str(key), value)
+
+    invalid: list[str] = []
+    for key in sorted(sample_by_key):
+        probe_cfg = clone_cfg(base_cfg)
+        try:
+            set_param(probe_cfg, key, sample_by_key[key])
+        except Exception:
+            invalid.append(key)
+
+    return invalid
+
 
 
 def configure_strategy(cfg: BotConfig, strategy: str) -> None:
@@ -399,6 +432,7 @@ def run_window(
     return row
 
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sweep macro_only_v2 with walk-forward and stress costs")
     p.add_argument("--product", default="BTC-USD")
@@ -418,17 +452,44 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--small", action="store_true", help="smaller walk-forward grid for quick checks")
     p.add_argument("--include-fred-grid", action="store_true", help="include FRED overlay parameters in sweep grid")
     p.add_argument("--workers", type=int, default=1, help="parallel worker processes for parameter sets")
+    p.add_argument(
+        "--skip-benchmark-baseline",
+        action="store_true",
+        help="Skip benchmark baseline comparator rows to reduce runtime when orchestrated",
+    )
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--top-n", type=int, default=5)
     p.add_argument("--output-dir", default="artifacts/frontier_macro_only_v2")
+    p.add_argument("--run-id", default=None, help="Optional run id; defaults to current UTC timestamp")
+    p.add_argument("--resume", action="store_true", help="Resume from an existing run/checkpoint")
+    p.add_argument("--checkpoint-every", type=int, default=10, help="Persist checkpoint every N parameter sets")
     p.add_argument("--maker-bps", type=float, default=10.0)
     p.add_argument("--taker-bps", type=float, default=25.0)
     return p.parse_args()
 
+def _validate_acceleration_backend(requested: str) -> bool:
+    ctx = resolve_acceleration_backend(requested)
+    if requested == "cuda" and ctx.backend != "cuda":
+        print(
+            f"ERROR: --acceleration-backend=cuda requested, but CUDA is unavailable ({ctx.reason or 'unknown reason'}).",
+            file=sys.stderr,
+        )
+        return False
+    if requested in {"auto", "cuda"}:
+        detail = ctx.device_name if ctx.device_name else (ctx.reason or "")
+        print(f"Acceleration backend resolved: {ctx.backend}{f' ({detail})' if detail else ''}")
+    return True
+
+
 
 def main() -> int:
     args = parse_args()
+    log_path = setup_system_logger()
+    logger.info("frontier_macro_only_start log_path=%s args=%s", log_path, vars(args))
+
+    if not _validate_acceleration_backend(args.acceleration_backend):
+        return 2
 
     cfg = BotConfig.load(args.config)
     cfg.data.product = args.product
@@ -478,55 +539,171 @@ def main() -> int:
         small=args.small,
         include_fred_grid=bool(args.include_fred_grid),
     )
+    invalid_grid_keys = validate_grid_keys(cfg, param_sets)
+    if invalid_grid_keys:
+        logger.error(
+            "frontier_grid_validation_failed strategy=%s keys=%s",
+            "macro_only_v2",
+            invalid_grid_keys,
+        )
+        print(
+            f"ERROR: Unknown/invalid grid parameter key(s): {', '.join(invalid_grid_keys)}",
+            file=sys.stderr,
+        )
+        return 2
+    logger.info(
+        "frontier_macro_only_config param_sets=%d workers=%s scenarios=%d skip_baseline=%s",
+        len(param_sets),
+        args.workers,
+        len(SCENARIOS),
+        bool(args.skip_benchmark_baseline),
+    )
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    summary_rows: list[dict[str, Any]] = []
+    out_dir, run_token = resolve_run_dir(args.output_dir, args.run_id, args.resume)
+    summary_path = out_dir / "summary.csv"
+    checkpoint_path = out_dir / "checkpoint.json"
+    checkpoint_every = max(1, int(args.checkpoint_every))
+    checkpoint_fingerprint = build_checkpoint_fingerprint("macro_only_v2", param_sets, windows)
 
-    # Baseline benchmark rows for comparison (same windows/scenarios).
-    baseline_rows: list[dict[str, Any]] = []
-    print("Running baseline macro_gate_benchmark comparator")
-    for window in windows:
-        for scenario in SCENARIOS:
-            try:
-                row = run_window(
-                    base_cfg=cfg,
-                    product=args.product,
-                    hourly=hourly,
-                    daily=daily,
-                    window=window,
-                    params={},
-                    scenario=scenario,
-                    base_maker=base_maker_rate,
-                    base_taker=base_taker_rate,
-                    strategy="macro_gate_benchmark",
-                )
-                row["param_id"] = "baseline"
-                baseline_rows.append(row)
-            except Exception as exc:
-                baseline_rows.append(
-                    {
-                        "param_id": "baseline",
-                        "strategy": "macro_gate_benchmark",
-                        "window": window.name,
-                        "scenario": scenario.name,
-                        "start": window.start.isoformat(),
-                        "end": window.end.isoformat(),
-                        "error": str(exc),
-                    }
-                )
+    checkpoint: dict[str, Any] = load_checkpoint(checkpoint_path) if args.resume else {}
+    if args.resume and checkpoint:
+        mismatch = checkpoint_fingerprint_mismatches(checkpoint, checkpoint_fingerprint)
+        if mismatch:
+            mismatch_keys = ", ".join(sorted(mismatch.keys()))
+            logger.error(
+                "frontier_macro_only_resume_checkpoint_mismatch strategy=macro_only_v2 run_id=%s mismatch=%s",
+                run_token,
+                mismatch,
+            )
+            print(
+                f"ERROR: Resume checkpoint metadata mismatch ({mismatch_keys}); refusing unsafe resume.",
+                file=sys.stderr,
+            )
+            return 2
+
+    loaded_rows = load_summary_rows(summary_path) if args.resume else []
+    summary_rows: list[dict[str, Any]] = [
+        row for row in loaded_rows if str(row.get("param_id", "") or "").strip() != "baseline"
+    ]
+    baseline_rows: list[dict[str, Any]] = [
+        row for row in loaded_rows if str(row.get("param_id", "") or "").strip() == "baseline"
+    ]
 
     grouped: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for row in summary_rows:
+        pid = str(row.get("param_id", "") or "").strip()
+        window = str(row.get("window", "") or "").strip()
+        scenario = str(row.get("scenario", "") or "").strip()
+        err = str(row.get("error", "") or "").strip()
+        if not pid or not window or not scenario or err:
+            continue
+        grouped.setdefault(pid, {}).setdefault(window, {})[scenario] = row
+
+    processed_param_ids: set[str] = set()
+    if args.resume:
+        processed_param_ids = {
+            str(pid).strip()
+            for pid in checkpoint.get("processed_param_ids", [])
+            if str(pid).strip()
+        }
+        if not processed_param_ids:
+            processed_param_ids = derive_processed_param_ids(
+                summary_rows,
+                expected_rows_per_param=len(windows) * len(SCENARIOS),
+            )
+
+    if args.resume and processed_param_ids:
+        print(
+            f"Resuming {run_token}: {len(processed_param_ids)}/{len(param_sets)} parameter sets already complete"
+        )
+    else:
+        print(f"Starting {run_token}: {len(param_sets)} parameter sets")
+
+    def persist_checkpoint(*, completed: bool) -> None:
+        write_summary_rows(summary_path, [*summary_rows, *baseline_rows])
+        save_checkpoint(
+            checkpoint_path,
+            {
+                "version": 1,
+                "run_id": run_token,
+                "strategy": "macro_only_v2",
+                "grid_hash": checkpoint_fingerprint["grid_hash"],
+                "window_hash": checkpoint_fingerprint["window_hash"],
+                "completed": bool(completed),
+                "processed_count": len(processed_param_ids),
+                "total_param_sets": len(param_sets),
+                "processed_param_ids": sorted(processed_param_ids),
+                "checkpoint_every": checkpoint_every,
+                "baseline_rows": len(baseline_rows),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "summary_csv": str(summary_path),
+            },
+        )
+
+    # Optional baseline benchmark rows for comparison (same windows/scenarios).
+    if args.skip_benchmark_baseline:
+        baseline_rows = []
+        print("Skipping baseline macro_gate_benchmark comparator")
+    else:
+        baseline_expected_rows = len(windows) * len(SCENARIOS)
+        if len(baseline_rows) >= baseline_expected_rows:
+            print("Reusing baseline macro_gate_benchmark comparator from previous checkpoint")
+        else:
+            print("Running baseline macro_gate_benchmark comparator")
+            baseline_rows = []
+            for window in windows:
+                for scenario in SCENARIOS:
+                    try:
+                        row = run_window(
+                            base_cfg=cfg,
+                            product=args.product,
+                            hourly=hourly,
+                            daily=daily,
+                            window=window,
+                            params={},
+                            scenario=scenario,
+                            base_maker=base_maker_rate,
+                            base_taker=base_taker_rate,
+                            strategy="macro_gate_benchmark",
+                        )
+                        row["param_id"] = "baseline"
+                        baseline_rows.append(row)
+                    except Exception as exc:
+                        logger.exception(
+                            "macro_only_baseline_error window=%s scenario=%s",
+                            window.name,
+                            scenario.name,
+                        )
+                        baseline_rows.append(
+                            {
+                                "param_id": "baseline",
+                                "strategy": "macro_gate_benchmark",
+                                "window": window.name,
+                                "scenario": scenario.name,
+                                "start": window.start.isoformat(),
+                                "end": window.end.isoformat(),
+                                "error": str(exc),
+                            }
+                        )
+            persist_checkpoint(completed=False)
 
     workers = max(1, int(args.workers or 1))
-    if workers <= 1 or len(param_sets) <= 1:
-        for i, params in enumerate(param_sets):
+    pending: list[tuple[int, dict[str, Any]]] = [
+        (i, params)
+        for i, params in enumerate(param_sets)
+        if f"p{i:04d}" not in processed_param_ids
+    ]
+
+    processed_since_checkpoint = 0
+
+    if workers <= 1 or len(pending) <= 1:
+        for done, (i, params) in enumerate(pending, start=1):
             param_id = f"p{i:04d}"
-            grouped[param_id] = {}
-            print(f"[{i + 1}/{len(param_sets)}] {param_id}", flush=True)
+            grouped.setdefault(param_id, {})
+            print(f"[{done}/{len(pending)}] {param_id}", flush=True)
 
             for window in windows:
-                grouped[param_id][window.name] = {}
+                grouped[param_id].setdefault(window.name, {})
                 for scenario in SCENARIOS:
                     try:
                         row = run_window(
@@ -546,6 +723,13 @@ def main() -> int:
                         grouped[param_id][window.name][scenario.name] = row
                         summary_rows.append(row)
                     except Exception as exc:
+                        logger.exception(
+                            "macro_only_run_error param_id=%s window=%s scenario=%s params=%s",
+                            param_id,
+                            window.name,
+                            scenario.name,
+                            params,
+                        )
                         summary_rows.append(
                             {
                                 "param_id": param_id,
@@ -558,8 +742,14 @@ def main() -> int:
                                 "error": str(exc),
                             }
                         )
+
+            processed_param_ids.add(param_id)
+            processed_since_checkpoint += 1
+            if processed_since_checkpoint >= checkpoint_every:
+                persist_checkpoint(completed=False)
+                processed_since_checkpoint = 0
     else:
-        max_workers = min(workers, len(param_sets))
+        max_workers = min(workers, len(pending))
         print(f"Running macro_only_v2 parameter grid with {max_workers} workers", flush=True)
 
         if hasattr(cfg, "model_dump"):
@@ -594,7 +784,7 @@ def main() -> int:
         ) as executor:
             future_map = {
                 executor.submit(_run_param_worker, (i, params)): (i, params)
-                for i, params in enumerate(param_sets)
+                for i, params in pending
             }
 
             for future in as_completed(future_map):
@@ -605,11 +795,17 @@ def main() -> int:
                     grouped[pid] = grouped_param
                     summary_rows.extend(rows)
                     done += 1
-                    print(f"[{done}/{len(param_sets)}] {pid}", flush=True)
+                    print(f"[{done}/{len(pending)}] {pid}", flush=True)
+                    processed_param_ids.add(pid)
                 except Exception as exc:
                     done += 1
                     grouped[param_id] = {}
-                    print(f"[{done}/{len(param_sets)}] {param_id} failed", flush=True)
+                    print(f"[{done}/{len(pending)}] {param_id} failed", flush=True)
+                    logger.exception(
+                        "macro_only_worker_error param_id=%s params=%s",
+                        param_id,
+                        params,
+                    )
                     summary_rows.append(
                         {
                             "param_id": param_id,
@@ -618,17 +814,19 @@ def main() -> int:
                             "error": str(exc),
                         }
                     )
+                    processed_param_ids.add(param_id)
 
-    summary_rows.extend(baseline_rows)
+                processed_since_checkpoint += 1
+                if processed_since_checkpoint >= checkpoint_every:
+                    persist_checkpoint(completed=False)
+                    processed_since_checkpoint = 0
 
-    summary_path = out_dir / "summary.csv"
-    if summary_rows:
-        cols = sorted({k for row in summary_rows for k in row.keys()})
-        with summary_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            for row in summary_rows:
-                w.writerow(row)
+    persist_checkpoint(completed=False)
+
+    rejection_counts: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
     ranked: list[dict[str, Any]] = []
     for i, params in enumerate(param_sets):
@@ -636,18 +834,22 @@ def main() -> int:
 
         val_baseline = grouped.get(param_id, {}).get("val", {})
         val = val_baseline.get("stress_1") if isinstance(val_baseline, dict) else None
-        if val is None:
+        val2 = val_baseline.get("stress_2") if isinstance(val_baseline, dict) else None
+
+        if not val or not val2:
+            reject("missing_val_stress_rows")
             continue
 
-        val2 = val_baseline.get("stress_2")
-
-        if not val or not val.get("cagr") or not val2 or not val2.get("cagr"):
+        if not val.get("cagr") or not val2.get("cagr"):
+            reject("missing_cagr")
             continue
 
         if float(val.get("cagr", 0.0) or 0.0) <= 0.0 or float(val2.get("cagr", 0.0) or 0.0) <= 0.0:
+            reject("non_positive_stress_cagr")
             continue
 
         if abs(float(val.get("max_drawdown", 0.0) or 0.0)) > args.max_drawdown_max:
+            reject("drawdown_limit")
             continue
 
         total_turnover = max(
@@ -656,8 +858,10 @@ def main() -> int:
             float(val2.get("turnover", 0.0) or 0.0),
         )
         if total_turnover > args.turnover_max:
+            reject("turnover_limit")
             continue
 
+        rejection_counts["accepted"] = rejection_counts.get("accepted", 0) + 1
         ranked.append(
             {
                 "param_id": param_id,
@@ -669,6 +873,16 @@ def main() -> int:
                 "val_stress1_turnover": float(val.get("turnover", 0.0) or 0.0),
             }
         )
+
+    write_strict_json(
+        out_dir / "filter_rejections.json",
+        build_filter_rejections_payload(
+            run_id=run_token,
+            strategy="macro_only_v2",
+            total_param_sets=len(param_sets),
+            rejection_counts=rejection_counts,
+        ),
+    )
 
     ranked.sort(
         key=lambda r: (
@@ -731,7 +945,16 @@ def main() -> int:
             f"--strategy macro_only_v2 --config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
+        files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(best_cfg_path),
+            "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+            "checkpoint_json": str(checkpoint_path),
+        }
         report = {
+            "strategy": "macro_only_v2",
+            "run_id": run_token,
             "best": best,
             "constraints": {
                 "max_drawdown_max": args.max_drawdown_max,
@@ -739,15 +962,14 @@ def main() -> int:
             },
             "reproduce_test_command": test_repro,
             "best_config": best_cfg,
-            "files": {
-                "summary_csv": str(summary_path),
-                "frontier_csv": str(frontier_path),
-                "best_config_json": str(best_cfg_path),
-            },
+            "files": files_payload,
+            "paths": dict(files_payload),
             "test_window_stress_1": {
                 "cagr": float(test_benchmark.get("cagr", 0.0) if isinstance(test_benchmark, dict) else 0.0),
                 "sharpe": float(test_benchmark.get("sharpe", 0.0) if isinstance(test_benchmark, dict) else 0.0),
                 "max_drawdown": float(test_benchmark.get("max_drawdown", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "turnover": float(test_benchmark.get("turnover", 0.0) if isinstance(test_benchmark, dict) else 0.0),
+                "trade_count": int(test_benchmark.get("trade_count", 0) if isinstance(test_benchmark, dict) else 0),
             },
             "benchmark_summary": baseline_rows,
         }
@@ -758,10 +980,53 @@ def main() -> int:
         print(f"Summary: {summary_path}")
         print(f"Frontier: {frontier_path}")
         print(f"Reproduce best: {test_repro}")
+        logger.info(
+            "frontier_macro_only_complete ranked=%d top=%d summary=%s frontier=%s best_config=%s",
+            len(ranked),
+            len(frontier_rows),
+            summary_path,
+            frontier_path,
+            best_cfg_path,
+        )
     else:
+        no_best_files_payload = {
+            "summary_csv": str(summary_path),
+            "frontier_csv": str(frontier_path),
+            "best_config_json": str(out_dir / "best_config.json"),
+            "filter_rejections_json": str(out_dir / 'filter_rejections.json'),
+            "checkpoint_json": str(checkpoint_path),
+        }
+        no_best_report = {
+            "strategy": "macro_only_v2",
+            "run_id": run_token,
+            "best": None,
+            "constraints": {
+                "max_drawdown_max": args.max_drawdown_max,
+                "turnover_max": args.turnover_max,
+            },
+            "reproduce_test_command": None,
+            "best_config": {},
+            "files": no_best_files_payload,
+            "paths": dict(no_best_files_payload),
+            "test_window_stress_1": {
+                "cagr": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "turnover": 0.0,
+                "trade_count": 0,
+            },
+            "benchmark_summary": baseline_rows,
+        }
+        write_strict_json(out_dir / "best_summary.json", no_best_report)
         print("macro_only_v2 frontier sweep completed, but no configuration passed filters.")
         print(f"Summary: {summary_path}")
+        logger.warning(
+            "frontier_macro_only_no_winner param_sets=%d summary=%s",
+            len(param_sets),
+            summary_path,
+        )
 
+    persist_checkpoint(completed=True)
     return 0
 
 
