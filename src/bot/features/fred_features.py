@@ -37,7 +37,7 @@ def _rolling_z(series: pd.Series, window: int, clip: float) -> pd.Series:
     w = max(10, int(window))
     min_periods = max(5, w // 4)
     mu = series.rolling(w, min_periods=min_periods).mean()
-    sigma = series.rolling(w, min_periods=min_periods).std(ddof=0)
+    sigma = series.rolling(w, min_periods=min_periods).std(ddof=1)
     z = (series - mu) / sigma.replace(0.0, np.nan)
     z = z.replace([np.inf, -np.inf], np.nan)
     c = float(max(0.5, clip))
@@ -146,12 +146,30 @@ def _lookback_by_frequency(cfg: FredConfig, freq: str) -> int:
 
 
 def _yoy_shift_for_frequency(freq: str) -> int:
+    """Return the number of *rows* (not calendar days) that equals ~1 year."""
     f = str(freq or "daily").lower()
     if f == "weekly":
-        return 52 * 7
+        return 52  # 52 weekly observations = 1 year
     if f == "monthly":
-        return 12 * 30
-    return 252
+        return 12  # 12 monthly observations = 1 year
+    return 252  # 252 trading-day observations = 1 year
+
+
+def _scale_windows_for_frequency(windows: list[int], freq: str) -> list[int]:
+    """Scale delta/pct windows by data frequency.
+
+    Default windows (5, 20, 60) are calibrated for daily data.
+    For weekly data, divide by 5 (trading days/week).
+    For monthly data, divide by 21 (trading days/month).
+    """
+    f = str(freq or "daily").lower()
+    if f == "weekly":
+        divisor = 5
+    elif f == "monthly":
+        divisor = 21
+    else:
+        return windows  # daily: use as-is
+    return sorted({max(1, int(round(w / divisor))) for w in windows})
 
 
 def _parse_windows(raw: Any, default: Iterable[int]) -> list[int]:
@@ -372,8 +390,12 @@ def build_fred_daily_overlay_features(
 
             transforms_raw = entry.get("transformations")
             transforms = transforms_raw if isinstance(transforms_raw, dict) else {}
-            delta_windows = _parse_windows(transforms.get("delta_windows"), DEFAULT_DELTA_WINDOWS)
-            pct_windows = _parse_windows(transforms.get("pct_change_windows"), DEFAULT_PCT_WINDOWS)
+            delta_windows = _scale_windows_for_frequency(
+                _parse_windows(transforms.get("delta_windows"), DEFAULT_DELTA_WINDOWS), freq_hint
+            )
+            pct_windows = _scale_windows_for_frequency(
+                _parse_windows(transforms.get("pct_change_windows"), DEFAULT_PCT_WINDOWS), freq_hint
+            )
 
             try:
                 realtime_start = None

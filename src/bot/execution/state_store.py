@@ -116,8 +116,12 @@ class BotStateStore:
             logger.debug("state_store_schema_ok path=%s", self.path)
 
     def set_kv(self, key: str, value: object) -> None:
-        self.conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value)))
-        self.conn.commit()
+        try:
+            self.conn.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value)))
+            self.conn.commit()
+        except sqlite3.Error as exc:
+            logger.error("state_store_set_kv_failed key=%s error=%s", key, exc)
+            raise
 
     def get_kv(self, key: str, default=None):
         row = self.conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
@@ -143,28 +147,32 @@ class BotStateStore:
         replace_count: int = 0,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO open_orders(
-                client_order_id,product,side,size,order_type,price,created_at,status,filled_size,last_update_ts,replace_count,metadata
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                order_id,
-                product,
-                side,
-                size,
-                order_type,
-                price,
-                created_at_ts,
-                status,
-                float(filled_size),
-                int(created_at_ts),
-                int(replace_count),
-                json.dumps(metadata or {}),
-            ),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO open_orders(
+                    client_order_id,product,side,size,order_type,price,created_at,status,filled_size,last_update_ts,replace_count,metadata
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    product,
+                    side,
+                    size,
+                    order_type,
+                    price,
+                    created_at_ts,
+                    status,
+                    float(filled_size),
+                    int(created_at_ts),
+                    int(replace_count),
+                    json.dumps(metadata or {}),
+                ),
+            )
+            self.conn.commit()
+        except sqlite3.Error as exc:
+            logger.error("state_store_put_order_failed order_id=%s error=%s", order_id, exc)
+            raise
 
     def update_open_order(
         self,
@@ -251,11 +259,19 @@ class BotStateStore:
         return out
 
     def store_position(self, ts: int, product: str, btc: float, usd: float, exposure: float, comment: str = "") -> None:
-        self.conn.execute(
-            "INSERT OR REPLACE INTO positions(ts, product, btc, usd, exposure, comment) VALUES(?,?,?,?,?,?)",
-            (ts, product, btc, usd, exposure, comment),
-        )
-        self.conn.commit()
+        # Use millisecond-resolution timestamps to avoid same-second overwrites.
+        # Fall back to INSERT OR REPLACE for backward compatibility with
+        # integer-second primary keys.
+        try:
+            ts_ms = int(ts * 1000) if ts < 1e12 else int(ts)
+            self.conn.execute(
+                "INSERT OR REPLACE INTO positions(ts, product, btc, usd, exposure, comment) VALUES(?,?,?,?,?,?)",
+                (ts_ms, product, btc, usd, exposure, comment),
+            )
+            self.conn.commit()
+        except sqlite3.Error as exc:
+            logger.error("state_store_position_failed ts=%s product=%s error=%s", ts, product, exc)
+            raise
 
     def latest_position(self, product: str):
         row = self.conn.execute(
@@ -265,11 +281,15 @@ class BotStateStore:
         return row
 
     def log_decision(self, ts: int, product: str, payload: dict) -> None:
-        self.conn.execute(
-            "INSERT OR REPLACE INTO decisions(ts, product, payload) VALUES(?,?,?)",
-            (ts, product, json.dumps(payload)),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO decisions(ts, product, payload) VALUES(?,?,?)",
+                (ts, product, json.dumps(payload)),
+            )
+            self.conn.commit()
+        except sqlite3.Error as exc:
+            logger.error("state_store_log_decision_failed ts=%s product=%s error=%s", ts, product, exc)
+            raise
 
     def get_last_signal_ts(self) -> int | None:
         v = self.get_kv("last_signal_ts")
@@ -292,6 +312,16 @@ class BotStateStore:
     def set_equity_peak(self, val: float) -> None:
         self.set_kv("equity_peak", float(val))
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception as exc:
+            logger.warning("state_store_close_error path=%s error=%s", self.path, exc)
         logger.info("state_store_closed path=%s", self.path)

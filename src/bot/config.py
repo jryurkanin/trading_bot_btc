@@ -266,6 +266,28 @@ class RegimeConfig(BaseModel):
     # Back-compat switch for old sub-strategy switching behavior
     legacy_substrategy_switching: bool = False
 
+    @field_validator("adx_range_threshold", mode="after")
+    def _validate_adx_thresholds(cls, v, info):
+        values = info.data if hasattr(info, "data") else {}
+        trend = values.get("adx_trend_threshold", 25.0)
+        if v >= trend:
+            raise ValueError(f"adx_range_threshold ({v}) must be < adx_trend_threshold ({trend})")
+        return v
+
+    @field_validator("macro_exit_threshold", mode="after")
+    def _validate_macro_thresholds(cls, v, info):
+        values = info.data if hasattr(info, "data") else {}
+        enter = values.get("macro_enter_threshold", 0.75)
+        if v >= enter:
+            raise ValueError(f"macro_exit_threshold ({v}) must be < macro_enter_threshold ({enter})")
+        return v
+
+    @field_validator("target_ann_vol", mode="after")
+    def _validate_target_ann_vol(cls, v):
+        if v <= 0:
+            raise ValueError(f"target_ann_vol must be > 0, got {v}")
+        return v
+
     # V4 core strategy config
     v4_macro_enter_threshold: float = 0.75
     v4_macro_exit_threshold: float = 0.25
@@ -577,4 +599,5 @@ def timeframe_to_seconds(tf: TIMEFRAME) -> int:
 
 
 def now_utc() -> datetime:
-    return datetime.utcnow().replace(tzinfo=None)
+    from datetime import timezone
+    return datetime.now(tz=timezone.utc)

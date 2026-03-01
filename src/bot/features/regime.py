@@ -39,8 +39,8 @@ def compute_adx_di(
         tr = indicators.true_range(high, low, close, backend=backend)
         atr = tr.rolling(window=window, min_periods=window).mean()
 
-        plus_di = 100 * (plus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
-        minus_di = 100 * (minus_dm.rolling(window=window, min_periods=window).sum() / atr.replace(0, np.nan))
+        plus_di = 100 * (plus_dm.rolling(window=window, min_periods=window).mean() / atr.replace(0, np.nan))
+        minus_di = 100 * (minus_dm.rolling(window=window, min_periods=window).mean() / atr.replace(0, np.nan))
 
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
         adx = dx.rolling(window=window, min_periods=window).mean()
@@ -67,18 +67,15 @@ def compute_adx_di(
     plus_dm = xp.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = xp.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    tr = xp.asarray(indicators.true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+    close_arr = xp.asarray(close.to_numpy(dtype=float))
+    tr = indicators._true_range_xp(high_arr, low_arr, close_arr, xp)
     atr = indicators._rolling_mean_xp(tr, int(window), min_periods=int(window), xp=xp)
 
-    valid_count = indicators._rolling_sum_xp(xp.isfinite(tr).astype(np.float64), int(window), xp)
-    plus_dm_sum = indicators._rolling_sum_xp(plus_dm, int(window), xp)
-    minus_dm_sum = indicators._rolling_sum_xp(minus_dm, int(window), xp)
+    plus_dm_avg = indicators._rolling_mean_xp(plus_dm, int(window), min_periods=int(window), xp=xp)
+    minus_dm_avg = indicators._rolling_mean_xp(minus_dm, int(window), min_periods=int(window), xp=xp)
 
-    plus_dm_sum = xp.where(valid_count >= float(window), plus_dm_sum, xp.nan)
-    minus_dm_sum = xp.where(valid_count >= float(window), minus_dm_sum, xp.nan)
-
-    plus_di = 100.0 * (plus_dm_sum / xp.where(atr != 0, atr, xp.nan))
-    minus_di = 100.0 * (minus_dm_sum / xp.where(atr != 0, atr, xp.nan))
+    plus_di = 100.0 * (plus_dm_avg / xp.where(atr != 0, atr, xp.nan))
+    minus_di = 100.0 * (minus_dm_avg / xp.where(atr != 0, atr, xp.nan))
 
     di_sum = plus_di + minus_di
     dx = 100.0 * xp.abs(plus_di - minus_di) / xp.where(di_sum != 0, di_sum, xp.nan)
@@ -128,7 +125,8 @@ def compute_chop(
     xp = get_array_module(ctx)
     high_arr = xp.asarray(high.to_numpy(dtype=float))
     low_arr = xp.asarray(low.to_numpy(dtype=float))
-    tr_arr = xp.asarray(indicators.true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+    close_arr = xp.asarray(close.to_numpy(dtype=float))
+    tr_arr = indicators._true_range_xp(high_arr, low_arr, close_arr, xp)
 
     tr_sum = indicators._rolling_sum_xp(tr_arr, int(window), xp)
     valid_count = indicators._rolling_sum_xp(xp.isfinite(tr_arr).astype(np.float64), int(window), xp)
@@ -188,6 +186,8 @@ class RuleBasedRegimeSwitcher:
     def _vote(self, adx: float, chop: float, is_high_vol: bool) -> RegimeState:
         if is_high_vol:
             return RegimeState.HIGH_VOL
+        # OR logic: either indicator can independently signal regime.
+        # Confirmation bars and min_duration guard against false positives.
         if adx >= self.adx_trend or chop <= self.chop_trend:
             return RegimeState.TREND
         if adx <= self.adx_range or chop >= self.chop_range:
@@ -203,7 +203,9 @@ class RuleBasedRegimeSwitcher:
             self._candidate_count = 1
 
         if self._candidate_count >= self.confirmation_bars:
-            if vote != self._confirmed_regime and self._regime_age >= self.min_duration_hours:
+            # Allow initial regime transition without waiting for min_duration
+            is_initial = self._confirmed_regime == RegimeState.NEUTRAL and self._regime_age <= self.confirmation_bars + 1
+            if vote != self._confirmed_regime and (is_initial or self._regime_age >= self.min_duration_hours):
                 self._confirmed_regime = vote
                 self._regime_age = 0
             elif vote == self._confirmed_regime:
@@ -212,13 +214,13 @@ class RuleBasedRegimeSwitcher:
         self._regime_age += 1
         return self._confirmed_regime
 
-    def compute_series(self, df: pd.DataFrame, vol_threshold: float) -> pd.Series:
+    def compute_series(self, df: pd.DataFrame, vol_threshold: float, *, adx_window: int | None = None, chop_window: int | None = None) -> pd.Series:
         req = {"high", "low", "close", "realized_vol"}
         if not req.issubset(df.columns):
             raise ValueError(f"df must include columns {req}")
 
-        adx = compute_adx(df["high"], df["low"], df["close"], 14)
-        chop = compute_chop(df["high"], df["low"], df["close"], 14)
+        adx = compute_adx(df["high"], df["low"], df["close"], adx_window or 14)
+        chop = compute_chop(df["high"], df["low"], df["close"], chop_window or 14)
         out = []
         self.reset()
         for i in range(len(df)):

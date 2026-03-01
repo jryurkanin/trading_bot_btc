@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional, Tuple
 import hashlib
 import math
+import os
 import time
 
 from ..config import ExecutionConfig
@@ -55,8 +56,9 @@ class OrderRouter:
 
     @staticmethod
     def _make_order_id(product: str, side: str, size: float, now: datetime) -> str:
-        raw = f"{product}:{side}:{size:.8f}:{int(now.timestamp())}"
-        return hashlib.md5(raw.encode()).hexdigest()[:32]
+        nonce = os.urandom(8).hex()
+        raw = f"{product}:{side}:{size:.8f}:{now.timestamp():.6f}:{nonce}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
     def make_order_id(self, product: str, side: str, size: float, now: datetime) -> str:
         return self._make_order_id(product, side, size, now)
@@ -601,8 +603,13 @@ class OrderRouter:
             )
         ]
 
-    def simulate_fill(self, side: str, fraction_delta: float, price: float, equity_usd: float, maker_fee_rate: float, taker_fee_rate: float) -> SimulatedFill:
-        fee_rate = maker_fee_rate if fraction_delta < 0.5 else taker_fee_rate
+    def simulate_fill(self, side: str, fraction_delta: float, price: float, equity_usd: float, maker_fee_rate: float, taker_fee_rate: float, *, is_maker: bool | None = None) -> SimulatedFill:
+        # Determine maker/taker: use explicit flag if provided, otherwise assume
+        # small orders (< 10% of portfolio) are more likely to rest as maker.
+        if is_maker is not None:
+            fee_rate = maker_fee_rate if is_maker else taker_fee_rate
+        else:
+            fee_rate = maker_fee_rate if abs(fraction_delta) < 0.10 else taker_fee_rate
         notional = abs(fraction_delta) * equity_usd
         fill_price = price
         fee = notional * fee_rate

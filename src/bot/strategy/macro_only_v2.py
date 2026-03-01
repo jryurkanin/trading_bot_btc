@@ -101,6 +101,16 @@ class MacroOnlyV2Strategy:
             ts = ts.tz_convert("UTC")
         return int(ts.floor("D").value)
 
+    _MAX_CACHE_ENTRIES = 10
+
+    def _evict_old_cache(self) -> None:
+        """Evict oldest entries when caches grow too large."""
+        for cache in (self._daily_ts_cache, self._daily_signal_cache,
+                      self._daily_realized_cache, self._daily_last_ts_cache):
+            while len(cache) > self._MAX_CACHE_ENTRIES:
+                oldest_key = next(iter(cache))
+                del cache[oldest_key]
+
     def _closed_daily_cached(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
         if daily_df is None or daily_df.empty:
             return pd.DataFrame(columns=daily_df.columns if daily_df is not None else [])
@@ -108,6 +118,7 @@ class MacroOnlyV2Strategy:
         key = self._day_cache_key(decision_ts)
         if key in self._daily_ts_cache:
             return self._daily_ts_cache[key]
+        self._evict_old_cache()
 
         cutoff = pd.Timestamp(decision_ts)
         if cutoff.tzinfo is None:

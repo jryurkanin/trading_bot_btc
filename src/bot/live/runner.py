@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Optional
 import json
 import logging
+import signal
 import time
 
 import pandas as pd
@@ -55,6 +56,7 @@ class LiveRunner:
         self.paper_trader = PaperTrader(self.state, cfg.execution.maker_bps, cfg.execution.taker_bps, cfg.execution.max_slippage_bps, cfg.execution.spread_bps)
         self.order_router = OrderRouter(self.client, cfg.execution)
         self.last_daily_update: Optional[pd.Timestamp] = None
+        self._cached_daily: Optional[pd.DataFrame] = None
 
         self.summary_path = Path(cfg.backtest.output_dir) / "daily_summary.log"
         self.summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +68,7 @@ class LiveRunner:
 
         self.consecutive_cycle_failures = 0
         self.consecutive_order_failures = 0
+        self._missing_order_counts: dict[str, int] = {}  # order_id -> consecutive missing count
 
         saved_risk = self.state.get_kv("risk_runtime", {})
         if isinstance(saved_risk, dict):
@@ -183,9 +186,20 @@ class LiveRunner:
 
             remote = remote_map.get(order_id)
             if remote is None:
-                self.state.log_order_event(order_id, "missing_on_exchange", {"action": "drop_local"}, ts=now_ts)
+                self._missing_order_counts[order_id] = self._missing_order_counts.get(order_id, 0) + 1
+                miss_count = self._missing_order_counts[order_id]
+                if miss_count < 3:
+                    logger.warning(
+                        "order %s not found on exchange (attempt %d/3), deferring drop",
+                        order_id, miss_count,
+                    )
+                    continue
+                self.state.log_order_event(order_id, "missing_on_exchange", {"action": "drop_local", "miss_count": miss_count}, ts=now_ts)
                 self.state.drop_open_order(order_id)
+                self._missing_order_counts.pop(order_id, None)
                 continue
+            # Order found on exchange, clear any missing counter
+            self._missing_order_counts.pop(order_id, None)
 
             status = self._order_status(remote)
             filled_size = self._order_filled_size(remote)
@@ -272,16 +286,27 @@ class LiveRunner:
             self._alert("stale_hourly_feed", {"age_minutes": age_min})
 
         # ensure latest daily data with full warmup history
-        if self.last_daily_update is None or self.last_daily_update.date() != now.date():
+        if self.last_daily_update is None or self.last_daily_update.date() != now.date() or self._cached_daily is None:
             daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
+            self._cached_daily = daily
             self.last_daily_update = now
         else:
-            daily = self._get_candles(self.cfg.data.product, "1d", lookback_hours=daily_lookback_days * 24)
+            daily = self._cached_daily
 
         current_hourly = hourly.copy()
         latest_close = float(current_hourly["close"].iloc[-1])
         latest_high = float(current_hourly["high"].iloc[-1])
         latest_low = float(current_hourly["low"].iloc[-1])
+
+        # Fetch real-time bid/ask for live order pricing
+        try:
+            best_quotes = self.client.get_best_bid_ask(self.cfg.data.product)
+            latest_bid = float(best_quotes.bid) if best_quotes.bid > 0 else latest_close
+            latest_ask = float(best_quotes.ask) if best_quotes.ask > 0 else latest_close
+        except Exception as exc:
+            logger.warning("Failed to fetch bid/ask, falling back to candle close: %s", exc)
+            latest_bid = latest_close
+            latest_ask = latest_close
 
         if self.paper_mode:
             current_equity = self.paper_trader.get_portfolio().equity(latest_close)
@@ -328,8 +353,8 @@ class LiveRunner:
                 target_fraction=target,
                 equity_usd=current_equity,
                 price=latest_close,
-                latest_bid=latest_close,
-                latest_ask=latest_close,
+                latest_bid=latest_bid,
+                latest_ask=latest_ask,
             )
             for o in orders:
                 try:
@@ -337,8 +362,8 @@ class LiveRunner:
                         product=o.product,
                         side=o.side,
                         size=o.size,
-                        bid=latest_low,
-                        ask=latest_high,
+                        bid=latest_bid,
+                        ask=latest_ask,
                         now=now.to_pydatetime(),
                         fallback_to_market=self.cfg.execution.fallback_to_market,
                         client_order_id=o.client_order_id,
@@ -423,36 +448,73 @@ class LiveRunner:
     def run(self):
         cycles = self.cycles
         current = 0
-        logger.info("Starting live runner (paper=%s)", self.paper_mode)
-        while cycles is None or current < cycles:
-            self._reconcile()
-            try:
-                decision = self.step_once(current)
-            except Exception as exc:
-                self.consecutive_cycle_failures += 1
-                logger.exception("run cycle failed at %d", current)
-                self._write_health("error", {"cycle": current, "error": str(exc)})
-                if self.consecutive_cycle_failures >= self.cfg.runtime.max_consecutive_cycle_failures:
-                    self._alert("consecutive_cycle_failures", {"count": self.consecutive_cycle_failures, "cycle": current})
-            else:
-                self.consecutive_cycle_failures = 0
-                logger.info(
-                    "cycle=%d target=%s regime=%s strategy=%s filled=%s",
-                    current,
-                    decision.target_fraction,
-                    decision.micro_regime,
-                    decision.strategy,
-                    decision.filled,
-                )
-            current += 1
+        self._shutdown_requested = False
 
-            if cycles is not None and current >= cycles:
-                break
-            now = datetime.now(tz=timezone.utc)
-            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
-            delay = (next_hour - now).total_seconds()
-            if delay > 0:
-                if cycles is not None:
-                    time.sleep(min(delay, 1.0))
+        def _signal_handler(signum, frame):
+            logger.info("Received signal %s, initiating graceful shutdown...", signum)
+            self._shutdown_requested = True
+
+        prev_sigint = signal.getsignal(signal.SIGINT)
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+        logger.info("Starting live runner (paper=%s)", self.paper_mode)
+        try:
+            while (cycles is None or current < cycles) and not self._shutdown_requested:
+                self._reconcile()
+                try:
+                    decision = self.step_once(current)
+                except Exception as exc:
+                    self.consecutive_cycle_failures += 1
+                    logger.exception("run cycle failed at %d", current)
+                    self._write_health("error", {"cycle": current, "error": str(exc)})
+                    if self.consecutive_cycle_failures >= self.cfg.runtime.max_consecutive_cycle_failures:
+                        self._alert("consecutive_cycle_failures", {"count": self.consecutive_cycle_failures, "cycle": current})
                 else:
-                    time.sleep(delay)
+                    self.consecutive_cycle_failures = 0
+                    logger.info(
+                        "cycle=%d target=%s regime=%s strategy=%s filled=%s",
+                        current,
+                        decision.target_fraction,
+                        decision.micro_regime,
+                        decision.strategy,
+                        decision.filled,
+                    )
+                current += 1
+
+                if cycles is not None and current >= cycles:
+                    break
+                if self._shutdown_requested:
+                    break
+                now = datetime.now(tz=timezone.utc)
+                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+                delay = (next_hour - now).total_seconds()
+                if delay > 0:
+                    if cycles is not None:
+                        time.sleep(min(delay, 1.0))
+                    else:
+                        # Sleep in short intervals to allow shutdown signal to interrupt
+                        deadline = time.time() + delay
+                        while time.time() < deadline and not self._shutdown_requested:
+                            time.sleep(min(1.0, deadline - time.time()))
+        finally:
+            logger.info("Live runner shutting down, persisting state...")
+            self._write_health("shutdown", {"cycle": current, "reason": "signal" if self._shutdown_requested else "completed"})
+            try:
+                self.state.set_kv(
+                    "risk_runtime",
+                    {
+                        "equity_peak": self.risk_state.equity_peak,
+                        "current_equity": self.risk_state.current_equity,
+                        "day_start_equity": self.risk_state.day_start_equity,
+                        "day_anchor": str(self.risk_state.day_anchor) if self.risk_state.day_anchor is not None else None,
+                        "consecutive_losses": self.risk_state.consecutive_losses,
+                    },
+                )
+                self.state.set_kv("orchestrator_runtime", self.orchestrator.runtime_state())
+            except Exception as exc:
+                logger.error("Failed to persist state on shutdown: %s", exc)
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
+            logger.info("Live runner stopped.")

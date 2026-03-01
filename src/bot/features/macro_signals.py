@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from enum import Enum
 from typing import Any
 
 import pandas as pd
 
 from ..features.indicators import sma
-from ..features.macro_score import compute_macro_score
+from ..features.macro_score import compute_macro_score, MacroState
 from ..config import RegimeConfig
 
-
-class MacroStrength(str, Enum):
-    OFF = "OFF"
-    ON_HALF = "ON_HALF"
-    ON_FULL = "ON_FULL"
+# Use the canonical MacroState enum; MacroStrength is kept as an alias for
+# backward compatibility so existing callers continue to work.
+MacroStrength = MacroState
 
 
 def _to_timestamped_close(daily_df: pd.DataFrame) -> pd.Series:
@@ -91,8 +88,9 @@ def macro_sma200_band_signal(daily_df: pd.DataFrame, cfg: RegimeConfig | Any) ->
     level_half = float(sma200) * (1.0 + exit_band)
 
     # if the user accidentally passes overlapping bands, keep deterministic ordering:
-    level_full = max(level_full, level_half)
-    level_half = min(level_full, level_half)
+    level_full_orig = level_full
+    level_full = max(level_full_orig, level_half)
+    level_half = min(level_full_orig, level_half)
 
     if float(last) >= level_full:
         return MacroStrength.ON_FULL
