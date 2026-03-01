@@ -167,7 +167,7 @@ def _run_param_worker(task: tuple[int, dict[str, Any]]) -> tuple[str, list[dict[
             parse_ts(str(w_payload["end"])),
         )
         grouped_param[window.name] = {}
-        for scenario in selected_scenarios:
+        for scenario in SCENARIOS:
             try:
                 row = run_window(
                     base_cfg=base_cfg,
@@ -296,7 +296,7 @@ def resolve_windows(all_windows: list[Window], raw: str) -> list[Window]:
 
 def _scenario_by_name(name: str) -> CostScenario:
     key = str(name or "").strip().lower()
-    for scenario in selected_scenarios:
+    for scenario in SCENARIOS:
         if scenario.name.lower() == key:
             return scenario
     raise ValueError(f"Unknown scenario: {name}")
@@ -727,7 +727,7 @@ def main() -> int:
             print("Running baseline macro_gate_benchmark comparator")
             baseline_rows = []
             for window in windows:
-                for scenario in selected_scenarios:
+                for scenario in SCENARIOS:
                     try:
                         row = run_window(
                             base_cfg=cfg,
@@ -779,7 +779,7 @@ def main() -> int:
 
             for window in windows:
                 grouped[param_id].setdefault(window.name, {})
-                for scenario in selected_scenarios:
+                for scenario in SCENARIOS:
                     try:
                         row = run_window(
                             base_cfg=cfg,
