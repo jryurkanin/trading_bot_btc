@@ -32,7 +32,7 @@ def realized_ann_vol_from_daily(daily_df: pd.DataFrame, lookback_days: int | Non
     if log_ret.empty:
         return 0.0
 
-    vol = float(np.std(log_ret.to_numpy(), ddof=0) * math.sqrt(365))
+    vol = float(np.std(log_ret.to_numpy(), ddof=1) * math.sqrt(365))
     return vol if np.isfinite(vol) else 0.0
 
 
@@ -75,7 +75,8 @@ def sized_weight(
     if mode == "inverse_vol":
         target_ann_vol = max(0.0, state_target_vol(state, cfg))
         vol_floor = max(1e-9, float(getattr(cfg, "macro2_vol_floor", 0.05)))
-        base = target_ann_vol / max(float(realized_vol or 0.0), vol_floor)
+        rv = float(realized_vol) if realized_vol is not None and np.isfinite(float(realized_vol)) else 0.0
+        base = target_ann_vol / max(rv, vol_floor)
         return max(0.0, min(1.0, base))
 
     # Unknown modes fail-safe to state weight.

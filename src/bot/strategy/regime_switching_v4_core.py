@@ -71,6 +71,96 @@ class V4CoreStrategy:
         logger.debug("v4_state_reset")
 
     # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def runtime_state(self) -> dict:
+        state = self._gate._cached_state
+        return {
+            "gate": {
+                "cached_state": state.value if isinstance(state, MacroState) else str(state),
+                "cached_multiplier": float(self._gate._cached_multiplier),
+                "cached_score": float(self._gate._cached_score),
+                "cached_components": dict(self._gate._cached_components),
+                "last_daily_ts": str(self._gate._last_daily_ts) if self._gate._last_daily_ts is not None else None,
+                "state_machine": self._gate._gate.snapshot().__dict__,
+            },
+            "last_refresh_day": str(self._last_refresh_day) if self._last_refresh_day is not None else None,
+            "frozen_base_fraction": float(self._frozen_base_fraction),
+            "current_target": float(self._current_target),
+            "rule_switcher": {
+                "confirmed_regime": self._rule_switcher._confirmed_regime.value,
+                "candidate_regime": self._rule_switcher._candidate_regime.value,
+                "candidate_count": self._rule_switcher._candidate_count,
+                "regime_age": self._rule_switcher._regime_age,
+            },
+        }
+
+    def load_runtime_state(self, payload: dict | None) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        if isinstance(payload.get("current_target"), (int, float)):
+            self._current_target = float(payload["current_target"])
+        if isinstance(payload.get("frozen_base_fraction"), (int, float)):
+            self._frozen_base_fraction = float(payload["frozen_base_fraction"])
+
+        last_refresh = payload.get("last_refresh_day")
+        if last_refresh:
+            try:
+                self._last_refresh_day = pd.Timestamp(last_refresh)
+            except Exception:
+                self._last_refresh_day = None
+
+        gate_state = payload.get("gate")
+        if isinstance(gate_state, dict):
+            raw_state = gate_state.get("cached_state")
+            if isinstance(raw_state, str):
+                try:
+                    self._gate._cached_state = MacroState(raw_state)
+                except Exception:
+                    pass
+            mult = gate_state.get("cached_multiplier")
+            if isinstance(mult, (int, float)):
+                self._gate._cached_multiplier = float(mult)
+            score = gate_state.get("cached_score")
+            if isinstance(score, (int, float)):
+                self._gate._cached_score = float(score)
+            comp = gate_state.get("cached_components")
+            if isinstance(comp, dict):
+                self._gate._cached_components = comp
+            lt = gate_state.get("last_daily_ts")
+            if lt:
+                try:
+                    self._gate._last_daily_ts = pd.Timestamp(lt)
+                except Exception:
+                    pass
+            sm = gate_state.get("state_machine")
+            if isinstance(sm, dict):
+                self._gate._gate.restore(sm)
+
+        rs = payload.get("rule_switcher")
+        if isinstance(rs, dict):
+            cr = rs.get("confirmed_regime")
+            if isinstance(cr, str):
+                try:
+                    self._rule_switcher._confirmed_regime = RegimeState(cr)
+                except Exception:
+                    pass
+            ca = rs.get("candidate_regime")
+            if isinstance(ca, str):
+                try:
+                    self._rule_switcher._candidate_regime = RegimeState(ca)
+                except Exception:
+                    pass
+            cc = rs.get("candidate_count")
+            if isinstance(cc, int):
+                self._rule_switcher._candidate_count = cc
+            ra = rs.get("regime_age")
+            if isinstance(ra, int):
+                self._rule_switcher._regime_age = ra
+
+    # ------------------------------------------------------------------
     # Helpers — mirror orchestrator's daily-bar logic
     # ------------------------------------------------------------------
 

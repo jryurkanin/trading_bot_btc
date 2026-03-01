@@ -45,6 +45,19 @@ class CandleStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_candles_lookup ON candles(product,timeframe,ts)")
         self.conn.commit()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
     def _fetch_cached(self, product: str, timeframe: str, start_ts: int, end_ts: int) -> pd.DataFrame:
         query = """
             SELECT ts, open, high, low, close, volume
@@ -62,15 +75,20 @@ class CandleStore:
     def _upsert(self, product: str, timeframe: str, df: pd.DataFrame) -> None:
         if df.empty:
             return
-        rows = []
-        for _, row in df.iterrows():
-            ts_obj = pd.Timestamp(row["timestamp"])
-            if ts_obj.tzinfo is None:
-                ts_obj = ts_obj.tz_localize(timezone.utc)
-            else:
-                ts_obj = ts_obj.tz_convert(timezone.utc)
-            ts = int(ts_obj.timestamp())
-            rows.append((product, timeframe, ts, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]), float(row["volume"])))
+        ts_col = pd.to_datetime(df["timestamp"], utc=True)
+        ts_ints = (ts_col.astype("int64") // 10**9).to_numpy()
+        products = [product] * len(df)
+        timeframes = [timeframe] * len(df)
+        rows = list(zip(
+            products,
+            timeframes,
+            ts_ints,
+            df["open"].to_numpy(dtype=float),
+            df["high"].to_numpy(dtype=float),
+            df["low"].to_numpy(dtype=float),
+            df["close"].to_numpy(dtype=float),
+            df["volume"].to_numpy(dtype=float),
+        ))
         self.conn.executemany(
             """
             INSERT INTO candles(product, timeframe, ts, open, high, low, close, volume)
@@ -106,15 +124,23 @@ class CandleStore:
         # first try cache
         cached = self._fetch_cached(query.product, query.timeframe, start_ts, end_ts)
         if not cached.empty and not query.force_refresh:
-            # if cache has everything needed (contiguous enough) return
+            # Verify cache spans the range AND has no large gaps (contiguity check)
             if cached["timestamp"].min() <= pd.Timestamp(start).tz_convert("UTC") and cached["timestamp"].max() >= pd.Timestamp(end).tz_convert("UTC"):
-                logger.info("Using cached %s candles for %s", query.timeframe, query.product)
-                return cached
+                expected_step = _tf_to_seconds(query.timeframe)
+                ts_sorted = cached["timestamp"].sort_values()
+                diffs = ts_sorted.diff().dt.total_seconds().dropna()
+                max_gap = float(diffs.max()) if len(diffs) > 0 else 0.0
+                # Allow up to 3x the expected step (tolerates weekends/holidays for daily, brief outages for hourly)
+                if max_gap <= expected_step * 3:
+                    logger.info("Using cached %s candles for %s", query.timeframe, query.product)
+                    return cached
+                logger.info("Cache gap detected (%.0fs > %ds threshold), refetching %s candles for %s",
+                           max_gap, expected_step * 3, query.timeframe, query.product)
 
         # fetch from API with pagination
         all_frames: List[pd.DataFrame] = []
         cursor = start
-        limit = min(query.timeframe == "1h" and self.cfg.hourly_limit or self.cfg.daily_limit, 350)
+        limit = min(self.cfg.hourly_limit if query.timeframe == "1h" else self.cfg.daily_limit, 350)
         batch_seconds = _tf_to_seconds(query.timeframe)
         while cursor < end:
             chunk_end = min(cursor + timedelta(seconds=limit * batch_seconds), end)
@@ -144,20 +170,27 @@ class CandleStore:
                 if ts is None:
                     continue
                 ts_int = int(ts)
+                o = item.get("open")
+                h = item.get("high")
+                l = item.get("low")
+                c = item.get("close")
+                if o is None or h is None or l is None or c is None:
+                    logger.warning("Skipping candle with missing OHLC keys: ts=%s", ts_int)
+                    continue
                 rows.append(
                     {
                         "timestamp": pd.to_datetime(ts_int, unit="s", utc=True),
-                        "open": float(item.get("open")),
-                        "high": float(item.get("high")),
-                        "low": float(item.get("low")),
-                        "close": float(item.get("close")),
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c),
                         "volume": float(item.get("volume", 0.0)),
                     }
                 )
             if rows:
                 df = pd.DataFrame(rows).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
                 all_frames.append(df)
-                last_ts = int(rows[-1]["timestamp"].timestamp())
+                last_ts = int(df["timestamp"].max().timestamp())
             else:
                 last_ts = int(cursor.timestamp())
 

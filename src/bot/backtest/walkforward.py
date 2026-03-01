@@ -192,7 +192,14 @@ def walk_forward_test(hourly: pd.DataFrame, daily: pd.DataFrame, cfg: BotConfig,
                 execution_config=cfg_for_run.execution,
                 fred_config=cfg_for_run.fred,
             )
-            _ = engine_train.run()  # warm-up only
+            train_result = engine_train.run()
+            logger.info(
+                "walkforward_train_complete param_index=%d window_index=%d train_cagr=%s train_sharpe=%s",
+                p_idx,
+                w_idx,
+                train_result.metrics.get("cagr"),
+                train_result.metrics.get("sharpe"),
+            )
 
             engine_test = BacktestEngine(
                 product=cfg.data.product,

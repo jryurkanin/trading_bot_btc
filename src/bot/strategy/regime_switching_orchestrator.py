@@ -110,6 +110,9 @@ class RegimeSwitchingOrchestrator:
 
         self._acceleration_backend: str = str(getattr(cfg, "acceleration_backend", "cpu") or "cpu")
 
+        # HMM fit cache — only refit when the day changes (24x reduction)
+        self._hmm_last_fit_day: str | None = None
+
         self._last_logged_day: pd.Timestamp | None = None
         self._last_logged_macro_state: str | None = None
         self._last_logged_micro_regime: RegimeState | None = None
@@ -125,6 +128,7 @@ class RegimeSwitchingOrchestrator:
         self._boost_on_streak = 0
         self._boost_off_streak = 0
         self._boost_last_daily_ts = None
+        self._hmm_last_fit_day = None
         self._daily_cache = {}
         self._daily_ts_cache = {}
         self._daily_last_ts_cache = {}
@@ -327,7 +331,10 @@ class RegimeSwitchingOrchestrator:
                 ).fillna(0)
 
             if len(feats) >= 20:
-                self.hmm_switcher.fit(feats.tail(self.cfg.hmm_window_hours).values)
+                day_key = str(hourly.index[idx].date())
+                if day_key != self._hmm_last_fit_day:
+                    self.hmm_switcher.fit(feats.tail(self.cfg.hmm_window_hours).values)
+                    self._hmm_last_fit_day = day_key
                 return self.hmm_switcher.predict_one(feats.iloc[-1].values)
 
         lookback = max(24, self.cfg.vol_lookback_days * 24)

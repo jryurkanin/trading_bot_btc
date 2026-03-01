@@ -59,6 +59,8 @@ class FredClient:
         self.cache_ttl_hours = max(0.0, float(cache_ttl_hours))
         self.use_stale_cache_for_backtest = bool(use_stale_cache_for_backtest)
         self.stats = FredCacheStats()
+        self._min_request_interval: float = 1.0  # FRED rate limit: ~120 req/min
+        self._last_request_time: float = 0.0
 
         self._client = httpx.Client(timeout=self.timeout_seconds)
 
@@ -178,11 +180,20 @@ class FredClient:
     # HTTP
     # ------------------------------------------------------------------
 
+    def _rate_limit(self) -> None:
+        """Enforce minimum interval between FRED API requests."""
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_request_interval:
+            time.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = time.monotonic()
+
     def _fetch_series_observations_http(self, params: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.base_url}/series/observations"
         attempt = 0
         while True:
             attempt += 1
+            self._rate_limit()
             try:
                 resp = self._client.get(url, params=params)
                 self.stats.requests += 1

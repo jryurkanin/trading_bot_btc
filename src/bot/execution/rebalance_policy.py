@@ -35,6 +35,36 @@ class RebalancePolicy:
         self.max_trades_per_day = int(max_trades_per_day)
         self.state = RebalanceState()
 
+    def snapshot(self) -> dict:
+        """Serialize rebalance state for persistence."""
+        return {
+            "last_trade_bucket": self.state.last_trade_bucket,
+            "last_trade_ts": str(self.state.last_trade_ts) if self.state.last_trade_ts else None,
+            "trades_today": self.state.trades_today,
+            "current_day": str(self.state.current_day) if self.state.current_day else None,
+        }
+
+    def restore(self, payload: dict | None) -> None:
+        """Restore rebalance state from persistence."""
+        if not isinstance(payload, dict):
+            return
+        if isinstance(payload.get("last_trade_bucket"), (int, float)):
+            self.state.last_trade_bucket = float(payload["last_trade_bucket"])
+        lt = payload.get("last_trade_ts")
+        if lt:
+            try:
+                self.state.last_trade_ts = pd.Timestamp(lt)
+            except Exception:
+                pass
+        if isinstance(payload.get("trades_today"), int):
+            self.state.trades_today = int(payload["trades_today"])
+        cd = payload.get("current_day")
+        if cd:
+            try:
+                self.state.current_day = pd.Timestamp(cd)
+            except Exception:
+                pass
+
     def quantize_target(self, target: float) -> float:
         t = min(1.0, max(0.0, float(target)))
         step = self.target_quantization_step

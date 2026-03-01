@@ -96,12 +96,13 @@ class CostScenario:
     name: str
     fee_bps_delta: float
     impact_bps_delta: float
+    spread_bps_delta: float
 
 
 SCENARIOS = [
-    CostScenario("baseline", 0.0, 0.0),
-    CostScenario("stress_1", 5.0, 2.0),
-    CostScenario("stress_2", 10.0, 5.0),
+    CostScenario("baseline", 0.0, 0.0, 0.0),
+    CostScenario("stress_1", 5.0, 2.0, 2.0),
+    CostScenario("stress_2", 10.0, 5.0, 5.0),
 ]
 
 
@@ -167,7 +168,7 @@ def _run_param_worker(task: tuple[int, dict[str, Any]]) -> tuple[str, list[dict[
             parse_ts(str(w_payload["end"])),
         )
         grouped_param[window.name] = {}
-        for scenario in selected_scenarios:
+        for scenario in SCENARIOS:
             try:
                 row = run_window(
                     base_cfg=base_cfg,
@@ -296,7 +297,7 @@ def resolve_windows(all_windows: list[Window], raw: str) -> list[Window]:
 
 def _scenario_by_name(name: str) -> CostScenario:
     key = str(name or "").strip().lower()
-    for scenario in selected_scenarios:
+    for scenario in SCENARIOS:
         if scenario.name.lower() == key:
             return scenario
     raise ValueError(f"Unknown scenario: {name}")
@@ -415,6 +416,7 @@ def run_window(
     taker_rate = float(base_taker + scenario.fee_bps_delta / 10_000.0)
 
     cfg.execution.impact_bps = float(cfg.execution.impact_bps + scenario.impact_bps_delta)
+    cfg.execution.spread_bps = float(cfg.execution.spread_bps + scenario.spread_bps_delta)
 
     engine = BacktestEngine(
         product=product,
@@ -588,7 +590,7 @@ def main() -> int:
         if t > 0:
             base_taker_rate = t
     except Exception:
-        pass
+        logger.warning("Could not fetch transaction summary for fee rates", exc_info=True)
 
     grid_flags = parse_grid_flags(args.grid)
     param_sets = load_grid(
@@ -727,7 +729,7 @@ def main() -> int:
             print("Running baseline macro_gate_benchmark comparator")
             baseline_rows = []
             for window in windows:
-                for scenario in selected_scenarios:
+                for scenario in SCENARIOS:
                     try:
                         row = run_window(
                             base_cfg=cfg,
@@ -779,7 +781,7 @@ def main() -> int:
 
             for window in windows:
                 grouped[param_id].setdefault(window.name, {})
-                for scenario in selected_scenarios:
+                for scenario in SCENARIOS:
                     try:
                         row = run_window(
                             base_cfg=cfg,
@@ -1019,7 +1021,7 @@ def main() -> int:
 
         test_benchmark = grouped.get(best.get("param_id", ""), {}).get("test", {}).get("stress_1")
         test_repro = (
-            f"python3.14 scripts/backtest.py --product {args.product} "
+            f"{sys.executable} scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or end.isoformat().replace('+00:00', 'Z')} "
             f"--strategy macro_only_v2 --config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )

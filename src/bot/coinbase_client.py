@@ -520,7 +520,7 @@ class RESTClientWrapper:
 
                 bid = _px(bids)
                 ask = _px(asks)
-                return BestBidAsk(bid=bid, ask=ask if ask > 0 else bid, time=datetime.utcnow())
+                return BestBidAsk(bid=bid, ask=ask if ask > 0 else bid, time=datetime.now(tz=timezone.utc))
         except Exception:
             pass
 
@@ -530,7 +530,7 @@ class RESTClientWrapper:
     def get_product_book(self, product_id: str) -> BestBidAsk:
         data = self._request("GET", f"/products/{product_id}/book", params={"product_id": product_id})
         if not isinstance(data, dict):
-            return BestBidAsk(bid=0.0, ask=0.0, time=datetime.utcnow())
+            return BestBidAsk(bid=0.0, ask=0.0, time=datetime.now(tz=timezone.utc))
 
         # Coinbase may return bids/asks with [price,size,...] or nested dicts.
         if "bids" not in data:
@@ -552,7 +552,7 @@ class RESTClientWrapper:
 
         bid = _top_px(book, 0.0)
         ask = _top_px(asks, bid)
-        return BestBidAsk(bid=bid, ask=ask, time=datetime.utcnow())
+        return BestBidAsk(bid=bid, ask=ask, time=datetime.now(tz=timezone.utc))
 
     @staticmethod
     def _as_float(value: Any, default: float = 0.0) -> float:
@@ -606,24 +606,25 @@ class RESTClientWrapper:
         time_in_force: str = "GTC",
         post_only: bool = True,
     ) -> Dict[str, Any]:
+        if order_type == "market":
+            order_config = {
+                "market_market_ioc": {
+                    "base_size": size,
+                }
+            }
+        else:
+            order_config = {
+                "limit_limit_gtc": {
+                    "base_size": size,
+                    "limit_price": limit_price,
+                    "post_only": post_only,
+                }
+            }
         payload = {
             "client_order_id": client_order_id,
             "product_id": product_id,
             "side": side,
-            "order_configuration": {
-                "market_market_ioc": {
-                    "base_size": size,
-                }
-                if order_type == "market"
-                else {
-                    "limit_limit_gtc": {
-                        "base_size": size,
-                        "limit_price": limit_price,
-                        "post_only": post_only,
-                    }
-                }
-            },
-            "time_in_force": time_in_force,
+            "order_configuration": order_config,
         }
         return self._request("POST", "/orders", json_payload=payload)
 

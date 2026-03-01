@@ -18,14 +18,22 @@ def compute_cagr(equity: pd.Series, periods_per_year: int = 8760) -> float:
     equity = equity.dropna()
     if equity.empty or len(equity) < 2:
         return 0.0
-    start = float(equity.iloc[0])
-    end = float(equity.iloc[-1])
-    if start <= 0:
+    start_val = float(equity.iloc[0])
+    end_val = float(equity.iloc[-1])
+    if start_val <= 0:
         return 0.0
-    years = max(len(equity) - 1, 1) / periods_per_year
-    if years <= 0:
+    # Use calendar time if index is datetime, fall back to bar count
+    if isinstance(equity.index, pd.DatetimeIndex):
+        td = equity.index[-1] - equity.index[0]
+        years = td.total_seconds() / (365.25 * 24 * 3600)
+    else:
+        years = max(len(equity) - 1, 1) / periods_per_year
+    if years <= 1e-6:
         return 0.0
-    return float((end / start) ** (1 / years) - 1)
+    try:
+        return float((end_val / start_val) ** (1 / years) - 1)
+    except (OverflowError, ValueError):
+        return 0.0
 
 
 def compute_sharpe(returns: pd.Series, rf: float = 0.0, periods_per_year: int = 8760) -> float:
@@ -51,6 +59,11 @@ def compute_sortino(returns: pd.Series, rf: float = 0.0, periods_per_year: int =
 
 
 def max_drawdown(equity: pd.Series) -> float:
+    """Return maximum drawdown as a negative fraction (e.g. -0.20 for 20% drawdown).
+
+    Convention: always negative or zero.  To compare with RiskState.drawdown
+    (which uses the positive convention 0.20), use ``abs(max_drawdown(eq))``.
+    """
     eq = equity.dropna()
     if eq.empty:
         return 0.0

@@ -75,6 +75,7 @@ class BacktestEngine:
     risk_config: Optional[RiskConfig] = None
     execution_config: Optional[ExecutionConfig] = None
     fred_config: Optional[FredConfig] = None
+    signal_delay_bars: int = 0  # extra bars of latency for stale-data simulation
 
     def run(self) -> BacktestResult:
         log_path = setup_system_logger()
@@ -351,15 +352,23 @@ class BacktestEngine:
             except Exception:
                 return float(default)
 
+        # Pre-extract numpy arrays for O(1) per-bar access instead of .iloc
+        _hourly_close = hourly["close"].to_numpy(dtype=float)
+        _hourly_open = hourly["open"].to_numpy(dtype=float)
+        _hourly_timestamps = hourly.index
+
         # Iterate on signal bar t and fill on bar t+1. Use pre-start bars as
         # feature warmup context, but only execute/evaluate bars from start_i.
+        # signal_delay_bars adds extra latency to simulate stale data feeds.
+        delay = max(0, self.signal_delay_bars)
         for i in range(start_i, len(hourly)):
-            signal_ts = hourly.index[i - 1]
-            exec_ts = hourly.index[i]
-            bar_t = hourly.iloc[i - 1]
-            bar_t1 = hourly.iloc[i]
+            sig_idx = i - 1 - delay
+            if sig_idx < 0:
+                continue
+            signal_ts = _hourly_timestamps[sig_idx]
+            exec_ts = _hourly_timestamps[i]
 
-            mark_signal = float(bar_t.get("close", 0.0))
+            mark_signal = _hourly_close[sig_idx]
             if mark_signal <= 0:
                 continue
 
@@ -371,7 +380,7 @@ class BacktestEngine:
                 hourly_df=hourly,
                 daily_df=daily,
                 current_exposure=current_exposure,
-                hourly_idx=i - 1,
+                hourly_idx=sig_idx,
                 micro_precomputed=hourly_precomputed,
             )
             raw_target = float(bundle.final_target)
@@ -381,7 +390,7 @@ class BacktestEngine:
                 raw_target,
                 risk_state,
                 signal_ts.to_pydatetime(),
-                signal_ts.to_pydatetime(),
+                exec_ts.to_pydatetime(),
                 timeframe_minutes=60,
                 current_fraction=current_exposure,
             )
@@ -427,7 +436,7 @@ class BacktestEngine:
                 limit_price = None
                 if fill_model.name == "bid_ask" and exec_cfg.maker_first:
                     spread_bps = exec_cfg.spread_bps if self.use_spread_slippage else 0.0
-                    mark_open = float(bar_t1.get("open", mark_signal))
+                    mark_open = _hourly_open[i]
                     bid = mark_open * (1.0 - spread_bps / 20_000.0)
                     ask = mark_open * (1.0 + spread_bps / 20_000.0)
                     order_type = "limit"
@@ -455,6 +464,9 @@ class BacktestEngine:
                     spread_bps=exec_cfg.spread_bps if self.use_spread_slippage else 0.0,
                     impact_bps=exec_cfg.impact_bps,
                 )
+                # .iloc needed here — fill model requires full bar Series
+                bar_t = hourly.iloc[sig_idx]
+                bar_t1 = hourly.iloc[i]
                 fill = fill_model.fill(order, bar_t, bar_t1, market_state)
 
                 if fill.filled and fill.qty > 0:
@@ -467,11 +479,19 @@ class BacktestEngine:
                         qty_exec = float(fill.qty)
 
                         if side == "BUY":
-                            max_notional = cash / (1.0 + fee_rate)
+                            max_notional = max(0.0, cash) / (1.0 + fee_rate)
                             notional = min(notional, max_notional)
                             qty_exec = notional / max(fill.price, 1e-12)
                             fee = cost_model.fee(notional, fill.is_maker)
-                            cash -= notional + fee
+                            total_cost = notional + fee
+                            if total_cost > cash:
+                                # Scale down to prevent negative cash
+                                scale = max(0.0, cash) / max(total_cost, 1e-12)
+                                notional *= scale
+                                qty_exec *= scale
+                                fee = cost_model.fee(notional, fill.is_maker)
+                                total_cost = notional + fee
+                            cash -= total_cost
                             btc += qty_exec
                         else:
                             qty_exec = min(qty_exec, max(0.0, btc))
@@ -521,14 +541,22 @@ class BacktestEngine:
                                 target_bucket,
                             )
                             rebalance.on_trade(signal_ts, target_bucket)
+                            # Track consecutive losses based on actual trades
+                            trade_equity = cash + btc * float(fill.price)
+                            risk_mgr.record_trade(risk_state, trade_equity)
 
-            equity_exec = cash + btc * float(bar_t1.get("close", mark_signal))
+            # Deduct per-bar funding/carry cost on the BTC position.
+            mark_exec = _hourly_close[i]
+            position_value = btc * mark_exec
+            funding_cost = cost_model.funding_cost_per_bar(position_value)
+            cash -= funding_cost
+
+            equity_exec = cash + position_value
             risk_state.current_equity = equity_exec
             if equity_exec > risk_state.equity_peak:
                 risk_state.equity_peak = equity_exec
 
             drawdown = risk_state.drawdown
-            mark_exec = float(bar_t1.get("close", mark_signal))
             post_exposure = max(0.0, min(1.0, (btc * mark_exec / equity_exec) if equity_exec > 0 else 0.0))
 
             macro_state = str(bundle.metadata.get("macro_state", "OFF"))

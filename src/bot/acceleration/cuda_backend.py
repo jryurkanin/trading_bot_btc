@@ -49,7 +49,11 @@ def _probe_cuda() -> tuple[bool, str | None, str | None]:
         return False, None, f"cuda_probe_error:{exc.__class__.__name__}"
 
 
+_cached_ctx: AccelerationContext | None = None
+
+
 def resolve_acceleration_backend(requested: str | None = "auto") -> AccelerationContext:
+    global _cached_ctx
     req = str(requested or "auto").strip().lower()
     if req not in {"auto", "cpu", "cuda"}:
         req = "auto"
@@ -62,21 +66,28 @@ def resolve_acceleration_backend(requested: str | None = "auto") -> Acceleration
             reason="forced_cpu",
         )
 
+    if _cached_ctx is not None:
+        return _cached_ctx
+
     available, device_name, reason = _probe_cuda()
     if available:
-        return AccelerationContext(
+        _cached_ctx = AccelerationContext(
             requested=req,
             backend="cuda",
             cuda_available=True,
             device_name=device_name,
         )
+    else:
+        _cached_ctx = AccelerationContext(
+            requested=req,
+            backend="cpu",
+            cuda_available=False,
+            reason=reason if reason else "cuda_unavailable",
+        )
+    return _cached_ctx
 
-    return AccelerationContext(
-        requested=req,
-        backend="cpu",
-        cuda_available=False,
-        reason=reason if reason else "cuda_unavailable",
-    )
+
+_cached_xp: Any = None
 
 
 def get_array_module(ctx: AccelerationContext) -> Any:
@@ -84,10 +95,14 @@ def get_array_module(ctx: AccelerationContext) -> Any:
 
     The caller should first obtain *ctx* from ``resolve_acceleration_backend``.
     """
+    global _cached_xp
     if ctx.backend == "cuda":
+        if _cached_xp is not None:
+            return _cached_xp
         try:
             import cupy as cp  # type: ignore
 
+            _cached_xp = cp
             return cp
         except Exception:
             return np

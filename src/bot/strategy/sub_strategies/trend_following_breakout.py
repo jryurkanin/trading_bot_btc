@@ -35,6 +35,10 @@ class TrendFollowingBreakoutStrategy:
     def reset(self):
         self.state = TrendState()
 
+    def on_regime_switch(self) -> None:
+        """Reset stale entry_price when regime changes externally."""
+        self.state.entry_price = None
+
     def compute_target(self, hourly: pd.DataFrame, current_exposure: float, now: pd.Timestamp,
                        idx: int | None = None, precomputed: dict | None = None) -> float:
         if hourly.empty or len(hourly) < 2:

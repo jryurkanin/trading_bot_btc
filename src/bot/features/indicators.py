@@ -13,7 +13,12 @@ def _rolling_sum_xp(arr, window: int, xp):
         return arr.copy()
     csum = xp.cumsum(arr)
     out = csum.copy()
+    # First `window` elements are partial sums (cumsum gives sum of [0..i]),
+    # elements from index `window` onward get the correct rolling window.
     out[window:] = csum[window:] - csum[:-window]
+    # Elements [0..window-1] already hold cumsum values which represent
+    # partial sums of 1..window elements respectively — this is correct
+    # for callers that apply their own min_periods masking.
     return out
 
 
@@ -98,47 +103,42 @@ def _rolling_min_xp(arr, window: int, min_periods: int, xp):
     return out
 
 
-def sma(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
+def _resolve_fast(backend: str):
+    """Fast-path: skip probe when CPU is requested."""
     if backend == "cpu":
-        return series.rolling(window=window, min_periods=1).mean()
-
+        return None, np  # None ctx signals CPU
     ctx = resolve_acceleration_backend(backend)
     if ctx.backend != "cuda":
+        return None, np
+    return ctx, get_array_module(ctx)
+
+
+def _true_range_xp(high_arr, low_arr, close_arr, xp):
+    """Compute true range directly on array-module arrays (numpy or cupy)."""
+    prev_close = xp.empty_like(close_arr)
+    prev_close[0] = close_arr[0]
+    prev_close[1:] = close_arr[:-1]
+    tr1 = high_arr - low_arr
+    tr2 = xp.abs(high_arr - prev_close)
+    tr3 = xp.abs(low_arr - prev_close)
+    return xp.maximum(xp.maximum(tr1, tr2), tr3)
+
+
+def sma(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
+    ctx, xp = _resolve_fast(backend)
+
+    if ctx is None:
         return series.rolling(window=window, min_periods=1).mean()
 
-    xp = get_array_module(ctx)
     arr = xp.asarray(series.to_numpy(dtype=float))
     out = _rolling_mean_xp(arr, int(window), min_periods=1, xp=xp)
     return pd.Series(to_numpy(out, xp), index=series.index)
 
 
 def ema(series: pd.Series, window: int, *, backend: str = "cpu") -> pd.Series:
-    if backend == "cpu":
-        return series.ewm(span=window, adjust=False, min_periods=1).mean()
-
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        return series.ewm(span=window, adjust=False, min_periods=1).mean()
-
-    xp = get_array_module(ctx)
-    arr = xp.asarray(series.to_numpy(dtype=float))
-    out = xp.empty_like(arr)
-    alpha = float(2.0 / (float(window) + 1.0))
-
-    if arr.shape[0] == 0:
-        return pd.Series([], dtype=float, index=series.index)
-
-    first = arr[0]
-    if not xp.isfinite(first):
-        first = 0.0
-    out[0] = first
-    for i in range(1, int(arr.shape[0])):
-        x = arr[i]
-        if not xp.isfinite(x):
-            x = out[i - 1]
-        out[i] = alpha * x + (1.0 - alpha) * out[i - 1]
-
-    return pd.Series(to_numpy(out, xp), index=series.index)
+    # EMA is inherently sequential — pandas C implementation is fastest
+    # regardless of backend. A Python for-loop on GPU is slower than CPU.
+    return series.ewm(span=window, adjust=False, min_periods=1).mean()
 
 
 def bollinger_bands(
@@ -148,22 +148,15 @@ def bollinger_bands(
     *,
     backend: str = "cpu",
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
-    if backend == "cpu":
+    ctx, xp = _resolve_fast(backend)
+
+    if ctx is None:
         mid = sma(series, window)
         std = series.rolling(window=window, min_periods=1).std(ddof=0)
         upper = mid + stdev * std
         lower = mid - stdev * std
         return mid, upper, lower
 
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        mid = sma(series, window)
-        std = series.rolling(window=window, min_periods=1).std(ddof=0)
-        upper = mid + stdev * std
-        lower = mid - stdev * std
-        return mid, upper, lower
-
-    xp = get_array_module(ctx)
     arr = xp.asarray(series.to_numpy(dtype=float))
     mean = _rolling_mean_xp(arr, int(window), min_periods=1, xp=xp)
     std = _rolling_std_xp(arr, int(window), min_periods=1, xp=xp, ddof=0)
@@ -192,34 +185,20 @@ def true_range(
     *,
     backend: str = "cpu",
 ) -> pd.Series:
-    if backend == "cpu":
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    ctx, xp = _resolve_fast(backend)
 
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    if ctx is None:
+        # Vectorized numpy path — avoids 3 intermediate Series + DataFrame concat
+        h = high.to_numpy(dtype=float)
+        l = low.to_numpy(dtype=float)
+        c = close.to_numpy(dtype=float)
+        tr = _true_range_xp(h, l, c, np)
+        return pd.Series(tr, index=high.index)
 
-    xp = get_array_module(ctx)
     high_arr = xp.asarray(high.to_numpy(dtype=float))
     low_arr = xp.asarray(low.to_numpy(dtype=float))
     close_arr = xp.asarray(close.to_numpy(dtype=float))
-
-    prev_close = xp.empty_like(close_arr)
-    prev_close[0] = close_arr[0]
-    prev_close[1:] = close_arr[:-1]
-
-    tr1 = high_arr - low_arr
-    tr2 = xp.abs(high_arr - prev_close)
-    tr3 = xp.abs(low_arr - prev_close)
-    tr = xp.maximum(xp.maximum(tr1, tr2), tr3)
+    tr = _true_range_xp(high_arr, low_arr, close_arr, xp)
     return pd.Series(to_numpy(tr, xp), index=high.index)
 
 
@@ -231,36 +210,38 @@ def atr(
     *,
     backend: str = "cpu",
 ) -> pd.Series:
-    if backend == "cpu":
+    ctx, xp = _resolve_fast(backend)
+
+    if ctx is None:
         return true_range(high, low, close).rolling(window=window, min_periods=1).mean()
 
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        return true_range(high, low, close).rolling(window=window, min_periods=1).mean()
-
-    xp = get_array_module(ctx)
-    tr = xp.asarray(true_range(high, low, close, backend="cuda").to_numpy(dtype=float))
+    high_arr = xp.asarray(high.to_numpy(dtype=float))
+    low_arr = xp.asarray(low.to_numpy(dtype=float))
+    close_arr = xp.asarray(close.to_numpy(dtype=float))
+    tr = _true_range_xp(high_arr, low_arr, close_arr, xp)
     out = _rolling_mean_xp(tr, int(window), min_periods=1, xp=xp)
     return pd.Series(to_numpy(out, xp), index=high.index)
 
 
-def realized_vol(returns: pd.Series, window: int = 24, *, backend: str = "cpu") -> pd.Series:
-    # annualized to one-day hourly assumption; caller may adapt scaling
+def realized_vol(returns: pd.Series, window: int = 24, *, backend: str = "cpu", periods_per_year: int = 8760) -> pd.Series:
+    """Annualized realized volatility.
+
+    Parameters
+    ----------
+    periods_per_year : int
+        Number of return observations per year.  Default 8760 assumes hourly
+        data (365 * 24).  Pass 365 for daily data or 52 for weekly.
+    """
     min_periods = max(2, int(window) // 2)
+    ctx, xp = _resolve_fast(backend)
 
-    if backend == "cpu":
-        rv = returns.rolling(window=window, min_periods=min_periods).std() * np.sqrt(8760)
+    if ctx is None:
+        rv = returns.rolling(window=window, min_periods=min_periods).std() * np.sqrt(periods_per_year)
         return rv
 
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        rv = returns.rolling(window=window, min_periods=min_periods).std() * np.sqrt(8760)
-        return rv
-
-    xp = get_array_module(ctx)
     arr = xp.asarray(returns.to_numpy(dtype=float))
     std = _rolling_std_xp(arr, int(window), min_periods=min_periods, xp=xp, ddof=1)
-    rv = std * xp.sqrt(8760.0)
+    rv = std * xp.sqrt(float(periods_per_year))
     return pd.Series(to_numpy(rv, xp), index=returns.index)
 
 
@@ -271,14 +252,11 @@ def donchian_channel(
     *,
     backend: str = "cpu",
 ) -> tuple[pd.Series, pd.Series]:
-    if backend == "cpu":
+    ctx, xp = _resolve_fast(backend)
+
+    if ctx is None:
         return low.rolling(window=window, min_periods=1).min(), high.rolling(window=window, min_periods=1).max()
 
-    ctx = resolve_acceleration_backend(backend)
-    if ctx.backend != "cuda":
-        return low.rolling(window=window, min_periods=1).min(), high.rolling(window=window, min_periods=1).max()
-
-    xp = get_array_module(ctx)
     high_arr = xp.asarray(high.to_numpy(dtype=float))
     low_arr = xp.asarray(low.to_numpy(dtype=float))
 

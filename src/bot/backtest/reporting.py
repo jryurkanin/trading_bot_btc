@@ -19,13 +19,13 @@ def sanitize_for_json(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [sanitize_for_json(v) for v in value]
 
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
     if isinstance(value, (np.floating, float)):
         v = float(value)
         return v if math.isfinite(v) else None
     if isinstance(value, (np.integer, int)):
         return int(value)
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
 
     if value is None:
         return None

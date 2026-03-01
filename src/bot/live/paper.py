@@ -25,20 +25,51 @@ class PaperPortfolio:
 class PaperTrader:
     """Paper broker for --paper mode. Deterministic execution + optional slippage."""
 
-    def __init__(self, state: BotStateStore, maker_fee_bps: float = 10.0, taker_fee_bps: float = 25.0, slippage_bps: float = 5.0, spread_bps: float = 15.0):
+    def __init__(self, state: BotStateStore, maker_fee_bps: float = 10.0, taker_fee_bps: float = 25.0, slippage_bps: float = 5.0, spread_bps: float = 15.0, product: str = "BTC-USD"):
         self.state = state
         self.maker_fee = maker_fee_bps / 10000.0
         self.taker_fee = taker_fee_bps / 10000.0
         self.slippage_bps = slippage_bps
         self.spread_bps = spread_bps
+        self.product = product
         self.portfolio = PaperPortfolio(usd=10_000.0, btc=0.0)
+        self._restore_portfolio()
         logger.info(
-            "paper_trader_init maker_fee_bps=%.4f taker_fee_bps=%.4f slippage_bps=%.4f spread_bps=%.4f",
+            "paper_trader_init product=%s maker_fee_bps=%.4f taker_fee_bps=%.4f slippage_bps=%.4f spread_bps=%.4f usd=%.2f btc=%.8f",
+            product,
             maker_fee_bps,
             taker_fee_bps,
             slippage_bps,
             spread_bps,
+            self.portfolio.usd,
+            self.portfolio.btc,
         )
+
+    def _restore_portfolio(self) -> None:
+        """Restore paper portfolio from persistent state store."""
+        try:
+            raw = self.state.get_kv("paper_portfolio")
+            if raw:
+                import json
+                data = json.loads(raw)
+                self.portfolio = PaperPortfolio(
+                    usd=float(data.get("usd", 10_000.0)),
+                    btc=float(data.get("btc", 0.0)),
+                )
+                logger.info("paper_portfolio_restored usd=%.2f btc=%.8f", self.portfolio.usd, self.portfolio.btc)
+        except Exception as exc:
+            logger.warning("paper_portfolio_restore_failed error=%s", exc)
+
+    def _persist_portfolio(self) -> None:
+        """Save paper portfolio to persistent state store."""
+        try:
+            import json
+            self.state.set_kv("paper_portfolio", json.dumps({
+                "usd": self.portfolio.usd,
+                "btc": self.portfolio.btc,
+            }))
+        except Exception as exc:
+            logger.warning("paper_portfolio_persist_failed error=%s", exc)
 
     def get_portfolio(self) -> PaperPortfolio:
         return self.portfolio
@@ -122,9 +153,10 @@ class PaperTrader:
             equity,
         )
 
+        self._persist_portfolio()
         self.state.log_decision(
             int(now.timestamp()),
-            "BTC-USD",
+            self.product,
             {
                 "mode": "paper",
                 "side": side,

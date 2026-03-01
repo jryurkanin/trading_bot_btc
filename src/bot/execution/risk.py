@@ -21,6 +21,7 @@ class RiskState:
     day_start_equity: float = 1.0
     consecutive_losses: int = 0
     last_equity: float | None = None
+    last_trade_equity: float | None = None
 
     @property
     def drawdown(self) -> float:
@@ -116,12 +117,16 @@ class RiskManager:
             state.day_start_equity = float(equity)
             state.consecutive_losses = 0
 
-        if state.last_equity is not None:
-            if equity < state.last_equity:
-                state.consecutive_losses += 1
-            elif equity > state.last_equity:
-                state.consecutive_losses = 0
         state.last_equity = float(equity)
+
+    def record_trade(self, state: RiskState, equity_after_trade: float) -> None:
+        """Track consecutive losses based on actual trade outcomes."""
+        if state.last_trade_equity is not None:
+            if equity_after_trade < state.last_trade_equity:
+                state.consecutive_losses += 1
+            elif equity_after_trade > state.last_trade_equity:
+                state.consecutive_losses = 0
+        state.last_trade_equity = float(equity_after_trade)
 
     def daily_pnl_pct(self, state: RiskState) -> float:
         if state.day_start_equity <= 0:

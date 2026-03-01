@@ -496,7 +496,7 @@ def main() -> int:
         if t > 0:
             base_taker_rate = t
     except Exception:
-        pass
+        logger.warning("Could not fetch transaction summary for fee rates", exc_info=True)
 
     grid_flags = parse_grid_flags(args.grid)
     param_sets = load_grid(args.grid_config, grid_flags, small=args.small)
@@ -812,7 +812,7 @@ def main() -> int:
         )
 
         repro_cmd = (
-            f"python3.14 scripts/backtest.py --product {args.product} "
+            f"{sys.executable} scripts/backtest.py --product {args.product} "
             f"--start {args.test_start} --end {args.test_end or args.end} "
             f"--strategy {TARGET_STRATEGY} --fill-model {args.fill_model} "
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"

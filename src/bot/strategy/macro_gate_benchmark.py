@@ -64,6 +64,7 @@ class MacroGateBenchmarkStrategy:
                 "cached_score": float(self._gate._cached_score),
                 "cached_components": dict(self._gate._cached_components),
                 "last_daily_ts": str(self._gate._last_daily_ts) if self._gate._last_daily_ts is not None else None,
+                "state_machine": self._gate._gate.snapshot().__dict__,
             },
             "last_refresh_day": str(self._last_refresh_day) if self._last_refresh_day is not None else None,
             "frozen_base_fraction": float(self._frozen_base_fraction),
@@ -115,6 +116,11 @@ class MacroGateBenchmarkStrategy:
                     self._gate._last_daily_ts = pd.Timestamp(lt)
                 except Exception:
                     pass
+
+            # Restore inner state machine (hysteresis streaks, age, etc.)
+            sm = gate_state.get("state_machine")
+            if isinstance(sm, dict):
+                self._gate._gate.restore(sm)
 
     # ------------------------------------------------------------------
     # Helpers — same daily-bar logic as V4CoreStrategy

@@ -82,8 +82,119 @@ class V5AdaptiveStrategy:
         logger.debug("v5_state_reset")
 
     # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def runtime_state(self) -> dict:
+        state = self._gate._cached_state
+        return {
+            "gate": {
+                "cached_state": state.value if isinstance(state, MacroState) else str(state),
+                "cached_multiplier": float(self._gate._cached_multiplier),
+                "cached_score": float(self._gate._cached_score),
+                "cached_components": dict(self._gate._cached_components),
+                "last_daily_ts": str(self._gate._last_daily_ts) if self._gate._last_daily_ts is not None else None,
+                "state_machine": self._gate._gate.snapshot().__dict__,
+                "cached_thresholds": dict(self._gate._cached_thresholds),
+                "vol_history": list(self._gate._vol_history),
+            },
+            "last_refresh_day": str(self._last_refresh_day) if self._last_refresh_day is not None else None,
+            "frozen_base_fraction": float(self._frozen_base_fraction),
+            "current_target": float(self._current_target),
+            "rule_switcher": {
+                "confirmed_regime": self._rule_switcher._confirmed_regime.value,
+                "candidate_regime": self._rule_switcher._candidate_regime.value,
+                "candidate_count": self._rule_switcher._candidate_count,
+                "regime_age": self._rule_switcher._regime_age,
+            },
+        }
+
+    def load_runtime_state(self, payload: dict | None) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        if isinstance(payload.get("current_target"), (int, float)):
+            self._current_target = float(payload["current_target"])
+        if isinstance(payload.get("frozen_base_fraction"), (int, float)):
+            self._frozen_base_fraction = float(payload["frozen_base_fraction"])
+
+        last_refresh = payload.get("last_refresh_day")
+        if last_refresh:
+            try:
+                self._last_refresh_day = pd.Timestamp(last_refresh)
+            except Exception:
+                self._last_refresh_day = None
+
+        gate_state = payload.get("gate")
+        if isinstance(gate_state, dict):
+            raw_state = gate_state.get("cached_state")
+            if isinstance(raw_state, str):
+                try:
+                    self._gate._cached_state = MacroState(raw_state)
+                except Exception:
+                    pass
+            mult = gate_state.get("cached_multiplier")
+            if isinstance(mult, (int, float)):
+                self._gate._cached_multiplier = float(mult)
+            score = gate_state.get("cached_score")
+            if isinstance(score, (int, float)):
+                self._gate._cached_score = float(score)
+            comp = gate_state.get("cached_components")
+            if isinstance(comp, dict):
+                self._gate._cached_components = comp
+            lt = gate_state.get("last_daily_ts")
+            if lt:
+                try:
+                    self._gate._last_daily_ts = pd.Timestamp(lt)
+                except Exception:
+                    pass
+            sm = gate_state.get("state_machine")
+            if isinstance(sm, dict):
+                self._gate._gate.restore(sm)
+            ct = gate_state.get("cached_thresholds")
+            if isinstance(ct, dict):
+                self._gate._cached_thresholds = ct
+            vh = gate_state.get("vol_history")
+            if isinstance(vh, list):
+                self._gate._vol_history.clear()
+                for v in vh:
+                    if isinstance(v, (int, float)):
+                        self._gate._vol_history.append(float(v))
+
+        rs = payload.get("rule_switcher")
+        if isinstance(rs, dict):
+            cr = rs.get("confirmed_regime")
+            if isinstance(cr, str):
+                try:
+                    self._rule_switcher._confirmed_regime = RegimeState(cr)
+                except Exception:
+                    pass
+            ca = rs.get("candidate_regime")
+            if isinstance(ca, str):
+                try:
+                    self._rule_switcher._candidate_regime = RegimeState(ca)
+                except Exception:
+                    pass
+            cc = rs.get("candidate_count")
+            if isinstance(cc, int):
+                self._rule_switcher._candidate_count = cc
+            ra = rs.get("regime_age")
+            if isinstance(ra, int):
+                self._rule_switcher._regime_age = ra
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _latest_daily_feature(daily_df: pd.DataFrame, column: str, default: float = 0.0) -> float:
+        """Read latest value of a column from the daily DataFrame."""
+        if daily_df is None or daily_df.empty or column not in daily_df.columns:
+            return float(default)
+        series = pd.to_numeric(daily_df[column], errors="coerce").dropna()
+        if series.empty:
+            return float(default)
+        return float(series.iloc[-1])
 
     @staticmethod
     def _to_timestamp_col(df: pd.DataFrame) -> pd.Series:
@@ -396,10 +507,14 @@ class V5AdaptiveStrategy:
             "macro_score_after_fred": macro_score_after_fred,
             "fred_risk_off_score": fred_risk_off_score,
             "fred_penalty_multiplier": fred_penalty_multiplier,
-            "fred_comp_vix_z": float(macro_components.get("fred_VIXCLS_z_level", np.nan)),
-            "fred_comp_hy_oas_z": float(macro_components.get("fred_BAMLH0A0HYM2_z_level", np.nan)),
-            "fred_comp_stlfsi_z": float(macro_components.get("fred_STLFSI4_z_level", np.nan)),
-            "fred_comp_nfci_z": float(macro_components.get("fred_NFCI_z_level", np.nan)),
+            "fred_comp_vix_z": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_z_level", default=np.nan)),
+            "fred_comp_hy_oas_z": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_z_level", default=np.nan)),
+            "fred_comp_stlfsi_z": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_z_level", default=np.nan)),
+            "fred_comp_nfci_z": float(self._latest_daily_feature(daily_closed, "fred_NFCI_z_level", default=np.nan)),
+            "fred_vix_level": float(self._latest_daily_feature(daily_closed, "fred_VIXCLS_level", default=np.nan)),
+            "fred_hy_oas_level": float(self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_level", default=np.nan)),
+            "fred_stlfsi_level": float(self._latest_daily_feature(daily_closed, "fred_STLFSI4_level", default=np.nan)),
+            "fred_nfci_level": float(self._latest_daily_feature(daily_closed, "fred_NFCI_level", default=np.nan)),
             "macro_state": macro_state.value,
             "macro_multiplier": macro_mult,
             "macro_mult": macro_mult,
