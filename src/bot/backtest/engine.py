@@ -165,111 +165,6 @@ class BacktestEngine:
             start_i,
         )
 
-        # Precompute heavy regime inputs once so the backtest loop is O(n),
-        # not O(n^2) from repeatedly recomputing rolling features.
-        acc_ctx = resolve_acceleration_backend(getattr(cfg, "acceleration_backend", "auto"))
-        acc_backend = "cpu"
-        if (
-            acc_ctx.backend == "cuda"
-            and len(hourly) >= int(getattr(cfg, "acceleration_min_bars", 2048) or 2048)
-        ):
-            acc_backend = "cuda"
-
-        hourly_returns = hourly["close"].pct_change()
-        vol_lookback_hours = max(24, reg_cfg.vol_lookback_days * 24)
-        vol_min_periods = max(30, vol_lookback_hours // 4)
-
-        realized_vol = indicators.realized_vol(
-            hourly_returns,
-            reg_cfg.realized_vol_window,
-            backend=acc_backend,
-        )
-        hourly_precomputed: dict[str, Any] = {
-            "realized_vol": realized_vol,
-            "adx": compute_adx(
-                hourly["high"],
-                hourly["low"],
-                hourly["close"],
-                window=reg_cfg.adx_window,
-                backend=acc_backend,
-            ),
-            "chop": compute_chop(
-                hourly["high"],
-                hourly["low"],
-                hourly["close"],
-                window=reg_cfg.chop_window,
-                backend=acc_backend,
-            ),
-            "vol_thresholds": realized_vol.rolling(vol_lookback_hours, min_periods=vol_min_periods).quantile(
-                reg_cfg.vol_high_threshold_quantile
-            ),
-            "acceleration_backend": acc_backend,
-            "acceleration_requested": getattr(cfg, "acceleration_backend", "auto"),
-            "acceleration_cuda_available": int(acc_ctx.cuda_available),
-            "acceleration_device": acc_ctx.device_name,
-            "acceleration_fallback_reason": acc_ctx.reason,
-        }
-
-        # Precompute sub-strategy indicators for O(1) per-bar lookups.
-        _donchian_low, _donchian_high = donchian_channel(
-            hourly["high"],
-            hourly["low"],
-            reg_cfg.donchian_window,
-            backend=acc_backend,
-        )
-        hourly_precomputed["donchian_high"] = _donchian_high
-        hourly_precomputed["donchian_low"] = _donchian_low
-        hourly_precomputed["atr"] = compute_atr(
-            hourly["high"],
-            hourly["low"],
-            hourly["close"],
-            reg_cfg.atr_window,
-            backend=acc_backend,
-        )
-        hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast, backend=acc_backend)
-        hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow, backend=acc_backend)
-        _bb_mid, _bb_upper, _bb_lower = bollinger_bands(
-            hourly["close"],
-            reg_cfg.bb_window,
-            reg_cfg.bb_stdev,
-            backend=acc_backend,
-        )
-        hourly_precomputed["bb_mid"] = _bb_mid
-        hourly_precomputed["bb_upper"] = _bb_upper
-        hourly_precomputed["bb_lower"] = _bb_lower
-
-        if reg_cfg.hmm_regime_enabled:
-            hourly_precomputed["hmm_features"] = (
-                pd.concat(
-                    [
-                        hourly["close"].pct_change().fillna(0.0),
-                        hourly["high"].pct_change().fillna(0.0),
-                        hourly["low"].pct_change().fillna(0.0),
-                        hourly["volume"].pct_change().fillna(0.0),
-                        hourly_precomputed["realized_vol"].fillna(0.0),
-                    ],
-                    axis=1,
-                )
-                .rename(
-                    columns={
-                        0: "close_chg",
-                        1: "high_chg",
-                        2: "low_chg",
-                        3: "volume_chg",
-                        4: "realized_vol",
-                    }
-                )
-            )
-
-        logger.info(
-            "engine_acceleration requested=%s effective=%s cuda_available=%s device=%s fallback_reason=%s",
-            hourly_precomputed.get("acceleration_requested"),
-            hourly_precomputed.get("acceleration_backend"),
-            hourly_precomputed.get("acceleration_cuda_available"),
-            hourly_precomputed.get("acceleration_device"),
-            hourly_precomputed.get("acceleration_fallback_reason"),
-        )
-
         strategy_id = cfg.strategy if cfg.strategy else "macro_gate_benchmark"
         if strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
@@ -288,6 +183,134 @@ class BacktestEngine:
             raise ValueError(f"Unsupported strategy '{strategy_id}'. Supported: [{valid}]")
 
         logger.info("engine_strategy_selected strategy_id=%s orchestrator=%s", strategy_id, orchestrator.__class__.__name__)
+
+        # Precompute regime inputs once so per-bar decision logic stays O(n).
+        # Prefer strategy-provided precompute hooks to avoid unnecessary work.
+        acc_ctx = resolve_acceleration_backend(getattr(cfg, "acceleration_backend", "auto"))
+        acc_backend = "cpu"
+        if (
+            acc_ctx.backend == "cuda"
+            and len(hourly) >= int(getattr(cfg, "acceleration_min_bars", 2048) or 2048)
+        ):
+            acc_backend = "cuda"
+
+        hourly_precomputed: dict[str, Any] = {
+            "acceleration_backend": acc_backend,
+            "acceleration_requested": getattr(cfg, "acceleration_backend", "auto"),
+            "acceleration_cuda_available": int(acc_ctx.cuda_available),
+            "acceleration_device": acc_ctx.device_name,
+            "acceleration_fallback_reason": acc_ctx.reason,
+        }
+
+        precompute_fn = getattr(orchestrator.__class__, "get_precomputed_features", None)
+        if callable(precompute_fn):
+            try:
+                extra = precompute_fn(hourly, reg_cfg, backend=acc_backend)
+                if isinstance(extra, dict):
+                    hourly_precomputed.update(extra)
+            except Exception as exc:
+                logger.warning(
+                    "engine_precompute_hook_failed strategy=%s orchestrator=%s err=%s",
+                    strategy_id,
+                    orchestrator.__class__.__name__,
+                    exc,
+                )
+
+        # Legacy orchestrator sub-strategies depend on these series to avoid
+        # expensive per-bar indicator recomputation.
+        if strategy_id in {"macro_gate_state", "regime_switching_orchestrator"}:
+            if "donchian_high" not in hourly_precomputed or "donchian_low" not in hourly_precomputed:
+                _donchian_low, _donchian_high = donchian_channel(
+                    hourly["high"],
+                    hourly["low"],
+                    reg_cfg.donchian_window,
+                    backend=acc_backend,
+                )
+                hourly_precomputed.setdefault("donchian_high", _donchian_high)
+                hourly_precomputed.setdefault("donchian_low", _donchian_low)
+
+            if "atr" not in hourly_precomputed:
+                hourly_precomputed["atr"] = compute_atr(
+                    hourly["high"],
+                    hourly["low"],
+                    hourly["close"],
+                    reg_cfg.atr_window,
+                    backend=acc_backend,
+                )
+
+            if "ema_fast" not in hourly_precomputed:
+                hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast, backend=acc_backend)
+            if "ema_slow" not in hourly_precomputed:
+                hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow, backend=acc_backend)
+
+            if not {"bb_mid", "bb_upper", "bb_lower"}.issubset(hourly_precomputed.keys()):
+                _bb_mid, _bb_upper, _bb_lower = bollinger_bands(
+                    hourly["close"],
+                    reg_cfg.bb_window,
+                    reg_cfg.bb_stdev,
+                    backend=acc_backend,
+                )
+                hourly_precomputed.setdefault("bb_mid", _bb_mid)
+                hourly_precomputed.setdefault("bb_upper", _bb_upper)
+                hourly_precomputed.setdefault("bb_lower", _bb_lower)
+
+            if reg_cfg.hmm_regime_enabled and "hmm_features" not in hourly_precomputed:
+                rv_seed = hourly_precomputed.get("realized_vol")
+                if not isinstance(rv_seed, pd.Series):
+                    rv_seed = indicators.realized_vol(
+                        hourly["close"].pct_change(),
+                        reg_cfg.realized_vol_window,
+                        backend=acc_backend,
+                    )
+                    hourly_precomputed["realized_vol"] = rv_seed
+                hourly_precomputed["hmm_features"] = (
+                    pd.concat(
+                        [
+                            hourly["close"].pct_change().fillna(0.0),
+                            hourly["high"].pct_change().fillna(0.0),
+                            hourly["low"].pct_change().fillna(0.0),
+                            hourly["volume"].pct_change().fillna(0.0),
+                            rv_seed.fillna(0.0),
+                        ],
+                        axis=1,
+                    )
+                    .rename(
+                        columns={
+                            0: "close_chg",
+                            1: "high_chg",
+                            2: "low_chg",
+                            3: "volume_chg",
+                            4: "realized_vol",
+                        }
+                    )
+                )
+
+        # Compatibility guards for any path that expects realized_vol/vol_thresholds.
+        if not isinstance(hourly_precomputed.get("realized_vol"), pd.Series):
+            hourly_returns = hourly["close"].pct_change()
+            hourly_precomputed["realized_vol"] = indicators.realized_vol(
+                hourly_returns,
+                reg_cfg.realized_vol_window,
+                backend=acc_backend,
+            )
+
+        if "vol_thresholds" not in hourly_precomputed:
+            vol_lookback_hours = max(24, reg_cfg.vol_lookback_days * 24)
+            vol_min_periods = max(30, vol_lookback_hours // 4)
+            hourly_precomputed["vol_thresholds"] = hourly_precomputed["realized_vol"].rolling(
+                vol_lookback_hours,
+                min_periods=vol_min_periods,
+            ).quantile(reg_cfg.vol_high_threshold_quantile)
+
+        logger.info(
+            "engine_acceleration requested=%s effective=%s cuda_available=%s device=%s fallback_reason=%s precomputed_keys=%s",
+            hourly_precomputed.get("acceleration_requested"),
+            hourly_precomputed.get("acceleration_backend"),
+            hourly_precomputed.get("acceleration_cuda_available"),
+            hourly_precomputed.get("acceleration_device"),
+            hourly_precomputed.get("acceleration_fallback_reason"),
+            sorted(hourly_precomputed.keys()),
+        )
 
         risk_mgr = RiskManager(risk_cfg)
         risk_state = RiskState(equity_peak=cfg.initial_equity, current_equity=cfg.initial_equity)

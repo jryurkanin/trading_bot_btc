@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -133,11 +134,18 @@ def _normalize_windows(windows: list[Any]) -> list[dict[str, str]]:
     return normalized
 
 
-def build_checkpoint_fingerprint(strategy: str, param_sets: list[dict[str, Any]], windows: list[Any]) -> dict[str, str]:
+def build_checkpoint_fingerprint(
+    strategy: str,
+    param_sets: list[dict[str, Any]],
+    windows: list[Any],
+    scenarios: list[Any] | None = None,
+) -> dict[str, str]:
+    scenario_names = [str(getattr(s, "name", s)) for s in (scenarios or [])]
     return {
         "strategy": str(strategy),
         "grid_hash": stable_hash(param_sets),
         "window_hash": stable_hash(_normalize_windows(windows)),
+        "scenario_hash": stable_hash(sorted(scenario_names)),
     }
 
 
@@ -146,7 +154,8 @@ def checkpoint_fingerprint_mismatches(
     expected_fingerprint: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
     mismatches: dict[str, dict[str, Any]] = {}
-    for key in ("strategy", "grid_hash", "window_hash"):
+    keys = sorted({"strategy", "grid_hash", "window_hash"} | set(expected_fingerprint.keys()))
+    for key in keys:
         expected = expected_fingerprint.get(key)
         observed = checkpoint_payload.get(key)
         if observed is None:
@@ -185,4 +194,68 @@ def build_filter_rejections_payload(
         "total_param_sets": int(total_param_sets),
         "accepted_param_sets": accepted,
         "rejections": rejections,
+    }
+
+def cap_param_sets(
+    param_sets: list[dict[str, Any]],
+    max_param_sets: int | None,
+    *,
+    seed: int = 42,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Deterministically cap a parameter grid while preserving coverage.
+
+    The sampler keeps boundary combinations and ensures each value bucket for
+    each key is represented at least once before filling the remaining budget
+    with a seeded random sample.
+    """
+
+    total = len(param_sets)
+    budget = int(max_param_sets or 0)
+    if budget <= 0 or total <= budget:
+        return list(param_sets), {
+            "seed": int(seed),
+            "original_count": int(total),
+            "sampled_count": int(total),
+            "dropped_count": 0,
+            "sampled": False,
+            "selected_indices": list(range(total)),
+        }
+
+    rng = random.Random(int(seed))
+    selected: set[int] = set()
+
+    # Keep deterministic boundary points.
+    selected.add(0)
+    selected.add(total - 1)
+
+    # Preserve value-coverage per key.
+    keys = sorted({str(k) for params in param_sets for k in params.keys()})
+    for key in keys:
+        buckets: dict[str, list[int]] = {}
+        for idx, params in enumerate(param_sets):
+            raw = params.get(key)
+            bucket_key = json.dumps(raw, sort_keys=True, default=str)
+            buckets.setdefault(bucket_key, []).append(idx)
+        for bucket_indices in buckets.values():
+            if len(selected) >= budget:
+                break
+            selected.add(rng.choice(bucket_indices))
+        if len(selected) >= budget:
+            break
+
+    if len(selected) < budget:
+        remaining = [idx for idx in range(total) if idx not in selected]
+        rng.shuffle(remaining)
+        selected.update(remaining[: max(0, budget - len(selected))])
+
+    selected_indices = sorted(selected)[:budget]
+    sampled = [param_sets[idx] for idx in selected_indices]
+
+    return sampled, {
+        "seed": int(seed),
+        "original_count": int(total),
+        "sampled_count": int(len(sampled)),
+        "dropped_count": int(total - len(sampled)),
+        "sampled": True,
+        "selected_indices": selected_indices,
     }

@@ -102,6 +102,14 @@ class RegimeSwitchingOrchestrator:
         # on every hourly bar when the daily bar hasn't changed.
         self._daily_cache: dict[str, Any] = {}
 
+        # Closed-daily slice cache keyed by UTC day to avoid per-bar dataframe copies.
+        self._daily_ts_cache: dict[int, pd.DataFrame] = {}
+        self._daily_last_ts_cache: dict[int, pd.Timestamp | None] = {}
+        self._daily_index_cache_sig: tuple[int, int] | None = None
+        self._daily_index_values: np.ndarray | None = None
+
+        self._acceleration_backend: str = str(getattr(cfg, "acceleration_backend", "cpu") or "cpu")
+
         self._last_logged_day: pd.Timestamp | None = None
         self._last_logged_macro_state: str | None = None
         self._last_logged_micro_regime: RegimeState | None = None
@@ -118,6 +126,10 @@ class RegimeSwitchingOrchestrator:
         self._boost_off_streak = 0
         self._boost_last_daily_ts = None
         self._daily_cache = {}
+        self._daily_ts_cache = {}
+        self._daily_last_ts_cache = {}
+        self._daily_index_cache_sig = None
+        self._daily_index_values = None
         self._last_logged_day = None
         self._last_logged_macro_state = None
         self._last_logged_micro_regime = None
@@ -157,36 +169,77 @@ class RegimeSwitchingOrchestrator:
             return ts
         return pd.to_datetime(df.index, utc=True)
 
-    def _closed_daily(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
+    @staticmethod
+    def _day_cache_key(decision_ts: pd.Timestamp) -> int:
+        ts = pd.Timestamp(decision_ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.floor("D").value)
+
+    def _ensure_daily_index_cache(self, daily_df: pd.DataFrame) -> None:
+        if daily_df is None or daily_df.empty:
+            self._daily_index_cache_sig = None
+            self._daily_index_values = None
+            return
+
+        ts = self._to_timestamp_col(daily_df)
+        if len(ts):
+            ts_last = ts.iloc[-1] if isinstance(ts, pd.Series) else ts[-1]
+            last_val = int(pd.Timestamp(ts_last).value)
+        else:
+            last_val = 0
+        sig = (int(len(daily_df)), last_val)
+        if self._daily_index_cache_sig == sig and self._daily_index_values is not None:
+            return
+
+        self._daily_index_values = ts.to_numpy(dtype="datetime64[ns]")
+        self._daily_index_cache_sig = sig
+        self._daily_ts_cache.clear()
+        self._daily_last_ts_cache.clear()
+
+    def _closed_daily_cached(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.DataFrame:
         if daily_df is None or daily_df.empty:
             return pd.DataFrame(columns=daily_df.columns if daily_df is not None else [])
 
-        d = daily_df.copy()
-        d["__ts"] = self._to_timestamp_col(d)
+        self._ensure_daily_index_cache(daily_df)
+        key = self._day_cache_key(decision_ts)
+        if key in self._daily_ts_cache:
+            return self._daily_ts_cache[key]
+
         cutoff = pd.Timestamp(decision_ts)
         if cutoff.tzinfo is None:
             cutoff = cutoff.tz_localize("UTC")
         else:
             cutoff = cutoff.tz_convert("UTC")
 
-        # Daily bars are treated as period-start timestamps; only use fully closed bars.
         closed_cutoff = cutoff.floor("D")
-        d = d[d["__ts"] < closed_cutoff].sort_values("__ts")
-        return d.drop(columns=["__ts"]) if not d.empty else d.drop(columns=["__ts"])
-
-    def _latest_daily_ts(self, daily_df: pd.DataFrame) -> pd.Timestamp | None:
-        if daily_df is None or daily_df.empty:
-            return None
-        ts = self._to_timestamp_col(daily_df)
-        if isinstance(ts, pd.Series):
-            if ts.empty:
-                return None
-            ts_last = ts.iloc[-1]
+        idx_vals = self._daily_index_values
+        if idx_vals is None:
+            d = pd.DataFrame(columns=daily_df.columns)
         else:
-            if len(ts) == 0:
-                return None
-            ts_last = ts[-1]
-        return pd.to_datetime(ts_last, utc=True)
+            pos = int(np.searchsorted(idx_vals, closed_cutoff.to_numpy(), side="left"))
+            d = daily_df.iloc[:pos]
+
+        self._daily_ts_cache[key] = d
+        return d
+
+    def _latest_daily_ts_cached(self, daily_df: pd.DataFrame, decision_ts: pd.Timestamp) -> pd.Timestamp | None:
+        key = self._day_cache_key(decision_ts)
+        if key in self._daily_last_ts_cache:
+            return self._daily_last_ts_cache[key]
+
+        closed = self._closed_daily_cached(daily_df, decision_ts)
+        if closed.empty:
+            self._daily_last_ts_cache[key] = None
+            return None
+
+        ts = self._to_timestamp_col(closed)
+        ts_last = ts.iloc[-1] if isinstance(ts, pd.Series) else ts[-1]
+        last = pd.to_datetime(ts_last, utc=True)
+        self._daily_last_ts_cache[key] = last
+        return last
 
     def _macro_risk_binary(self, daily_df: pd.DataFrame) -> Tuple[bool, str]:
         if len(daily_df) < max(self.cfg.daily_trend_window, self.cfg.daily_momentum_window + 1):
@@ -207,7 +260,7 @@ class RegimeSwitchingOrchestrator:
         return True, "risk_on"
 
     def _realized_vol(self, hourly: pd.DataFrame) -> pd.Series:
-        return indicators.realized_vol(hourly["close"].pct_change(), self.cfg.realized_vol_window)
+        return indicators.realized_vol(hourly["close"].pct_change(), self.cfg.realized_vol_window, backend=self._acceleration_backend)
 
     def _core_momentum_ratio(self, daily_df: pd.DataFrame) -> float:
         if len(daily_df) < max(self.cfg.daily_trend_window, self.cfg.daily_momentum_window + 1):
@@ -239,23 +292,24 @@ class RegimeSwitchingOrchestrator:
         adx = precomputed.get("adx") if precomputed else None
         chop = precomputed.get("chop") if precomputed else None
         rv = precomputed.get("realized_vol") if precomputed else None
+        backend = str((precomputed or {}).get("acceleration_backend", self._acceleration_backend or "cpu"))
 
         if isinstance(adx, pd.Series) and len(adx) > idx:
             adx_val = adx.iloc[idx]
         else:
-            adx_series = compute_adx(hourly["high"], hourly["low"], hourly["close"], self.cfg.adx_window)
+            adx_series = compute_adx(hourly["high"], hourly["low"], hourly["close"], self.cfg.adx_window, backend=backend)
             adx_val = adx_series.iloc[idx]
 
         if isinstance(chop, pd.Series) and len(chop) > idx:
             chop_val = chop.iloc[idx]
         else:
-            chop_series = compute_chop(hourly["high"], hourly["low"], hourly["close"], self.cfg.chop_window)
+            chop_series = compute_chop(hourly["high"], hourly["low"], hourly["close"], self.cfg.chop_window, backend=backend)
             chop_val = chop_series.iloc[idx]
 
         if isinstance(rv, pd.Series) and len(rv) > idx:
             rv_series = rv
         else:
-            rv_series = self._realized_vol(hourly)
+            rv_series = indicators.realized_vol(hourly["close"].pct_change(), self.cfg.realized_vol_window, backend=backend)
 
         if self.cfg.hmm_regime_enabled and len(hourly) >= self.cfg.hmm_window_hours:
             start = max(0, idx - self.cfg.hmm_window_hours + 1)
@@ -412,6 +466,45 @@ class RegimeSwitchingOrchestrator:
         mult = 1.0 if binary_on else 0.0
         return state, mult, bool(binary_on), "risk_on" if binary_on else "macro_off"
 
+    @staticmethod
+    def get_precomputed_features(
+        hourly_df: pd.DataFrame,
+        cfg: RegimeConfig,
+        *,
+        backend: str = "cpu",
+    ) -> dict[str, Any]:
+        if hourly_df is None or hourly_df.empty:
+            return {}
+
+        high = hourly_df["high"].astype(float)
+        low = hourly_df["low"].astype(float)
+        close = hourly_df["close"].astype(float)
+
+        adx = compute_adx(high, low, close, window=cfg.adx_window, backend=backend)
+        chop = compute_chop(high, low, close, window=cfg.chop_window, backend=backend)
+        realized_vol = indicators.realized_vol(close.pct_change(), int(cfg.realized_vol_window), backend=backend)
+
+        lookback = max(24, int(cfg.vol_lookback_days) * 24)
+        min_periods = max(30, lookback // 4)
+        vol_thresholds = realized_vol.rolling(lookback, min_periods=min_periods).quantile(cfg.vol_high_threshold_quantile)
+
+        hmm_features = pd.concat(
+            [
+                hourly_df[["close", "high", "low", "volume"]].pct_change().fillna(0),
+                realized_vol,
+            ],
+            axis=1,
+        ).fillna(0)
+
+        return {
+            "adx": adx,
+            "chop": chop,
+            "realized_vol": realized_vol,
+            "vol_thresholds": vol_thresholds,
+            "hmm_features": hmm_features,
+            "acceleration_backend": backend,
+        }
+
     def compute_target_position(
         self,
         timestamp: pd.Timestamp,
@@ -439,6 +532,11 @@ class RegimeSwitchingOrchestrator:
         if hourly_idx is None:
             hourly_idx = len(hourly_df) - 1
         hourly_idx = max(0, min(int(hourly_idx), len(hourly_df) - 1))
+
+        if micro_precomputed is not None:
+            backend_hint = micro_precomputed.get("acceleration_backend")
+            if isinstance(backend_hint, str) and backend_hint:
+                self._acceleration_backend = backend_hint
 
         # Fast path: reuse cached daily-derived results when the signal
         # timestamp falls on the same calendar day.  All daily outputs
@@ -470,8 +568,8 @@ class RegimeSwitchingOrchestrator:
             macro_reason = _dc["macro_reason"]
         else:
             # Day changed — recompute everything and store.
-            daily_closed = self._closed_daily(daily_df, timestamp)
-            daily_bar_ts = self._latest_daily_ts(daily_closed)
+            daily_closed = self._closed_daily_cached(daily_df, _ts_floor)
+            daily_bar_ts = self._latest_daily_ts_cached(daily_df, _ts_floor)
 
             macro = macro_result(daily_closed, self.cfg)
             macro_score = float(macro.score)

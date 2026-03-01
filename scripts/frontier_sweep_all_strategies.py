@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import os
 import statistics
 import subprocess
@@ -35,6 +36,17 @@ RUNNERS: dict[str, StrategyRunner] = {
     "regime_switching_v4_core": ("frontier_sweep_core.py", "regime_switching_v4_core"),
     "regime_switching_orchestrator": ("frontier_sweep_v3.py", "regime_switching_orchestrator"),
     "macro_gate_state": ("frontier_sweep_v3.py", "macro_gate_state"),
+}
+
+# Strategy-level caps that keep full multi-strategy sweeps within a practical 24h budget
+# on a single machine while preserving broad parameter-space coverage.
+DEFAULT_FAST_24H_MAX_PARAM_SETS: dict[str, int] = {
+    "macro_gate_benchmark": 600,
+    "macro_gate_state": 1200,
+    "regime_switching_orchestrator": 1200,
+    "regime_switching_v4_core": 900,
+    "v5_adaptive": 900,
+    "macro_only_v2": 800,
 }
 
 logger = get_system_logger("scripts.frontier_sweep_all_strategies")
@@ -100,6 +112,39 @@ def parse_args() -> argparse.Namespace:
         default="vs_benchmark",
         help="How to choose best strategy across runs",
     )
+    p.add_argument(
+        "--fast-24h",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable 24h-oriented sweep defaults (reduced windows/scenarios + strategy caps)",
+    )
+    p.add_argument(
+        "--max-param-sets",
+        type=int,
+        default=0,
+        help="Global max param sets per strategy (0=disabled; strategy overrides still apply)",
+    )
+    p.add_argument(
+        "--strategy-max-param-sets",
+        default="",
+        help="Comma-separated per-strategy cap overrides, e.g. macro_gate_state=1500,v5_adaptive=1200",
+    )
+    p.add_argument(
+        "--search-seed",
+        type=int,
+        default=42,
+        help="Deterministic seed for capped-grid sampling",
+    )
+    p.add_argument(
+        "--optimize-windows",
+        default=None,
+        help="Comma-separated windows passed to sweeps (default under --fast-24h: val,test)",
+    )
+    p.add_argument(
+        "--optimize-scenarios",
+        default=None,
+        help="Comma-separated scenarios passed to sweeps (default under --fast-24h: baseline,stress_1)",
+    )
     return p.parse_args()
 
 
@@ -162,6 +207,53 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _parse_strategy_cap_overrides(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for chunk in [c.strip() for c in str(raw or "").split(",") if c.strip()]:
+        if "=" in chunk:
+            key, val = chunk.split("=", 1)
+        elif ":" in chunk:
+            key, val = chunk.split(":", 1)
+        else:
+            continue
+        key = key.strip()
+        if key not in RUNNERS:
+            continue
+        try:
+            parsed = int(val.strip())
+        except ValueError:
+            continue
+        if parsed > 0:
+            out[key] = parsed
+    return out
+
+
+def _resolve_effective_windows(args: argparse.Namespace) -> str:
+    if args.optimize_windows:
+        return str(args.optimize_windows)
+    return "val,test" if bool(args.fast_24h) else "train,val,test"
+
+
+def _resolve_effective_scenarios(args: argparse.Namespace) -> str:
+    if args.optimize_scenarios:
+        return str(args.optimize_scenarios)
+    return "baseline,stress_1" if bool(args.fast_24h) else "baseline,stress_1,stress_2"
+
+
+def _resolve_strategy_max_param_sets(
+    args: argparse.Namespace,
+    strategy: str,
+    overrides: dict[str, int],
+) -> int:
+    if strategy in overrides:
+        return int(overrides[strategy])
+    if int(args.max_param_sets or 0) > 0:
+        return int(args.max_param_sets)
+    if bool(args.fast_24h):
+        return int(DEFAULT_FAST_24H_MAX_PARAM_SETS.get(strategy, 0) or 0)
+    return 0
+
+
 def _build_base_args(args: argparse.Namespace) -> list[str]:
     base_args = [
         "--product",
@@ -201,6 +293,15 @@ def _build_base_args(args: argparse.Namespace) -> list[str]:
     if args.grid:
         for raw in args.grid:
             base_args.extend(["--grid", raw])
+
+    effective_windows = _resolve_effective_windows(args)
+    effective_scenarios = _resolve_effective_scenarios(args)
+    if effective_windows:
+        base_args.extend(["--optimize-windows", effective_windows])
+    if effective_scenarios:
+        base_args.extend(["--optimize-scenarios", effective_scenarios])
+    base_args.extend(["--search-seed", str(int(args.search_seed))])
+
     return base_args
 
 
@@ -243,6 +344,7 @@ def _build_strategy_command(
     baseline_args: list[str],
     strategy_dir: Path,
     run_id: str,
+    max_param_sets: int,
 ) -> tuple[list[str], str]:
     script_name, _default_tag = RUNNERS[strategy]
     args_for_strategy = baseline_args.copy()
@@ -254,6 +356,8 @@ def _build_strategy_command(
         "--checkpoint-every",
         str(args.checkpoint_every),
     ])
+    if int(max_param_sets) > 0:
+        args_for_strategy.extend(["--max-param-sets", str(int(max_param_sets))])
     if args.resume:
         args_for_strategy.append("--resume")
 
@@ -665,6 +769,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     selected = deduped
 
     strategy_workers = _resolve_strategy_workers(args, len(selected))
+    strategy_cap_overrides = _parse_strategy_cap_overrides(args.strategy_max_param_sets)
 
     _write_progress(
         progress_path,
@@ -675,6 +780,10 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
             "strategies": selected,
             "args": vars(args),
             "strategy_workers": strategy_workers,
+            "effective_optimize_windows": _resolve_effective_windows(args),
+            "effective_optimize_scenarios": _resolve_effective_scenarios(args),
+            "strategy_cap_overrides": strategy_cap_overrides,
+            "fast_24h": bool(args.fast_24h),
         },
     )
 
@@ -687,12 +796,19 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
         strategy_base_dir.mkdir(parents=True, exist_ok=True)
         strategy_run_dir = strategy_base_dir / run_id
 
+        strategy_max_param_sets = _resolve_strategy_max_param_sets(
+            args=args,
+            strategy=strategy,
+            overrides=strategy_cap_overrides,
+        )
+
         cmd, script_name = _build_strategy_command(
             args=args,
             strategy=strategy,
             baseline_args=baseline_args,
             strategy_dir=strategy_base_dir,
             run_id=run_id,
+            max_param_sets=strategy_max_param_sets,
         )
         command = " ".join(cmd)
 
@@ -705,6 +821,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 "strategy_base_dir": strategy_base_dir,
                 "cmd": cmd,
                 "command": command,
+                "max_param_sets": int(strategy_max_param_sets),
             }
         )
 
@@ -717,6 +834,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 "strategy_index": index,
                 "command": command,
                 "output_dir": str(strategy_run_dir),
+                "max_param_sets": int(strategy_max_param_sets),
             },
         )
 
@@ -752,6 +870,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                     "total_rows": result.get("total_rows", 0),
                     "error_rate": result.get("error_rate", 0.0),
                     "summary": {"available": result["summary"] is not None},
+                    "max_param_sets": int(job.get("max_param_sets", 0) or 0),
                 },
             )
     else:
@@ -790,6 +909,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                         "total_rows": result.get("total_rows", 0),
                         "error_rate": result.get("error_rate", 0.0),
                         "summary": {"available": result["summary"] is not None},
+                    "max_param_sets": int(job.get("max_param_sets", 0) or 0),
                     },
                 )
 
@@ -1036,7 +1156,10 @@ def _summarize(
 
 def main() -> int:
     args = parse_args()
-    log_path = setup_system_logger()
+    try:
+        log_path = setup_system_logger(level=logging.INFO)
+    except TypeError:
+        log_path = setup_system_logger()
     logger.info("frontier_all_start log_path=%s args=%s", log_path, vars(args))
 
     if not ACTIVE_STRATEGIES:
