@@ -105,6 +105,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trend-boost-sma50-slope-lookback-days", type=int, default=None)
 
 
+    # --- Statistical analysis features ---
+    p.add_argument("--monte-carlo", action="store_true", help="Run Monte Carlo simulation on equity curve")
+    p.add_argument("--mc-simulations", type=int, default=1000)
+    p.add_argument("--mc-seed", type=int, default=42)
+
+    p.add_argument("--sharpe-bootstrap", action="store_true", help="Compute bootstrap Sharpe ratio CIs")
+    p.add_argument("--sharpe-n-bootstrap", type=int, default=10_000)
+    p.add_argument("--sharpe-seed", type=int, default=42)
+
+    p.add_argument("--cost-sensitivity", action="store_true", help="Run transaction cost sensitivity sweep")
+    p.add_argument("--cs-multiplier-max", type=float, default=3.0)
+    p.add_argument("--cs-steps", type=int, default=20)
+
+    p.add_argument("--cpcv", action="store_true", help="Run combinatorial purged cross-validation")
+    p.add_argument("--cpcv-n-groups", type=int, default=6)
+    p.add_argument("--cpcv-n-test-groups", type=int, default=2)
+    p.add_argument("--cpcv-purge-bars", type=int, default=24)
+    p.add_argument("--cpcv-embargo-bars", type=int, default=12)
+
     p.add_argument("--ci-mode", action="store_true")
     p.add_argument("--no-spread", action="store_true")
     p.add_argument("--output", default="reports")
@@ -454,6 +473,94 @@ def main() -> int:
             "mom_12m_days": cfg.regime.mom_12m_days,
         },
     }
+    # --- Optional statistical analysis features ---
+    if args.sharpe_bootstrap:
+        from bot.backtest.metrics import bootstrap_sharpe_confidence, _to_returns
+        eq_series = result.equity_curve["equity"] if "equity" in result.equity_curve.columns else result.equity_curve.iloc[:, 0]
+        ret = _to_returns(eq_series)
+        sb = bootstrap_sharpe_confidence(
+            ret, n_bootstrap=args.sharpe_n_bootstrap, seed=args.sharpe_seed,
+        )
+        report["sharpe_confidence"] = {
+            "point_estimate": sb.point_estimate,
+            "confidence_intervals": sb.confidence_intervals,
+            "bootstrap_mean": sb.bootstrap_mean,
+            "bootstrap_std": sb.bootstrap_std,
+            "p_value_sharpe_leq_0": sb.p_value_sharpe_leq_0,
+            "hac_std_error": sb.hac_std_error,
+            "hac_confidence_intervals": sb.hac_confidence_intervals,
+            "n_simulations": sb.n_simulations,
+            "block_length_used": sb.block_length_used,
+        }
+        logger.info("sharpe_bootstrap_complete p_value=%.4f", sb.p_value_sharpe_leq_0)
+
+    if args.monte_carlo:
+        from bot.backtest.monte_carlo import run_monte_carlo, MonteCarloConfig
+        eq_series = result.equity_curve["equity"] if "equity" in result.equity_curve.columns else result.equity_curve.iloc[:, 0]
+        mc = run_monte_carlo(eq_series, MonteCarloConfig(
+            n_simulations=args.mc_simulations, seed=args.mc_seed,
+        ))
+        report["monte_carlo"] = {
+            "percentile_labels": mc.percentile_labels,
+            "cagr": mc.cagr,
+            "sharpe": mc.sharpe,
+            "sortino": mc.sortino,
+            "max_drawdown": mc.max_drawdown,
+            "terminal_wealth": mc.terminal_wealth,
+            "n_simulations": mc.n_simulations,
+            "block_length_used": mc.block_length_used,
+        }
+        logger.info("monte_carlo_complete n_simulations=%d", mc.n_simulations)
+
+    if args.cost_sensitivity:
+        from bot.backtest.cost_sensitivity import run_cost_sensitivity, CostSensitivityConfig
+        cs = run_cost_sensitivity(hourly, daily, cfg, CostSensitivityConfig(
+            multiplier_max=args.cs_multiplier_max, n_steps=args.cs_steps,
+        ))
+        cs.combined_sweep.to_csv(out / "cost_sensitivity.csv", index=False)
+        report["cost_sensitivity"] = {
+            "breakeven_sharpe_0": cs.breakeven_sharpe_0,
+            "breakeven_sharpe_1": cs.breakeven_sharpe_1,
+            "breakeven_cagr_0": cs.breakeven_cagr_0,
+            "n_points": len(cs.combined_sweep),
+        }
+        logger.info(
+            "cost_sensitivity_complete breakeven_sharpe_0=%.3f breakeven_cagr_0=%s",
+            cs.breakeven_sharpe_0 or 0.0,
+            cs.breakeven_cagr_0,
+        )
+
+    if args.cpcv:
+        from bot.backtest.cpcv import run_cpcv, CPCVConfig
+        cpcv_result = run_cpcv(hourly, daily, cfg, CPCVConfig(
+            n_groups=args.cpcv_n_groups,
+            n_test_groups=args.cpcv_n_test_groups,
+            purge_bars=args.cpcv_purge_bars,
+            embargo_bars=args.cpcv_embargo_bars,
+        ))
+        splits_data = []
+        for s in cpcv_result.splits:
+            splits_data.append({
+                "split_id": s.split_id,
+                "test_group_indices": list(s.test_group_indices),
+                "test_start": str(s.test_start),
+                "test_end": str(s.test_end),
+                "train_bars": s.train_bars,
+                "test_bars": s.test_bars,
+                "purged_bars": s.purged_bars,
+                "embargoed_bars": s.embargoed_bars,
+                **{f"metric_{k}": v for k, v in s.metrics.items()},
+            })
+        pd.DataFrame(splits_data).to_csv(out / "cpcv_splits.csv", index=False)
+        report["cpcv"] = {
+            "n_groups": cpcv_result.n_groups,
+            "n_test_groups": cpcv_result.n_test_groups,
+            "n_paths": cpcv_result.n_paths,
+            "n_completed": cpcv_result.n_completed,
+            "aggregate_metrics": cpcv_result.aggregate_metrics,
+        }
+        logger.info("cpcv_complete n_paths=%d n_completed=%d", cpcv_result.n_paths, cpcv_result.n_completed)
+
     report_path = write_strict_json(out / "report.json", report)
 
     execution_quality = run_pnl_decomposition(

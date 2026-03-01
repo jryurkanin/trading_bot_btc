@@ -169,13 +169,33 @@ def bollinger_bands(
     )
 
 
-def rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=window, min_periods=1).mean()
-    loss = -delta.clip(upper=0).rolling(window=window, min_periods=1).mean()
-    rs = gain / loss.replace(0, np.nan)
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50.0)
+def rsi(series: pd.Series, window: int = 14, *, backend: str = "cpu") -> pd.Series:
+    ctx, xp = _resolve_fast(backend)
+
+    if ctx is None:
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(window=window, min_periods=1).mean()
+        loss = -delta.clip(upper=0).rolling(window=window, min_periods=1).mean()
+        rs = gain / loss.replace(0, np.nan)
+        out = 100 - (100 / (1 + rs))
+        return out.fillna(50.0)
+
+    arr = xp.asarray(series.to_numpy(dtype=float))
+    delta = xp.empty_like(arr)
+    delta[0] = xp.nan
+    delta[1:] = arr[1:] - arr[:-1]
+
+    gain = xp.where(delta > 0, delta, 0.0)
+    loss = xp.where(delta < 0, -delta, 0.0)
+
+    avg_gain = _rolling_mean_xp(gain, int(window), min_periods=1, xp=xp)
+    avg_loss = _rolling_mean_xp(loss, int(window), min_periods=1, xp=xp)
+
+    rs = avg_gain / xp.where(avg_loss != 0, avg_loss, xp.nan)
+    rsi_arr = 100.0 - (100.0 / (1.0 + rs))
+
+    result = pd.Series(to_numpy(rsi_arr, xp), index=series.index)
+    return result.fillna(50.0)
 
 
 def true_range(

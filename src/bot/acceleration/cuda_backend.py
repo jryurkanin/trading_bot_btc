@@ -113,3 +113,85 @@ def to_numpy(arr: Any, xp: Any) -> np.ndarray:
     if xp.__name__ == "cupy":
         return xp.asnumpy(arr)
     return np.asarray(arr)
+
+
+def upload_ohlcv(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray | None,
+    xp: Any,
+) -> tuple[Any, Any, Any, Any | None]:
+    """Upload OHLCV numpy arrays to GPU in one batch.
+
+    Returns (high_gpu, low_gpu, close_gpu, volume_gpu).
+    volume_gpu is None if volume input is None.
+    """
+    h = xp.asarray(high)
+    l = xp.asarray(low)
+    c = xp.asarray(close)
+    v = xp.asarray(volume) if volume is not None else None
+    return h, l, c, v
+
+
+def download_batch(results: dict[str, Any], xp: Any) -> dict[str, np.ndarray]:
+    """Download a dict of GPU arrays to numpy in one batch.
+
+    Stacks all arrays into a single contiguous block, transfers once,
+    then slices back. Falls back to per-array transfer if shapes differ.
+    """
+    if not results:
+        return {}
+
+    if xp.__name__ != "cupy":
+        return {k: np.asarray(v) for k, v in results.items()}
+
+    keys = list(results.keys())
+    arrays = [results[k] for k in keys]
+
+    # Check if all arrays have the same shape for stacked transfer
+    shapes = [a.shape for a in arrays]
+    if len(set(shapes)) == 1:
+        stacked = xp.stack(arrays, axis=0)
+        stacked_np = xp.asnumpy(stacked)
+        return {k: stacked_np[i] for i, k in enumerate(keys)}
+
+    # Fallback: per-array download if shapes differ
+    return {k: xp.asnumpy(v) for k, v in zip(keys, arrays)}
+
+
+def estimate_transfer_overhead_ms(ctx: AccelerationContext) -> float | None:
+    """Benchmark a small GPU round trip to characterize interconnect latency.
+
+    Returns estimated overhead in milliseconds, or None if CUDA unavailable.
+    Typical results:
+    - PCIe x16: 0.1-0.5ms
+    - OCuLink/Thunderbolt: 1-3ms
+    """
+    if ctx.backend != "cuda":
+        return None
+
+    xp = get_array_module(ctx)
+    if xp.__name__ != "cupy":
+        return None
+
+    try:
+        import time
+
+        # Warm up
+        test_data = np.random.randn(32768).astype(np.float32)  # ~128KB
+        gpu = xp.asarray(test_data)
+        _ = xp.asnumpy(gpu)
+
+        # Benchmark 5 round trips
+        times = []
+        for _ in range(5):
+            t0 = time.perf_counter()
+            gpu = xp.asarray(test_data)
+            _ = xp.asnumpy(gpu)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000.0)
+
+        return float(np.median(times))
+    except Exception:
+        return None
