@@ -40,6 +40,7 @@ from bot.backtest.frontier_runtime import (
     build_checkpoint_fingerprint,
     checkpoint_fingerprint_mismatches,
     build_filter_rejections_payload,
+    cap_param_sets,
 )
 
 
@@ -185,6 +186,46 @@ def load_grid(path: str | None, grid_flags: dict[str, list[Any]], small: bool = 
     space = dict(SMALL_GRID_SPACE_V4 if small else DEFAULT_GRID_SPACE_V4)
     space.update(grid_flags)
     return product_grid(space)
+
+
+def resolve_windows(all_windows: list[Window], raw: str) -> list[Window]:
+    names = [chunk.strip().lower() for chunk in str(raw or "").split(",") if chunk.strip()]
+    if not names:
+        return list(all_windows)
+
+    by_name = {w.name.lower(): w for w in all_windows}
+    selected: list[Window] = []
+    seen: set[str] = set()
+    for name in names:
+        if name not in by_name:
+            raise ValueError(f"Unknown window in --optimize-windows: {name}")
+        if name in seen:
+            continue
+        selected.append(by_name[name])
+        seen.add(name)
+    if not selected:
+        raise ValueError("No windows selected")
+    return selected
+
+
+def resolve_scenarios(raw: str) -> list[CostScenario]:
+    names = [chunk.strip().lower() for chunk in str(raw or "").split(",") if chunk.strip()]
+    if not names:
+        return list(SCENARIOS)
+
+    by_name = {s.name.lower(): s for s in SCENARIOS}
+    selected: list[CostScenario] = []
+    seen: set[str] = set()
+    for name in names:
+        if name not in by_name:
+            raise ValueError(f"Unknown scenario in --optimize-scenarios: {name}")
+        if name in seen:
+            continue
+        selected.append(by_name[name])
+        seen.add(name)
+    if not selected:
+        raise ValueError("No scenarios selected")
+    return selected
 
 
 def clone_cfg(cfg: BotConfig) -> BotConfig:
@@ -358,6 +399,10 @@ def parse_args() -> argparse.Namespace:
         "--grid", action="append", default=[], help="Repeatable KEY=v1,v2 override"
     )
     p.add_argument("--small", action="store_true", help="Use reduced grid for quick smoke tests")
+    p.add_argument("--max-param-sets", type=int, default=0, help="Cap evaluated parameter sets (0=no cap)")
+    p.add_argument("--search-seed", type=int, default=42, help="Seed for deterministic capped-grid sampling")
+    p.add_argument("--optimize-windows", default="train,val,test", help="Comma-separated windows to evaluate (e.g., val,test)")
+    p.add_argument("--optimize-scenarios", default="baseline,stress_1,stress_2", help="Comma-separated scenarios to evaluate")
     p.add_argument("--turnover-max", type=float, default=700.0)
     p.add_argument("--max-drawdown-max", type=float, default=0.30)
     p.add_argument("--min-full-time-share", type=float, default=0.05)
@@ -387,7 +432,10 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
-    log_path = setup_system_logger(level=logging.INFO)
+    try:
+        log_path = setup_system_logger(level=logging.INFO)
+    except TypeError:
+        log_path = setup_system_logger()
     logger.info("frontier_v4_core_start log_path=%s args=%s", log_path, vars(args))
 
     if not _validate_acceleration_backend(args.acceleration_backend):
@@ -403,11 +451,13 @@ def main() -> int:
     prefetch_start = _prefetch_start(start, cfg)
     test_end = parse_ts(args.test_end) if args.test_end else end
 
-    windows = [
+    all_windows = [
         Window("train", parse_ts(args.train_start), parse_ts(args.train_end)),
         Window("val", parse_ts(args.val_start), parse_ts(args.val_end)),
         Window("test", parse_ts(args.test_start), test_end),
     ]
+    windows = resolve_windows(all_windows, getattr(args, "optimize_windows", "train,val,test"))
+    selected_scenarios = resolve_scenarios(getattr(args, "optimize_scenarios", "baseline,stress_1,stress_2"))
 
     client = RESTClientWrapper(cfg.coinbase, cfg.data)
     store = CandleStore(cfg.data)
@@ -448,11 +498,29 @@ def main() -> int:
         )
         return 2
 
+    param_sets, sampling_meta = cap_param_sets(
+        param_sets,
+        getattr(args, "max_param_sets", 0),
+        seed=getattr(args, "search_seed", 42),
+    )
+    logger.info(
+        "frontier_v4_core_config param_sets=%d windows=%s scenarios=%s sampled=%s",
+        len(param_sets),
+        [w.name for w in windows],
+        [s.name for s in selected_scenarios],
+        bool(sampling_meta.get("sampled")),
+    )
+    if sampling_meta.get("sampled"):
+        print(
+            f"Grid capped for {TARGET_STRATEGY}: {sampling_meta['sampled_count']}/{sampling_meta['original_count']} "
+            f"parameter sets (seed={sampling_meta['seed']})"
+        )
+
     out_dir, run_token = resolve_run_dir(args.output_dir, args.run_id, args.resume)
     summary_path = out_dir / "summary.csv"
     checkpoint_path = out_dir / "checkpoint.json"
     checkpoint_every = max(1, int(args.checkpoint_every))
-    checkpoint_fingerprint = build_checkpoint_fingerprint(TARGET_STRATEGY, param_sets, windows)
+    checkpoint_fingerprint = build_checkpoint_fingerprint(TARGET_STRATEGY, param_sets, windows, selected_scenarios)
 
     checkpoint: dict[str, Any] = load_checkpoint(checkpoint_path) if args.resume else {}
     if args.resume and checkpoint:
@@ -493,7 +561,7 @@ def main() -> int:
         if not processed_param_ids:
             processed_param_ids = derive_processed_param_ids(
                 summary_rows,
-                expected_rows_per_param=len(windows) * len(SCENARIOS),
+                expected_rows_per_param=len(windows) * len(selected_scenarios),
             )
 
     if args.resume and processed_param_ids:
@@ -513,11 +581,15 @@ def main() -> int:
                 "strategy": TARGET_STRATEGY,
                 "grid_hash": checkpoint_fingerprint["grid_hash"],
                 "window_hash": checkpoint_fingerprint["window_hash"],
+                "scenario_hash": checkpoint_fingerprint.get("scenario_hash", ""),
                 "completed": bool(completed),
                 "processed_count": len(processed_param_ids),
                 "total_param_sets": len(param_sets),
                 "processed_param_ids": sorted(processed_param_ids),
                 "checkpoint_every": checkpoint_every,
+                "window_names": [w.name for w in windows],
+                "scenario_names": [s.name for s in selected_scenarios],
+                "sampling": sampling_meta,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
                 "summary_csv": str(summary_path),
             },
@@ -535,7 +607,7 @@ def main() -> int:
             grouped[param_id].setdefault(strategy, {})
             for window in windows:
                 grouped[param_id][strategy].setdefault(window.name, {})
-                for scenario in SCENARIOS:
+                for scenario in selected_scenarios:
                     try:
                         row = run_window(
                             base_cfg=cfg,
@@ -587,11 +659,11 @@ def main() -> int:
         bench_val = grouped.get(param_id, {}).get(TARGET_STRATEGY, {}).get("val", {})
         bench_test = grouped.get(param_id, {}).get(TARGET_STRATEGY, {}).get("test", {})
 
-        bench_base = bench_val.get("baseline")
-        bench_s1 = bench_val.get("stress_1")
-        bench_s2 = bench_val.get("stress_2")
+        bench_base = bench_val.get("baseline") or bench_val.get("stress_1") or bench_val.get("stress_2")
+        bench_s1 = bench_val.get("stress_1") or bench_val.get("baseline")
+        bench_s2 = bench_val.get("stress_2") or bench_s1
 
-        if not bench_base or not bench_s1 or not bench_s2:
+        if not bench_base or not bench_s1:
             reject("missing_val_scenarios")
             continue
 
@@ -660,9 +732,9 @@ def main() -> int:
                     float(bench_s2.get("max_drawdown", 0.0) or 0.0),
                 ),
                 "val_full_time_share_min": full_share_min,
-                "test_cagr_stress_1": float((bench_test.get("stress_1") or {}).get("cagr", 0.0) or 0.0),
-                "test_sharpe_stress_1": float((bench_test.get("stress_1") or {}).get("sharpe", 0.0) or 0.0),
-                "test_max_drawdown_stress_1": float((bench_test.get("stress_1") or {}).get("max_drawdown", 0.0) or 0.0),
+                "test_cagr_stress_1": float((bench_test.get("stress_1") or bench_test.get("baseline") or {}).get("cagr", 0.0) or 0.0),
+                "test_sharpe_stress_1": float((bench_test.get("stress_1") or bench_test.get("baseline") or {}).get("sharpe", 0.0) or 0.0),
+                "test_max_drawdown_stress_1": float((bench_test.get("stress_1") or bench_test.get("baseline") or {}).get("max_drawdown", 0.0) or 0.0),
             }
         )
 
@@ -724,7 +796,7 @@ def main() -> int:
             f"--config {best_cfg_path} --output {out_dir / 'best_test_repro'}"
         )
 
-        test_stress_1 = grouped.get(best["param_id"], {}).get(TARGET_STRATEGY, {}).get("test", {}).get("stress_1", {})
+        test_stress_1 = grouped.get(best["param_id"], {}).get(TARGET_STRATEGY, {}).get("test", {}).get("stress_1") or grouped.get(best["param_id"], {}).get(TARGET_STRATEGY, {}).get("test", {}).get("baseline", {})
         files_payload = {
             "summary_csv": str(summary_path),
             "frontier_csv": str(frontier_path),

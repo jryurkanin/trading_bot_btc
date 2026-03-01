@@ -40,6 +40,7 @@ class MacroGateBenchmarkStrategy:
         self._daily_last_ts_cache: dict[int, pd.Timestamp | None] = {}
         self._daily_index_cache_sig: tuple[int, int] | None = None
         self._daily_index_values: np.ndarray | None = None
+        self._acceleration_backend: str = str(getattr(cfg, "acceleration_backend", "cpu") or "cpu")
 
     def reset(self) -> None:
         self._gate.reset()
@@ -207,6 +208,27 @@ class MacroGateBenchmarkStrategy:
         return float(series.iloc[-1])
 
     # ------------------------------------------------------------------
+    # Precompute features (one-time per backtest run)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_precomputed_features(
+        hourly_df: pd.DataFrame,
+        cfg: RegimeConfig,
+        *,
+        backend: str = "cpu",
+    ) -> dict[str, Any]:
+        if hourly_df is None or hourly_df.empty:
+            return {}
+
+        close = hourly_df["close"].astype(float)
+        realized_vol = indicators.realized_vol(close.pct_change(), int(cfg.realized_vol_window), backend=backend)
+        return {
+            "realized_vol": realized_vol,
+            "acceleration_backend": backend,
+        }
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -237,6 +259,11 @@ class MacroGateBenchmarkStrategy:
         if hourly_idx is None:
             hourly_idx = len(hourly_df) - 1
         hourly_idx = max(0, min(int(hourly_idx), len(hourly_df) - 1))
+
+        if micro_precomputed is not None:
+            backend_hint = micro_precomputed.get("acceleration_backend")
+            if isinstance(backend_hint, str) and backend_hint:
+                self._acceleration_backend = backend_hint
 
         # Normalize timestamp to UTC
         ts = pd.Timestamp(timestamp)
@@ -270,7 +297,7 @@ class MacroGateBenchmarkStrategy:
             rv_last = indicators.realized_vol(
                 hourly_df["close"].pct_change(),
                 self.cfg.realized_vol_window,
-                backend=str((micro_precomputed or {}).get("acceleration_backend", "cpu")),
+                backend=self._acceleration_backend,
             ).iloc[hourly_idx]
 
         realized_vol = float(rv_last) if rv_last is not None and pd.notna(rv_last) else 0.0

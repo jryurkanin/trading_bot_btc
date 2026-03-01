@@ -4,6 +4,7 @@ from bot.backtest.frontier_runtime import (
     build_checkpoint_fingerprint,
     checkpoint_fingerprint_mismatches,
     build_filter_rejections_payload,
+    cap_param_sets,
 )
 
 
@@ -98,3 +99,38 @@ def test_filter_rejections_payload_contract_shape():
             "turnover_limit": 4,
         },
     }
+
+def test_cap_param_sets_is_deterministic_for_seed():
+    param_sets = [
+        {"a": i % 3, "b": i // 3}
+        for i in range(24)
+    ]
+
+    sample1, meta1 = cap_param_sets(param_sets, 10, seed=7)
+    sample2, meta2 = cap_param_sets(param_sets, 10, seed=7)
+
+    assert [p for p in sample1] == [p for p in sample2]
+    assert meta1["selected_indices"] == meta2["selected_indices"]
+    assert meta1["sampled"] is True
+    assert meta1["sampled_count"] == 10
+    assert meta1["original_count"] == 24
+
+
+def test_cap_param_sets_preserves_boundaries_and_handles_no_cap():
+    param_sets = [
+        {"x": x, "bucket": "low" if x < 3 else "high"}
+        for x in range(8)
+    ]
+
+    full, meta_full = cap_param_sets(param_sets, 0, seed=11)
+    assert full == param_sets
+    assert meta_full["sampled"] is False
+    assert meta_full["sampled_count"] == len(param_sets)
+
+    sampled, meta = cap_param_sets(param_sets, 4, seed=11)
+    selected = meta["selected_indices"]
+
+    assert 0 in selected
+    assert len(param_sets) - 1 in selected
+    assert len(sampled) == 4
+    assert meta["sampled"] is True
