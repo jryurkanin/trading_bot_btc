@@ -29,6 +29,7 @@ from bot.coinbase_client import RESTClientWrapper
 from bot.config import BotConfig
 from bot.data.candles import CandleQuery, CandleStore
 from bot.acceleration.cuda_backend import resolve_acceleration_backend
+from bot.acceleration.precompute_cache import PrecomputeCache
 from bot.system_log import setup_system_logger, get_system_logger
 from bot.backtest.frontier_runtime import (
     resolve_run_dir,
@@ -294,6 +295,7 @@ def run_window(
     base_maker_rate: float,
     base_taker_rate: float,
     strategy: str,
+    precompute_cache: PrecomputeCache | None = None,
 ) -> dict[str, Any]:
     cfg = clone_cfg(base_cfg)
     cfg.data.product = product
@@ -322,6 +324,7 @@ def run_window(
         risk_config=cfg.risk,
         execution_config=cfg.execution,
         fred_config=cfg.fred,
+        precompute_cache=precompute_cache,
     )
     result = engine.run()
     eq = result.equity_curve["equity"]
@@ -597,6 +600,7 @@ def main() -> int:
 
     strategies = [TARGET_STRATEGY]
     processed_since_checkpoint = 0
+    _precompute_cache = PrecomputeCache()
     for i, params in enumerate(param_sets):
         param_id = f"p{i:04d}"
         if param_id in processed_param_ids:
@@ -620,6 +624,7 @@ def main() -> int:
                             base_maker_rate=base_maker_rate,
                             base_taker_rate=base_taker_rate,
                             strategy=strategy,
+                            precompute_cache=_precompute_cache,
                         )
                         row["param_id"] = param_id
                         row["params"] = json.dumps(params, sort_keys=True)

@@ -371,22 +371,35 @@ class V5AdaptiveStrategy:
         if hourly_df is None or hourly_df.empty:
             return {}
 
-        high = hourly_df["high"].astype(float)
-        low = hourly_df["low"].astype(float)
-        close = hourly_df["close"].astype(float)
+        # Use batch precompute to minimize GPU transfers
+        from ..acceleration.batch_precompute import batch_precompute_indicators
 
-        adx = compute_adx(high, low, close, window=cfg.adx_window, backend=backend)
-        chop = compute_chop(high, low, close, window=cfg.chop_window, backend=backend)
-        realized_vol = indicators.realized_vol(close.pct_change(), int(cfg.realized_vol_window), backend=backend)
+        batch = batch_precompute_indicators(hourly_df, cfg, backend=backend)
+
+        adx = batch.get("adx")
+        chop = batch.get("chop")
+        rv = batch.get("realized_vol")
+
+        # Fallback if batch didn't produce expected keys (shouldn't happen)
+        if adx is None or chop is None or rv is None:
+            high = hourly_df["high"].astype(float)
+            low = hourly_df["low"].astype(float)
+            close = hourly_df["close"].astype(float)
+            if adx is None:
+                adx = compute_adx(high, low, close, window=cfg.adx_window, backend=backend)
+            if chop is None:
+                chop = compute_chop(high, low, close, window=cfg.chop_window, backend=backend)
+            if rv is None:
+                rv = indicators.realized_vol(close.pct_change(), int(cfg.realized_vol_window), backend=backend)
 
         lookback = max(24, int(cfg.vol_lookback_days) * 24)
         min_periods = max(30, lookback // 4)
-        vol_thresholds = realized_vol.rolling(lookback, min_periods=min_periods).quantile(cfg.vol_high_threshold_quantile)
+        vol_thresholds = rv.rolling(lookback, min_periods=min_periods).quantile(cfg.vol_high_threshold_quantile)
 
         return {
             "adx": adx,
             "chop": chop,
-            "realized_vol": realized_vol,
+            "realized_vol": rv,
             "vol_thresholds": vol_thresholds,
             "acceleration_backend": backend,
         }

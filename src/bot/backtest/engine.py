@@ -11,7 +11,8 @@ from ..execution.risk import RiskManager, RiskState
 from ..execution.rebalance_policy import RebalancePolicy
 from ..features import indicators
 from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
-from ..acceleration.cuda_backend import resolve_acceleration_backend
+from ..acceleration.cuda_backend import resolve_acceleration_backend, estimate_transfer_overhead_ms
+from ..acceleration.batch_precompute import batch_precompute_indicators
 from ..features.regime import compute_adx, compute_chop
 from ..features.fred_features import build_fred_daily_overlay_features
 from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle, RegimeSwitchingOrchestrator
@@ -76,6 +77,7 @@ class BacktestEngine:
     execution_config: Optional[ExecutionConfig] = None
     fred_config: Optional[FredConfig] = None
     signal_delay_bars: int = 0  # extra bars of latency for stale-data simulation
+    precompute_cache: Any = None  # Optional PrecomputeCache for frontier sweep dedup
 
     def run(self) -> BacktestResult:
         log_path = setup_system_logger()
@@ -189,11 +191,21 @@ class BacktestEngine:
         # Prefer strategy-provided precompute hooks to avoid unnecessary work.
         acc_ctx = resolve_acceleration_backend(getattr(cfg, "acceleration_backend", "auto"))
         acc_backend = "cpu"
-        if (
-            acc_ctx.backend == "cuda"
-            and len(hourly) >= int(getattr(cfg, "acceleration_min_bars", 2048) or 2048)
-        ):
-            acc_backend = "cuda"
+        if acc_ctx.backend == "cuda":
+            # Dynamically select min_bars based on measured interconnect latency.
+            # OCuLink/Thunderbolt (>1ms overhead) needs more rows to amortize
+            # transfer cost vs PCIe x16 (<=1ms).
+            config_min_bars = int(getattr(cfg, "acceleration_min_bars", 4096) or 4096)
+            transfer_overhead = estimate_transfer_overhead_ms(acc_ctx)
+            if transfer_overhead is not None:
+                if transfer_overhead > 1.0:
+                    effective_min_bars = max(config_min_bars, 8192)
+                else:
+                    effective_min_bars = max(config_min_bars, 4096)
+            else:
+                effective_min_bars = config_min_bars
+            if len(hourly) >= effective_min_bars:
+                acc_backend = "cuda"
 
         hourly_precomputed: dict[str, Any] = {
             "acceleration_backend": acc_backend,
@@ -206,7 +218,15 @@ class BacktestEngine:
         precompute_fn = getattr(orchestrator.__class__, "get_precomputed_features", None)
         if callable(precompute_fn):
             try:
-                extra = precompute_fn(hourly, reg_cfg, backend=acc_backend)
+                if self.precompute_cache is not None:
+                    from ..acceleration.precompute_cache import PrecomputeCache
+                    cache_key = PrecomputeCache.make_key(hourly, reg_cfg)
+                    extra = self.precompute_cache.get_or_compute(
+                        cache_key,
+                        lambda: precompute_fn(hourly, reg_cfg, backend=acc_backend),
+                    )
+                else:
+                    extra = precompute_fn(hourly, reg_cfg, backend=acc_backend)
                 if isinstance(extra, dict):
                     hourly_precomputed.update(extra)
             except Exception as exc:
@@ -220,40 +240,26 @@ class BacktestEngine:
         # Legacy orchestrator sub-strategies depend on these series to avoid
         # expensive per-bar indicator recomputation.
         if strategy_id in {"macro_gate_state", "regime_switching_orchestrator"}:
-            if "donchian_high" not in hourly_precomputed or "donchian_low" not in hourly_precomputed:
-                _donchian_low, _donchian_high = donchian_channel(
-                    hourly["high"],
-                    hourly["low"],
-                    reg_cfg.donchian_window,
-                    backend=acc_backend,
+            orch_keys = {"donchian_high", "donchian_low", "atr", "bb_mid", "bb_upper", "bb_lower"}
+            missing_orch = orch_keys - hourly_precomputed.keys()
+            if missing_orch:
+                # Batch precompute fills donchian, atr, bollinger in one GPU round trip
+                orch_batch = batch_precompute_indicators(
+                    hourly, reg_cfg, backend=acc_backend, include_orchestrator_indicators=True
                 )
-                hourly_precomputed.setdefault("donchian_high", _donchian_high)
-                hourly_precomputed.setdefault("donchian_low", _donchian_low)
+                for k in orch_keys:
+                    if k in orch_batch:
+                        hourly_precomputed.setdefault(k, orch_batch[k])
+                # Also pick up adx/chop/realized_vol if not already present
+                for k in ("adx", "chop", "realized_vol"):
+                    if k in orch_batch and k not in hourly_precomputed:
+                        hourly_precomputed[k] = orch_batch[k]
 
-            if "atr" not in hourly_precomputed:
-                hourly_precomputed["atr"] = compute_atr(
-                    hourly["high"],
-                    hourly["low"],
-                    hourly["close"],
-                    reg_cfg.atr_window,
-                    backend=acc_backend,
-                )
-
+            # EMA is inherently sequential — always computed on CPU
             if "ema_fast" not in hourly_precomputed:
                 hourly_precomputed["ema_fast"] = ema(hourly["close"], reg_cfg.ema_fast, backend=acc_backend)
             if "ema_slow" not in hourly_precomputed:
                 hourly_precomputed["ema_slow"] = ema(hourly["close"], reg_cfg.ema_slow, backend=acc_backend)
-
-            if not {"bb_mid", "bb_upper", "bb_lower"}.issubset(hourly_precomputed.keys()):
-                _bb_mid, _bb_upper, _bb_lower = bollinger_bands(
-                    hourly["close"],
-                    reg_cfg.bb_window,
-                    reg_cfg.bb_stdev,
-                    backend=acc_backend,
-                )
-                hourly_precomputed.setdefault("bb_mid", _bb_mid)
-                hourly_precomputed.setdefault("bb_upper", _bb_upper)
-                hourly_precomputed.setdefault("bb_lower", _bb_lower)
 
             if reg_cfg.hmm_regime_enabled and "hmm_features" not in hourly_precomputed:
                 rv_seed = hourly_precomputed.get("realized_vol")

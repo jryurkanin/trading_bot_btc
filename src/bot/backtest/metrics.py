@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from ._bootstrap import circular_block_bootstrap_sample
 
 
 def _to_returns(equity: pd.Series) -> pd.Series:
@@ -149,3 +152,141 @@ def compute_metrics(
     if exposure is not None:
         out["avg_exposure"] = float(exposure.mean()) if len(exposure) else 0.0
     return out
+
+
+# ---------------------------------------------------------------------------
+# Sharpe ratio bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+
+# Hardcoded z-values to avoid scipy dependency
+_Z_VALUES: Dict[float, float] = {0.90: 1.6449, 0.95: 1.9600, 0.99: 2.5758}
+
+
+@dataclass
+class SharpeBootstrapResult:
+    point_estimate: float
+    confidence_intervals: Dict[str, Tuple[float, float]]
+    bootstrap_mean: float
+    bootstrap_std: float
+    p_value_sharpe_leq_0: float
+    hac_std_error: float
+    hac_confidence_intervals: Dict[str, Tuple[float, float]]
+    n_simulations: int
+    block_length_used: int
+
+
+def _newey_west_hac_se(
+    excess_returns: np.ndarray,
+    periods_per_year: int,
+) -> float:
+    """Newey-West HAC standard error of annualised Sharpe ratio.
+
+    Bartlett kernel with Andrews (1991) automatic bandwidth:
+    ``int(4 * (n / 100) ^ (2/9))``.
+    """
+    n = len(excess_returns)
+    if n < 2:
+        return 0.0
+
+    mean_r = float(np.mean(excess_returns))
+    std_r = float(np.std(excess_returns, ddof=1))
+    if std_r <= 0:
+        return 0.0
+
+    # Bandwidth selection (Andrews 1991)
+    bandwidth = int(4.0 * (n / 100.0) ** (2.0 / 9.0))
+    bandwidth = max(bandwidth, 1)
+
+    # Centred residuals
+    resid = excess_returns - mean_r
+
+    # Gamma_0
+    gamma_0 = float(np.dot(resid, resid)) / n
+
+    # Accumulate HAC variance with Bartlett weights
+    hac_var = gamma_0
+    for lag in range(1, bandwidth + 1):
+        w = 1.0 - lag / (bandwidth + 1.0)
+        gamma_lag = float(np.dot(resid[lag:], resid[:-lag])) / n
+        hac_var += 2.0 * w * gamma_lag
+
+    if hac_var <= 0:
+        return 0.0
+
+    # SE of the mean
+    se_mean = float(np.sqrt(hac_var / n))
+
+    # Delta-method: Sharpe = sqrt(T) * mean / std, so
+    # se(Sharpe_annualised) ≈ sqrt(periods_per_year) * se_mean / std_r
+    se_sharpe = float(np.sqrt(periods_per_year)) * se_mean / std_r
+    return se_sharpe
+
+
+def bootstrap_sharpe_confidence(
+    returns: pd.Series,
+    rf: float = 0.0,
+    periods_per_year: int = 8760,
+    n_bootstrap: int = 10_000,
+    block_length: Optional[int] = None,
+    confidence_levels: Tuple[float, ...] = (0.90, 0.95, 0.99),
+    seed: int = 42,
+) -> SharpeBootstrapResult:
+    """Compute bootstrap confidence intervals for the annualised Sharpe ratio.
+
+    Uses circular block bootstrap to preserve autocorrelation, plus
+    Newey-West HAC-based analytic intervals.
+    """
+    r = returns.dropna().values.astype(float)
+    n = len(r)
+
+    # Point estimate via existing helper
+    point_estimate = compute_sharpe(returns, rf=rf, periods_per_year=periods_per_year)
+
+    # Default block length: int(n^(1/3))
+    if block_length is None:
+        block_length = max(1, int(n ** (1.0 / 3.0)))
+
+    excess = r - rf / periods_per_year
+
+    rng = np.random.default_rng(seed)
+    boot_sharpes = np.empty(n_bootstrap, dtype=float)
+
+    for i in range(n_bootstrap):
+        sample = circular_block_bootstrap_sample(excess, block_length, rng)
+        std_s = float(np.std(sample, ddof=1))
+        if std_s <= 0:
+            boot_sharpes[i] = 0.0
+        else:
+            boot_sharpes[i] = float(np.sqrt(periods_per_year) * np.mean(sample) / std_s)
+
+    # Percentile-based CIs
+    cis: Dict[str, Tuple[float, float]] = {}
+    for level in confidence_levels:
+        alpha = (1.0 - level) / 2.0
+        lo = float(np.percentile(boot_sharpes, 100 * alpha))
+        hi = float(np.percentile(boot_sharpes, 100 * (1 - alpha)))
+        cis[f"{int(level * 100)}%"] = (lo, hi)
+
+    p_value = float(np.mean(boot_sharpes <= 0))
+
+    # HAC standard error
+    hac_se = _newey_west_hac_se(excess, periods_per_year)
+
+    hac_cis: Dict[str, Tuple[float, float]] = {}
+    for level in confidence_levels:
+        z = _Z_VALUES.get(level, 1.96)
+        lo = point_estimate - z * hac_se
+        hi = point_estimate + z * hac_se
+        hac_cis[f"{int(level * 100)}%"] = (lo, hi)
+
+    return SharpeBootstrapResult(
+        point_estimate=point_estimate,
+        confidence_intervals=cis,
+        bootstrap_mean=float(np.mean(boot_sharpes)),
+        bootstrap_std=float(np.std(boot_sharpes, ddof=1)),
+        p_value_sharpe_leq_0=p_value,
+        hac_std_error=hac_se,
+        hac_confidence_intervals=hac_cis,
+        n_simulations=n_bootstrap,
+        block_length_used=block_length,
+    )
