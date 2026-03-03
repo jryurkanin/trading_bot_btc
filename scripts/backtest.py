@@ -52,8 +52,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-trade-notional-usd", type=float, default=None)
     p.add_argument("--min-exposure-delta", type=float, default=None)
     p.add_argument("--target-quantization-step", type=float, default=None)
-    p.add_argument("--min-time-between-trades-hours", type=float, default=None)
-    p.add_argument("--max-trades-per-day", type=int, default=None)
 
     # macro scoring + trend boost (all optional, backward-compatible)
     p.add_argument("--macro-mode", choices=["binary", "score", "stateful_gate"], default=None)
@@ -187,10 +185,6 @@ def main() -> int:
         cfg.execution.min_exposure_delta = float(args.min_exposure_delta)
     if args.target_quantization_step is not None:
         cfg.execution.target_quantization_step = float(args.target_quantization_step)
-    if args.min_time_between_trades_hours is not None:
-        cfg.execution.min_time_between_trades_hours = float(args.min_time_between_trades_hours)
-    if args.max_trades_per_day is not None:
-        cfg.execution.max_trades_per_day = int(args.max_trades_per_day)
     if args.impact_bps is not None:
         cfg.execution.impact_bps = float(args.impact_bps)
 
@@ -422,8 +416,6 @@ def main() -> int:
             "min_trade_notional_usd": cfg.execution.min_trade_notional_usd,
             "min_exposure_delta": cfg.execution.min_exposure_delta,
             "target_quantization_step": cfg.execution.target_quantization_step,
-            "min_time_between_trades_hours": cfg.execution.min_time_between_trades_hours,
-            "max_trades_per_day": cfg.execution.max_trades_per_day,
             "impact_bps": cfg.execution.impact_bps,
         },
         "regime_config": {
@@ -475,9 +467,9 @@ def main() -> int:
     }
     # --- Optional statistical analysis features ---
     if args.sharpe_bootstrap:
-        from bot.backtest.metrics import bootstrap_sharpe_confidence, _to_returns
+        from bot.backtest.metrics import bootstrap_sharpe_confidence, to_returns
         eq_series = result.equity_curve["equity"] if "equity" in result.equity_curve.columns else result.equity_curve.iloc[:, 0]
-        ret = _to_returns(eq_series)
+        ret = to_returns(eq_series)
         sb = bootstrap_sharpe_confidence(
             ret, n_bootstrap=args.sharpe_n_bootstrap, seed=args.sharpe_seed,
         )

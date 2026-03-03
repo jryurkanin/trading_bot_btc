@@ -66,6 +66,44 @@ SMALL_GRID_SPACE: dict[str, list[Any]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Strategy-specific grids
+# ---------------------------------------------------------------------------
+
+ADAPTIVE_TREND_6H_GRID_SPACE: dict[str, list[Any]] = {
+    "adaptive6h_use_macro_gate": [True, False],
+    "adaptive6h_macro_multiplier_floor": [0.0, 0.25],
+    "adaptive6h_target_ann_vol": [0.40, 0.60, 0.80],
+    "adaptive6h_max_position_fraction": [0.5, 1.0],
+    "adaptive6h_reopt_lookback_days": [30, 60],
+    "adaptive6h_objective": ["sharpe", "sharpe_minus_turnover"],
+    "v4_macro_enter_threshold": [0.50, 0.75],
+}
+
+ADAPTIVE_TREND_6H_SMALL_GRID_SPACE: dict[str, list[Any]] = {
+    "adaptive6h_use_macro_gate": [True, False],
+    "adaptive6h_macro_multiplier_floor": [0.0],
+    "adaptive6h_target_ann_vol": [0.60],
+    "adaptive6h_max_position_fraction": [1.0],
+    "adaptive6h_reopt_lookback_days": [30],
+    "adaptive6h_objective": ["sharpe_minus_turnover"],
+    "v4_macro_enter_threshold": [0.50],
+}
+
+
+# Map strategy names to their dedicated grid spaces.
+# Strategies not listed here fall back to DEFAULT_GRID_SPACE.
+STRATEGY_GRID_MAP: dict[str, dict[str, list[Any]]] = {
+    "adaptive_trend_6h_v1": ADAPTIVE_TREND_6H_GRID_SPACE,
+    "adaptive_trend_6h": ADAPTIVE_TREND_6H_GRID_SPACE,
+}
+
+STRATEGY_SMALL_GRID_MAP: dict[str, dict[str, list[Any]]] = {
+    "adaptive_trend_6h_v1": ADAPTIVE_TREND_6H_SMALL_GRID_SPACE,
+    "adaptive_trend_6h": ADAPTIVE_TREND_6H_SMALL_GRID_SPACE,
+}
+
+
 DEFAULT_FRED_SWEEP_SPACE: dict[str, list[Any]] = {
     "fred.enabled": [False, True],
     "fred.max_risk_off_penalty": [0.0, 0.25, 0.5, 0.75],
@@ -158,6 +196,7 @@ def load_grid(
     *,
     include_fred_grid: bool = False,
     small: bool = False,
+    strategy: str = "",
 ) -> list[dict[str, Any]]:
     if path:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -179,7 +218,11 @@ def load_grid(
             return product_grid(space)
         raise ValueError("Unsupported --grid-config format (must be object or list)")
 
-    space = dict(SMALL_GRID_SPACE if small else DEFAULT_GRID_SPACE)
+    # Use strategy-specific grid when available, otherwise fall back to defaults
+    if small:
+        space = dict(STRATEGY_SMALL_GRID_MAP.get(strategy, SMALL_GRID_SPACE))
+    else:
+        space = dict(STRATEGY_GRID_MAP.get(strategy, DEFAULT_GRID_SPACE))
     if include_fred_grid:
         space.update(DEFAULT_FRED_SWEEP_SPACE)
     space.update(grid_flags)
@@ -405,6 +448,8 @@ def _validate_acceleration_backend(requested: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+    # Resolve strategy aliases (e.g. adaptive_trend_6h → adaptive_trend_6h_v1)
+    args.strategy = BacktestConfig.STRATEGY_ALIASES.get(args.strategy, args.strategy)
     try:
         log_path = setup_system_logger(level=logging.INFO)
     except TypeError:
@@ -456,6 +501,7 @@ def main() -> int:
         grid_flags,
         include_fred_grid=bool(args.include_fred_grid),
         small=bool(args.small),
+        strategy=args.strategy,
     )
     invalid_grid_keys = validate_grid_keys(cfg, param_sets)
     if invalid_grid_keys:

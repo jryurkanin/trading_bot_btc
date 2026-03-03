@@ -13,6 +13,10 @@ def _to_returns(equity: pd.Series) -> pd.Series:
     return equity.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
+# Public alias for external callers (e.g. scripts/backtest.py)
+to_returns = _to_returns
+
+
 def _to_pnl_dollars(equity: pd.Series) -> pd.Series:
     return equity.diff().replace([np.inf, -np.inf], np.nan).fillna(0.0)
 

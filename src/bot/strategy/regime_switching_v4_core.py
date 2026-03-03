@@ -1,7 +1,6 @@
 """V4 Core Strategy — macro-gated vol-targeted position with micro regime scaling."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict
 
 import numpy as np
@@ -241,6 +240,15 @@ class V4CoreStrategy:
         last = pd.to_datetime(ts_last, utc=True)
         self._daily_last_ts_cache[key] = last
         return last
+
+    @staticmethod
+    def _latest_daily_feature(daily_closed: pd.DataFrame, col: str, *, default: float = float("nan")) -> float:
+        if daily_closed is None or daily_closed.empty or col not in daily_closed.columns:
+            return default
+        val = daily_closed[col].iloc[-1]
+        if pd.isna(val):
+            return default
+        return float(val)
 
     # ------------------------------------------------------------------
     # Micro regime
@@ -483,6 +491,10 @@ class V4CoreStrategy:
             "fred_comp_hy_oas_z": float(macro_components.get("fred_BAMLH0A0HYM2_z_level", np.nan)),
             "fred_comp_stlfsi_z": float(macro_components.get("fred_STLFSI4_z_level", np.nan)),
             "fred_comp_nfci_z": float(macro_components.get("fred_NFCI_z_level", np.nan)),
+            "fred_vix_level": self._latest_daily_feature(daily_closed, "fred_VIXCLS_level"),
+            "fred_hy_oas_level": self._latest_daily_feature(daily_closed, "fred_BAMLH0A0HYM2_level"),
+            "fred_stlfsi_level": self._latest_daily_feature(daily_closed, "fred_STLFSI4_level"),
+            "fred_nfci_level": self._latest_daily_feature(daily_closed, "fred_NFCI_level"),
             "macro_state": macro_state.value,
             "macro_multiplier": macro_mult,
             "macro_mult": macro_mult,
