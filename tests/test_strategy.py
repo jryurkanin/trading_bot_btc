@@ -13,8 +13,6 @@ def test_range_strategy_incremental_entries_and_exits():
             bb_stdev=2.0,
             tranche_size=0.2,
             max_exposure=0.8,
-            min_time_between_trades_hours=0,
-            max_trades_per_day=10,
         )
     )
 

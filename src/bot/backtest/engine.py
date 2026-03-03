@@ -10,16 +10,16 @@ from ..config import BacktestConfig, RegimeConfig, RiskConfig, ExecutionConfig, 
 from ..execution.risk import RiskManager, RiskState
 from ..execution.rebalance_policy import RebalancePolicy
 from ..features import indicators
-from ..features.indicators import donchian_channel, ema, atr as compute_atr, bollinger_bands
+from ..features.indicators import ema
 from ..acceleration.cuda_backend import resolve_acceleration_backend, estimate_transfer_overhead_ms
 from ..acceleration.batch_precompute import batch_precompute_indicators
-from ..features.regime import compute_adx, compute_chop
 from ..features.fred_features import build_fred_daily_overlay_features
 from ..strategy.regime_switching_orchestrator import RegimeDecisionBundle, RegimeSwitchingOrchestrator
 from ..strategy.macro_gate_benchmark import MacroGateBenchmarkStrategy
 from ..strategy.macro_only_v2 import MacroOnlyV2Strategy
 from ..strategy.regime_switching_v4_core import V4CoreStrategy
 from ..strategy.v5_adaptive import V5AdaptiveStrategy
+from ..strategy.adaptive_trend_6h import AdaptiveTrend6HStrategy
 from ..system_log import setup_system_logger, get_system_logger
 from .fill_models import BacktestOrder, MarketState, make_fill_model
 from .cost_model import CostModel
@@ -169,6 +169,8 @@ class BacktestEngine:
         )
 
         strategy_id = cfg.strategy if cfg.strategy else "macro_gate_benchmark"
+        # Resolve aliases (e.g. adaptive_trend_6h → adaptive_trend_6h_v1)
+        strategy_id = cfg.STRATEGY_ALIASES.get(strategy_id, strategy_id)
         if strategy_id == "macro_gate_benchmark":
             orchestrator = MacroGateBenchmarkStrategy(reg_cfg)
         elif strategy_id == "macro_only_v2":
@@ -181,8 +183,10 @@ class BacktestEngine:
             orchestrator = RegimeSwitchingOrchestrator(reg_cfg)
         elif strategy_id == "v5_adaptive":
             orchestrator = V5AdaptiveStrategy(reg_cfg)
+        elif strategy_id == "adaptive_trend_6h_v1":
+            orchestrator = AdaptiveTrend6HStrategy(reg_cfg)
         else:
-            valid = ", ".join(sorted(["macro_gate_benchmark", "macro_only_v2", "macro_gate_state", "regime_switching_v4_core", "regime_switching_orchestrator", "v5_adaptive"]))
+            valid = ", ".join(sorted(["macro_gate_benchmark", "macro_only_v2", "macro_gate_state", "regime_switching_v4_core", "regime_switching_orchestrator", "v5_adaptive", "adaptive_trend_6h_v1"]))
             raise ValueError(f"Unsupported strategy '{strategy_id}'. Supported: [{valid}]")
 
         logger.info("engine_strategy_selected strategy_id=%s orchestrator=%s", strategy_id, orchestrator.__class__.__name__)
@@ -339,8 +343,6 @@ class BacktestEngine:
             min_trade_notional_usd=exec_cfg.min_trade_notional_usd,
             min_exposure_delta=exec_cfg.min_exposure_delta,
             target_quantization_step=exec_cfg.target_quantization_step,
-            min_time_between_trades_hours=exec_cfg.min_time_between_trades_hours,
-            max_trades_per_day=exec_cfg.max_trades_per_day,
         )
 
         cash = float(cfg.initial_equity)

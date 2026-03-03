@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -212,3 +213,73 @@ def test_frontier_sweep_contracts_and_resume_fingerprint(monkeypatch, tmp_path):
     args_holder["value"] = _base_args(tmp_path, run_id="contract1", resume=True)
     rc_resume_bad = module.main()
     assert rc_resume_bad == 2
+
+
+# ---------------------------------------------------------------------------
+# Strategy-specific grid selection tests
+# ---------------------------------------------------------------------------
+
+class TestStrategyGridSelection:
+    """Verify that load_grid selects the correct grid based on strategy."""
+
+    @staticmethod
+    def _load_module():
+        return _load_module(
+            "frontier_sweep_grid_test",
+            REPO_ROOT / "scripts" / "frontier_sweep.py",
+        )
+
+    def test_adaptive_trend_6h_uses_strategy_grid(self):
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="adaptive_trend_6h_v1")
+        keys = set(param_sets[0].keys())
+        assert "adaptive6h_use_macro_gate" in keys
+        assert "adaptive6h_target_ann_vol" in keys
+        # Must NOT contain default grid keys
+        assert "macro_mode" not in keys
+        assert "trend_boost_multiplier" not in keys
+
+    def test_default_strategy_uses_default_grid(self):
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="macro_gate_benchmark")
+        keys = set(param_sets[0].keys())
+        assert "macro_mode" in keys
+        assert "trend_boost_multiplier" in keys
+        assert "adaptive6h_use_macro_gate" not in keys
+
+    def test_unknown_strategy_falls_back_to_default(self):
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="unknown_strategy_xyz")
+        keys = set(param_sets[0].keys())
+        assert "macro_mode" in keys
+
+    def test_adaptive_grid_includes_macro_gate_toggle(self):
+        """The grid MUST include both True and False for the macro gate."""
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="adaptive_trend_6h_v1")
+        gate_values = {p["adaptive6h_use_macro_gate"] for p in param_sets}
+        assert gate_values == {True, False}
+
+    def test_small_adaptive_grid(self):
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="adaptive_trend_6h_v1", small=True)
+        assert len(param_sets) >= 2
+        keys = set(param_sets[0].keys())
+        assert "adaptive6h_use_macro_gate" in keys
+
+    def test_grid_flags_override_strategy_grid(self):
+        mod = self._load_module()
+        param_sets = mod.load_grid(
+            None,
+            {"adaptive6h_target_ann_vol": [0.50]},
+            strategy="adaptive_trend_6h_v1",
+        )
+        vol_values = {p["adaptive6h_target_ann_vol"] for p in param_sets}
+        assert vol_values == {0.50}
+
+    def test_all_adaptive_grid_keys_are_valid_config_params(self):
+        """Every key in the strategy grid must resolve via set_param."""
+        mod = self._load_module()
+        param_sets = mod.load_grid(None, {}, strategy="adaptive_trend_6h_v1")
+        invalid = mod.validate_grid_keys(mod.BotConfig(), param_sets)
+        assert invalid == [], f"Invalid grid keys: {invalid}"

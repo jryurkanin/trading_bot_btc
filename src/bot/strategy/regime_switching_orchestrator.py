@@ -63,8 +63,6 @@ class RegimeSwitchingOrchestrator:
                 bb_stdev=cfg.bb_stdev,
                 tranche_size=cfg.range_tranche_size,
                 max_exposure=cfg.range_max_exposure,
-                min_time_between_trades_hours=cfg.range_min_time_between_trades_hours,
-                max_trades_per_day=cfg.range_max_trades_per_day,
             )
         )
         self.trend_strategy = TrendFollowingBreakoutStrategy(

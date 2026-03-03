@@ -220,8 +220,6 @@ class RegimeConfig(BaseModel):
     bb_stdev: float = 2.0
     range_tranche_size: float = 0.25
     range_max_exposure: float = 0.75
-    range_min_time_between_trades_hours: float = 2.0
-    range_max_trades_per_day: int = 4
 
     # Hourly overlay controls (small add/reduce around core baseline)
     enable_hourly_overlay: bool = True
@@ -355,6 +353,40 @@ class RegimeConfig(BaseModel):
     mom_6m_days: int = 180
     mom_12m_days: int = 365
 
+    # AdaptiveTrend 6H config
+    adaptive6h_enabled: bool = True
+    adaptive6h_bar_hours: int = 6
+
+    # Momentum signal candidates (in 6h bars)
+    adaptive6h_mom_lookbacks: list[int] = Field(default_factory=lambda: [20, 40, 80])
+    adaptive6h_entry_thresholds: list[float] = Field(default_factory=lambda: [0.02, 0.04, 0.06])
+
+    # ATR trailing stop candidates (in 6h bars)
+    adaptive6h_atr_window_choices: list[int] = Field(default_factory=lambda: [10, 14, 20])
+    adaptive6h_atr_mult_choices: list[float] = Field(default_factory=lambda: [2.0, 2.5, 3.0, 3.5])
+
+    # Reoptimization
+    adaptive6h_reopt_cadence: Literal["monthly", "weekly"] = "monthly"
+    adaptive6h_reopt_lookback_days: int = 30
+    adaptive6h_min_trades_in_window: int = 3
+
+    # Objective
+    adaptive6h_objective: Literal["sharpe", "calmar", "sharpe_minus_turnover"] = "sharpe_minus_turnover"
+    adaptive6h_turnover_penalty: float = 0.25
+
+    # Position sizing
+    adaptive6h_use_vol_target: bool = True
+    adaptive6h_target_ann_vol: float = 0.60
+    adaptive6h_max_position_fraction: float = 1.0
+    adaptive6h_min_position_fraction: float = 0.0
+
+    # Reopt cost proxy (bps per unit turnover, independent of vol target)
+    adaptive6h_reopt_cost_bps: float = 18.0  # ~18 bps per position change
+
+    # Macro overlay (optional)
+    adaptive6h_use_macro_gate: bool = True
+    adaptive6h_macro_multiplier_floor: float = 0.0
+
 
 class RiskConfig(BaseModel):
     max_drawdown_cut_pct: float = 0.25
@@ -390,8 +422,6 @@ class ExecutionConfig(BaseModel):
     min_trade_notional_usd: float = 50.0
     min_exposure_delta: float = 0.05
     target_quantization_step: float = 0.25
-    min_time_between_trades_hours: float = 1.0
-    max_trades_per_day: int = 8
     max_allowed_slippage_bps: float = 50.0
 
     # exchange constraints
@@ -431,7 +461,6 @@ class BacktestConfig(BaseModel):
     taker_bps: float = 25.0
     slippage_bps: float = 5.0
     use_spread_slippage: bool = True
-    max_trades_per_year: Optional[int] = None
     ci_mode: bool = False
 
     # compute acceleration backend for backtests (falls back to CPU if CUDA unavailable)
@@ -445,10 +474,19 @@ class BacktestConfig(BaseModel):
         "regime_switching_v4_core",
         "regime_switching_orchestrator",
         "macro_gate_state",
+        "adaptive_trend_6h_v1",
+        "adaptive_trend_6h",
+    }
+
+    # Map short aliases to canonical strategy identifiers used by the engine.
+    STRATEGY_ALIASES: ClassVar[dict[str, str]] = {
+        "adaptive_trend_6h": "adaptive_trend_6h_v1",
     }
 
     @field_validator("strategy", mode="after")
     def _validate_strategy(cls, value: str) -> str:
+        # Resolve aliases first
+        value = cls.STRATEGY_ALIASES.get(value, value)
         if value not in cls.VALID_STRATEGIES:
             raise ValueError(f"Unknown strategy '{value}'. Valid: {sorted(cls.VALID_STRATEGIES)}")
         return value

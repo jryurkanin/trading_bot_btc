@@ -36,6 +36,8 @@ RUNNERS: dict[str, StrategyRunner] = {
     "regime_switching_v4_core": ("frontier_sweep_core.py", "regime_switching_v4_core"),
     "regime_switching_orchestrator": ("frontier_sweep_v3.py", "regime_switching_orchestrator"),
     "macro_gate_state": ("frontier_sweep_v3.py", "macro_gate_state"),
+    "adaptive_trend_6h_v1": ("frontier_sweep.py", "adaptive_trend_6h_v1"),
+    "adaptive_trend_6h": ("frontier_sweep.py", "adaptive_trend_6h_v1"),
 }
 
 # Strategy-level caps that keep full multi-strategy sweeps within a practical 24h budget
@@ -47,6 +49,8 @@ DEFAULT_FAST_24H_MAX_PARAM_SETS: dict[str, int] = {
     "regime_switching_v4_core": 900,
     "v5_adaptive": 900,
     "macro_only_v2": 800,
+    "adaptive_trend_6h_v1": 240,
+    "adaptive_trend_6h": 240,
 }
 
 logger = get_system_logger("scripts.frontier_sweep_all_strategies")
@@ -346,7 +350,7 @@ def _build_strategy_command(
     run_id: str,
     max_param_sets: int,
 ) -> tuple[list[str], str]:
-    script_name, _default_tag = RUNNERS[strategy]
+    script_name, canonical_strategy = RUNNERS[strategy]
     args_for_strategy = baseline_args.copy()
     args_for_strategy.extend([
         "--output-dir",
@@ -364,7 +368,9 @@ def _build_strategy_command(
     cmd = [sys.executable, str(SCRIPTS_DIR / script_name)]
 
     if script_name == "frontier_sweep.py":
-        cmd.extend(["--strategy", strategy])
+        # Always use canonical strategy name (e.g. adaptive_trend_6h_v1, not
+        # the alias adaptive_trend_6h) so argparse VALID_STRATEGIES check passes.
+        cmd.extend(["--strategy", canonical_strategy])
         cmd.extend(["--end", args.end])
         cmd.extend(["--test-end", args.test_end])
         if args.small:
@@ -390,7 +396,7 @@ def _build_strategy_command(
         cmd.extend(["--end", args.end])
         cmd.extend(["--test-end", args.test_end])
         if script_name == "frontier_sweep_v3.py":
-            cmd.extend(["--strategy", strategy])
+            cmd.extend(["--strategy", canonical_strategy])
         if args.small:
             cmd.append("--small")
         cmd.extend(args_for_strategy)
@@ -747,6 +753,10 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     run_id = run_reports_dir.name
 
     selected = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    alias_map = {
+        "adaptive_trend_6h": "adaptive_trend_6h_v1",
+    }
+    selected = [alias_map.get(s, s) for s in selected]
     unknown = [s for s in selected if s not in RUNNERS]
     if unknown:
         raise ValueError(
@@ -756,6 +766,7 @@ def _run_all_strategies(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     equivalence_key = {
         "macro_gate_state": "regime_switching_orchestrator",
         "regime_switching_orchestrator": "regime_switching_orchestrator",
+        "adaptive_trend_6h": "adaptive_trend_6h_v1",
     }
     deduped: list[str] = []
     seen_keys: set[str] = set()
